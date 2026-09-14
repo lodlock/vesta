@@ -539,6 +539,19 @@ La verifica **fallisce chiusa**: quando un digest atteso esiste, il commit avvie
 
 **Percorso**: gesto assistente → `VestaVoiceActivity` (trasparente, nessuna UI di chat) → riconoscitore di sistema → trascrizione → `VestaAssistBridge` (statico in-process: la deep link `vesta://` è BROWSABLE e quindi falsificabile, e una richiesta dell'assistente viene ESEGUITA, non pre-riempita) → `consumeAssistRequest()` da JS → `processMessage`, il cui fast path deterministico gira prima di ogni controllo sul modello → Intent Android. `chat-store.init({ loadModel: false })` fa sì che un avvio da assistente non carichi il GGUF né avvii il foreground service: "timer di 30 secondi" arriva all'orologio senza che i pesi tocchino la RAM. Il modello si carica solo se l'utente chiede esplicitamente il fallback, cioè quando il parser ha già dichiarato che non era un comando di scheduling.
 
+### ADR-021: Due backend sotto un'unica astrazione; NPU Qualcomm via Genie/GenieX (non ancora implementato)
+
+**Contesto**: su un OnePlus 15 (Snapdragon 8 Elite Gen 5, SM8850) Qwen3 1.7B impiega 20-30s a caricarsi sul percorso llama.cpp attuale, che è CPU-bound. L'NPU Hexagon di quel SoC esiste apposta per questo carico. Ma i due mondi non sono intercambiabili: un `.gguf` gira ovunque, un context binary QNN è compilato per UNA famiglia di SoC e altrove non è "più lento", è inutilizzabile.
+
+**Decisione (architettura)**: `lib/llm/backends` introduce `ModelBackend` — `supports()`, `load()`, `generate()`, `unload()`, `getDiagnostics()` — con `LlamaCppBackend` (adattatore sottile su `llm-engine`, che resta l'implementazione) e un `QualcommNpuBackend` **dichiarato e non implementato**. Il registry sceglie il primo backend che rivendica il modello, con llama.cpp in fondo: qualunque cosa nessuno rivendichi finisce sull'unico runtime che gira sempre. Lo stub riporta `available: false` e non rivendica niente — uno stub che fingesse trasformerebbe un fallback pulito in un load fallito, cioè esattamente ciò che questa astrazione esiste per evitare. GGUF, modelli importati dall'utente e il modello di trust restano intoccati.
+
+**Decisione (backend NPU, da verificare in un pass dedicato)**: la strada consigliata è **Qualcomm Genie / GenieX**, non ExecuTorch e non il backend Hexagon di llama.cpp.
+- *Genie/GenieX*: la documentazione Qualcomm elenca esplicitamente `Snapdragon 8 Elite Gen 5` (SM8850) tra le piattaforme Android validate, usa **Qwen3-4B come esempio principale** del tutorial, e GenieX espone un **SDK Android in Kotlin su Maven Central** — cioè un percorso di integrazione pensato per un'app di terze parti, non un runner da riga di comando. Requisiti dichiarati: Android 15+, Hexagon v73+, QAIRT 2.29+, 12 GB di RAM per modelli 3B+.
+- *ExecuTorch QNN*: la pagina backend verifica SM8550/SM8450 e non elenca SM8850; richiede host Linux (Ubuntu 22.04), QNN SDK 2.37, NDK 26c, g++ 13, export AOT off-device in `.pte` e la ridistribuzione delle `.so` QNN con `LD_LIBRARY_PATH`/`ADSP_LIBRARY_PATH` da gestire a mano. Più pezzi mobili per lo stesso risultato.
+- *llama.cpp Hexagon*: è marcato **experimental** a monte e c'è una issue aperta su output corrotto proprio su SM8850 / Hexagon v81, oltre al limite di 3.5 GB di spazio di indirizzamento per sessione NPU. Sarebbe la strada più elegante (stesso runtime, stesso formato) e va ricontrollata più avanti, ma oggi non è una base su cui costruire.
+
+**Conseguenze**: il percorso NPU è per forza *curato*, non "porta il tuo GGUF": artefatti per-SoC (context binary + tokenizer + `genie_config.json`), esportati off-device via AI Hub. Perciò i due backend convivono invece di sostituirsi — llama.cpp resta l'unico che accetta un file arbitrario dell'utente. Da verificare prima di scrivere codice: i termini di ridistribuzione delle librerie runtime QAIRT/GenieX in un'app di terze parti, che la documentazione pubblica consultata non dichiara.
+
 ---
 
 ## 8. Sicurezza

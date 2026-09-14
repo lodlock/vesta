@@ -37,6 +37,27 @@ loopback-only MCP server, and a smaller permission set.
 
 ### Added — assistant
 
+- **The assistant answers anything now** — a request the scheduling parser
+  declines goes to the local model automatically instead of stopping at a
+  button. Scheduling still never loads it, and a clarification is still handled
+  locally; the model comes in only once the parser has actually given up.
+  Two settings, both default ON: "Answer anything" and "Speak answers".
+- **Spoken answers** — confirmations and answers are read back through the
+  Android system TTS engine (no cloud voice). One utterance at a time: a new
+  invocation or a dismissal cuts off the previous one. Successful timers,
+  alarms and reminders speak their confirmation and then dismiss the overlay,
+  returning you to whatever you were doing; failures, questions and model
+  answers stay on screen.
+- **No reasoning on screen or out loud** — assistant turns disable the model's
+  thinking pass at generation time, use llama.rn's reasoning-filtered output,
+  and sanitize whatever is left. Leaked tool-call JSON is stripped too. Ordinary
+  chat is unchanged.
+- **Two-backend seam** (`lib/llm/backends`) — `ModelBackend` with
+  `LlamaCppBackend` and a declared-but-unimplemented `QualcommNpuBackend`, so a
+  future NPU runtime can sit beside llama.cpp rather than replace it. Selection
+  is first-match-wins with llama.cpp last, so any GGUF — including your own —
+  always has a runtime. See ADR-021.
+
 - **Vesta can be the system digital assistant** — it now handles
   `ACTION_ASSIST`, which is what makes a package a `ROLE_ASSISTANT` candidate,
   so it appears under Settings → Default apps → Digital assistant app. It
