@@ -172,6 +172,12 @@ export const useModelStore = create<ModelState>((set, get) => ({
   // no filename convention is required; the file comes in through the system
   // file picker (SAF) exactly as before.
   //
+  // STORAGE: the picked URI is used ONCE, as a copy source. The bytes land in
+  // the app-private models directory and everything afterwards — the header
+  // check, the hash, llama.cpp, every later load — reads that copy. Nothing
+  // outside the app can rewrite it, which is why an import-time baseline plus
+  // a size check on load is enough and no multi-GB re-hash happens at startup.
+  //
   // Checksum policy, in order:
   //   1. a digest the user supplied (pasted, or an adjacent `.sha256`) → the
   //      file MUST match it. Mismatch, or hashing that fails, rejects the
@@ -189,12 +195,13 @@ export const useModelStore = create<ModelState>((set, get) => ({
     try {
       await ensureModelsDir();
       const fileName = name.endsWith(".gguf") ? name : `${name}.gguf`;
-      const finalPath = modelPathFor(fileName);
+      // Never import onto an existing file. Two different models can easily
+      // share a name ("model.gguf"), and adopting the bytes already there would
+      // silently import the WRONG file — worse, a checksum mismatch would then
+      // delete a model the user still has installed. Take a free name instead.
+      const finalPath = await freeModelPath(fileName);
       // Single copy straight to the final path (no temp-then-load double write).
-      const existing = await FileSystem.getInfoAsync(finalPath);
-      if (!existing.exists) {
-        await FileSystem.copyAsync({ from: uri, to: finalPath });
-      }
+      await FileSystem.copyAsync({ from: uri, to: finalPath });
 
       // Cheap structural check before the native parser sees the path: catches a
       // truncated copy or a mis-picked file with a clear message. Not a safety
@@ -266,7 +273,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
       const model = await insertModel({
         displayName: fileName.replace(/\.gguf$/i, ""),
         filePath: finalPath,
-        hfFile: fileName,
+        hfFile: finalPath.split("/").pop() ?? fileName,
         sizeBytes: info.exists ? (info.size ?? 0) : 0,
         contextSize: 4096,
         role: "primary",
@@ -435,6 +442,21 @@ export const useModelStore = create<ModelState>((set, get) => ({
 
   clearError: () => set({ error: null }),
 }));
+
+// The first unused path for this filename: `model.gguf`, then `model-2.gguf`,
+// `model-3.gguf`... Bounded, so a filesystem that reports every path as
+// existing can't spin here.
+async function freeModelPath(fileName: string): Promise<string> {
+  const base = fileName.replace(/\.gguf$/i, "");
+  for (let n = 1; n <= 50; n++) {
+    const candidate = modelPathFor(n === 1 ? fileName : `${base}-${n}.gguf`);
+    const info = await FileSystem.getInfoAsync(candidate);
+    if (!info.exists) return candidate;
+  }
+  // 50 files of the same name is not a real situation; fall back to a unique
+  // suffix rather than failing the import.
+  return modelPathFor(`${base}-${Date.now()}.gguf`);
+}
 
 // Shared download flow for catalog + ad-hoc repo downloads.
 async function runDownload(

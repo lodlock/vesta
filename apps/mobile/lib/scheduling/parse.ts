@@ -45,9 +45,20 @@ export type AmbiguityReason =
   | "out-of-range"
   | "time-in-past";
 
+// Extra facts a clarification question needs. Only the meridiem question has
+// any: it has to name the hour it is asking about ("4 AM or 4 PM?").
+export interface AmbiguityDetail {
+  hour12?: number;
+}
+
 export type ScheduleParse =
   | { status: "resolved"; intent: ScheduleIntent; normalized: string }
-  | { status: "ambiguous"; reason: AmbiguityReason; normalized: string }
+  | {
+      status: "ambiguous";
+      reason: AmbiguityReason;
+      normalized: string;
+      detail?: AmbiguityDetail;
+    }
   | { status: "none" };
 
 type Family = "timer" | "alarm" | "reminder" | "calendar";
@@ -256,6 +267,11 @@ export interface DurationQuantity {
   seconds: number;
   start: number;
   end: number; // exclusive
+  // The number as spoken, and the unit it was spoken with. `unitSeconds` is
+  // null when no unit was said at all ("warn me at forty"), which is what lets
+  // a bare warning borrow the timer's unit instead of assuming minutes.
+  value: number;
+  unitSeconds: number | null;
 }
 
 // Joins quantities that are one spoken duration split across two unit phrases:
@@ -277,6 +293,10 @@ function mergeAdjacent(
     if (prev && touching) {
       prev.seconds += hit.seconds;
       prev.end = hit.end;
+      // "one hour and thirty minutes" inherits as MINUTES: the last unit spoken
+      // is the finer one, and the one a follow-up number would be measured in.
+      prev.value = hit.value;
+      prev.unitSeconds = hit.unitSeconds;
     } else {
       out.push({ ...hit });
     }
@@ -322,7 +342,7 @@ function scanDurationRaw(
       (lang === "it" && /^mezz[ao]?$/.test(tokens[i]) && units[tokens[i + 1] ?? ""] === 3600)
     ) {
       const end = lang === "en" ? i + 3 : i + 2;
-      hits.push({ seconds: 1800, start: i, end });
+      hits.push({ seconds: 1800, start: i, end, value: 30, unitSeconds: 60 });
       i = end - 1;
       continue;
     }
@@ -332,7 +352,7 @@ function scanDurationRaw(
       (lang === "it" && tokens[i] === "quarto" && tokens[i + 1] === "d" && units[tokens[i + 2] ?? ""] === 3600)
     ) {
       const end = lang === "en" ? i + 4 : i + 3;
-      hits.push({ seconds: 900, start: i, end });
+      hits.push({ seconds: 900, start: i, end, value: 15, unitSeconds: 60 });
       i = end - 1;
       continue;
     }
@@ -352,7 +372,7 @@ function scanDurationRaw(
       value += 1800;
       end += lang === "en" ? 3 : 2;
     }
-    hits.push({ seconds: value, start: i, end });
+    hits.push({ seconds: value, start: i, end, value: num.value, unitSeconds: unit });
     i = end - 1;
   }
 
@@ -561,6 +581,12 @@ function prefersMorning(text: string, lang: Language): boolean {
   return hasPhrase(text, "wake me") || hasPhrase(text, "wake up");
 }
 
+// "Tomorrow" and weekdays are named future days. "Today" is not: it is the day
+// the next-occurrence rule already works within, so it needs no extra question.
+function isNamedFutureDay(hit: DayHit | null): boolean {
+  return hit?.kind === "tomorrow" || hit?.kind === "weekday";
+}
+
 function itWeekdayIndex(word: string): number {
   const map: Record<string, number> = {
     domenica: 0, lunedì: 1, lunedi: 1, martedì: 2, martedi: 2,
@@ -627,17 +653,22 @@ function pickWarningQuantity(
   return before ?? null;
 }
 
-// A bare number in a timer+warning sentence is a duration in MINUTES:
-// "timer for forty five, warning at forty" has no unit words at all, and
-// minutes is the only reading anyone means. Deliberately scoped to this
-// resolver — elsewhere a bare number could be a clock time, and guessing
-// between the two is how "set a timer for seven" silently becomes 7 minutes.
-function bareMinuteQuantities(
-  tokens: string[],
-  lang: Language,
-): DurationQuantity[] {
+// Tokens that are only ever articles, never a spoken quantity.
+const ARTICLES: Record<Language, string[]> = {
+  en: ["a", "an"],
+  it: ["un", "una", "uno"],
+};
+
+// A bare number in a timer+warning sentence — "warning at forty", "warn me at
+// one". The unit is decided later by findWarningPair (it borrows the timer's);
+// `seconds` here is provisional. Deliberately scoped to this resolver:
+// elsewhere a bare number could be a clock time, and guessing between the two
+// is how "set a timer for seven" would silently become 7 minutes.
+function bareQuantities(tokens: string[], lang: Language): DurationQuantity[] {
   const out: DurationQuantity[] = [];
   for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (ARTICLES[lang].includes(token)) continue;
     const num = readNumber(tokens, i, lang);
     if (!num) continue;
     // A number that carries its own unit is already a real quantity.
@@ -645,16 +676,26 @@ function bareMinuteQuantities(
       i = num.next;
       continue;
     }
-    // Ignore 1. "a"/"an"/"one" parse as the number one, but in this shape they
-    // are almost always an article or a pronoun ("a warning", "another ONE
-    // five minutes before"), and a bare one-minute warning is not a thing
-    // people say. Reading them as durations produced phantom quantities that
-    // pushed real pairs out of range.
+    // "one" is usually a pronoun in this shape ("another ONE five minutes
+    // before that"), so it counts as a quantity only where a quantity is
+    // syntactically due: right after "at", or right before "before".
     if (num.value <= 1) {
-      i = num.next - 1;
-      continue;
+      const prev = tokens[i - 1] ?? "";
+      const next = tokens[num.next] ?? "";
+      const isQuantityPosition =
+        AT_WORDS[lang].includes(prev) || BEFORE_WORDS[lang].includes(next);
+      if (!isQuantityPosition) {
+        i = num.next - 1;
+        continue;
+      }
     }
-    out.push({ seconds: num.value * 60, start: i, end: num.next });
+    out.push({
+      seconds: num.value * 60,
+      start: i,
+      end: num.next,
+      value: num.value,
+      unitSeconds: null,
+    });
     i = num.next - 1;
   }
   return out;
@@ -680,20 +721,21 @@ function bareMinuteQuantities(
 export function findWarningPair(
   tokens: string[],
   lang: Language,
-  opts: { allowGeneric?: boolean } = {},
+  opts: { allowGeneric?: boolean; allowBareNumbers?: boolean } = {},
 ): WarningPair {
   const marker = findWarningMarker(tokens, lang, opts.allowGeneric ?? false);
   if (!marker) return { kind: "none" };
 
   let quantities = scanDurationQuantities(tokens, lang);
-  if (quantities.length < 2 && scanClock(tokens, lang) === null) {
+  if (quantities.length < 2 && opts.allowBareNumbers) {
     // No units spoken ("forty five ... forty"), or only one of the two carried
-    // a unit: read bare numbers as minutes to fill the gap.
+    // a unit ("two hours ... at one"): read bare numbers too.
     //
-    // Only when the utterance holds no clock time at all. Otherwise "remind me
-    // to call mum at six and take the bread out in ten minutes" would read
-    // "six" as a six-minute timer and turn a reminder into a timer pair.
-    const bare = bareMinuteQuantities(tokens, lang).filter(
+    // Gated by the caller on there being no alarm/reminder/calendar in the
+    // utterance, because there a bare number is usually a clock time: "remind
+    // me to call mum at six and take the bread out in ten minutes" must not
+    // read "six" as a quantity and become a timer pair.
+    const bare = bareQuantities(tokens, lang).filter(
       (b) => !quantities.some((q) => b.start < q.end && q.start < b.end),
     );
     quantities = [...quantities, ...bare].sort((a, b) => a.start - b.start);
@@ -713,19 +755,32 @@ export function findWarningPair(
   const isAbsolute =
     !isRelative && AT_WORDS[lang].includes(tokens[warning.start - 1] ?? "");
 
-  const warningSeconds = isAbsolute
-    ? warning.seconds
-    : main.seconds - warning.seconds;
-
-  if (
-    main.seconds <= 0 ||
-    main.seconds > MAX_TIMER_SECONDS ||
-    warningSeconds <= 0 ||
-    warningSeconds >= main.seconds
-  ) {
+  if (main.seconds <= 0 || main.seconds > MAX_TIMER_SECONDS) {
     return { kind: "unresolved" };
   }
-  return { kind: "pair", durationSeconds: main.seconds, warningSeconds };
+
+  // UNIT INHERITANCE. An explicit unit always wins. A bare warning number
+  // borrows the timer's unit first — "give me two hours, warn me at one" is one
+  // HOUR, not one minute, and reading it as minutes is the dangerous answer
+  // because it fires 119 minutes early. Minutes stay as the fallback for when
+  // the borrowed unit gives something impossible ("two hours, warn me at
+  // ninety" is 90 minutes, since 90 hours cannot be it), and for when neither
+  // quantity named a unit at all ("timer for forty five, warning at forty").
+  const inheritedUnit = main.unitSeconds ?? 60;
+  const candidateLengths =
+    warning.unitSeconds !== null
+      ? [warning.seconds]
+      : [...new Set([warning.value * inheritedUnit, warning.value * 60])];
+
+  for (const length of candidateLengths) {
+    const warningSeconds = isAbsolute ? length : main.seconds - length;
+    if (warningSeconds > 0 && warningSeconds < main.seconds) {
+      return { kind: "pair", durationSeconds: main.seconds, warningSeconds };
+    }
+  }
+  // Nothing plausible: a warning that isn't before the end, or a number no unit
+  // makes sense of. Ask.
+  return { kind: "unresolved" };
 }
 
 // ── Intent detection ────────────────────────────────────────────────────────
@@ -827,34 +882,39 @@ function atTime(day: Date, hour: number, minute: number): Date {
  *
  * THE RULE, in order — the first line that applies decides it:
  *
- *  1. An explicit am/pm, or a 24-hour reading ("19:30", "at 0 hundred"), is
- *     taken as spoken.
+ *  1. An explicit am/pm, or a 24-hour reading ("19:30"), is taken as spoken.
  *  2. A part-of-day word anywhere in the utterance decides it: "in the
  *     morning" → am, "tonight" / "this evening" / "at night" → pm.
- *  3. A wake-up phrasing ("wake me", Italian "sveglia") means morning.
+ *  3. A wake-up phrasing ("wake me", Italian "sveglia", which is both the noun
+ *     and the verb) means morning.
  *  4. A bare "twelve" with none of the above is genuinely two-way — noon and
- *     midnight are twelve hours apart and both are plausible — so it ASKS.
- *  5. An explicit day or weekday was named: read 7-11 as morning and 1-6 as
- *     afternoon on that day. Across a day boundary "the next occurrence" stops
- *     meaning anything — "tomorrow at four" is 16:00, not 04:00.
- *  6. Otherwise: the NEXT PLAUSIBLE OCCURRENCE. Of the two readings (h and
- *     h+12), take whichever comes sooner from now, rolling into tomorrow when
- *     both have passed today.
+ *     midnight — so it ASKS.
+ *  5. A named FUTURE day ("tomorrow", "Friday") with a bare 1-12 hour: ASK.
+ *     Nothing in the sentence says which half of the day it is, and unlike
+ *     rule 6 there is no clock to lean on — "tomorrow at four" is a coin flip
+ *     between breakfast and teatime, and an alarm that guesses wrong by twelve
+ *     hours is worse than one more question.
+ *  6. Otherwise (no day, or "today"): the NEXT PLAUSIBLE OCCURRENCE. Of the two
+ *     readings (h and h+12), take whichever comes sooner from now, rolling into
+ *     tomorrow when both have passed today.
  *
  * Rule 6 is why "alarm for four" means 04:00 said at 02:00 and 16:00 said at
  * 13:00: at 02:00 the morning reading is two hours away and the afternoon one
  * fourteen. It is fully deterministic — the same (utterance, instant) pair
  * always gives the same answer — and it crosses midnight naturally, since a
- * reading that has passed today is simply tried again tomorrow.
+ * reading that has passed today is simply tried again tomorrow. "Today at four"
+ * uses it too, and may roll to tomorrow; the confirmation names the day it
+ * landed on.
  */
 function resolveClockInstant(
   clock: ClockHit,
   day: Date | null,
+  namedFutureDay: boolean,
   now: Date,
   text: string,
   lang: Language,
   preferAm: boolean,
-): { at: Date } | { ambiguous: "ambiguous-meridiem" } {
+): { at: Date } | { ambiguous: "ambiguous-meridiem"; hour12: number } {
   const { minute } = clock;
 
   // The next time this hour:minute comes around, today or tomorrow.
@@ -882,13 +942,17 @@ function resolveClockInstant(
 
   // 4. Noon or midnight — ask. (Checked before the wake-up rule: "wake me at
   // twelve" is no less ambiguous for being a wake-up.)
-  if (clock.hour === 12) return { ambiguous: "ambiguous-meridiem" };
+  if (clock.hour === 12) {
+    return { ambiguous: "ambiguous-meridiem", hour12: 12 };
+  }
 
   // 3. Wake-up phrasing.
   if (preferAm) return fixed(clock.hour);
 
-  // 5. A named day.
-  if (day) return { at: atTime(day, clock.hour <= 6 ? clock.hour + 12 : clock.hour, minute) };
+  // 5. A named future day with nothing to disambiguate it — ask.
+  if (namedFutureDay) {
+    return { ambiguous: "ambiguous-meridiem", hour12: clock.hour };
+  }
 
   // 6. Next plausible occurrence.
   const am = nextOccurrence(clock.hour);
@@ -945,7 +1009,15 @@ export function parseSchedulingCommand(
   // short: the longest one this is built for is eight tokens.
   const MAX_FAMILYLESS_PAIR_TOKENS = 14;
   const hasTimerFamily = families.includes("timer");
-  const pairOpts = { allowGeneric: hasTimerFamily };
+  const pairOpts = {
+    allowGeneric: hasTimerFamily,
+    // Bare numbers are quantities only where nothing else in the utterance
+    // wants a clock time. With an alarm, a reminder or an event in it, "at six"
+    // is six o'clock.
+    allowBareNumbers: !families.some(
+      (f) => f === "alarm" || f === "reminder" || f === "calendar",
+    ),
+  };
   const pairAllowed = (segment: string[]) =>
     hasTimerFamily || segment.length <= MAX_FAMILYLESS_PAIR_TOKENS;
   const lastSegment = segmentsOf(norm.segments).at(-1) ?? tokens;
@@ -1035,13 +1107,19 @@ export function parseSchedulingCommand(
     const settled = resolveClockInstant(
       clock.hit,
       targetDay,
+      isNamedFutureDay(day?.hit ?? null),
       now,
       text,
       lang,
       prefersMorning(text, lang),
     );
     if ("ambiguous" in settled) {
-      return { status: "ambiguous", reason: settled.ambiguous, normalized: text };
+      return {
+        status: "ambiguous",
+        reason: settled.ambiguous,
+        normalized: text,
+        detail: { hour12: settled.hour12 },
+      };
     }
     const time = `${pad2(settled.at.getHours())}:${pad2(settled.at.getMinutes())}`;
     const label = leftoverPhrase(clock.tokens, clock.hit.spans, lang);
@@ -1087,13 +1165,19 @@ export function parseSchedulingCommand(
     const settled = resolveClockInstant(
       clock.hit,
       targetDay,
+      isNamedFutureDay(day?.hit ?? null),
       now,
       text,
       lang,
       prefersMorning(text, lang),
     );
     if ("ambiguous" in settled) {
-      return { status: "ambiguous", reason: settled.ambiguous, normalized: text };
+      return {
+        status: "ambiguous",
+        reason: settled.ambiguous,
+        normalized: text,
+        detail: { hour12: settled.hour12 },
+      };
     }
     const when = settled.at;
     // Only reachable when the user named a day and that time on it has gone.
@@ -1112,13 +1196,28 @@ export function parseSchedulingCommand(
   // time and a clear leftover title; otherwise hand the utterance to the model,
   // which is good at exactly this.
   if (!clock) return { status: "none" };
-  const targetDay = dateForHit(day?.hit ?? null, now);
-  const settled = resolveClockInstant(clock.hit, targetDay, now, text, lang, false);
-  if ("ambiguous" in settled) {
-    return { status: "ambiguous", reason: settled.ambiguous, normalized: text };
-  }
+  // Title first: an event we cannot name goes to the model regardless, and
+  // asking AM/PM about it would be a question with no useful answer.
   const title = leftoverPhrase(clock.tokens, clock.hit.spans, lang);
   if (!title) return { status: "none" };
+  const targetDay = dateForHit(day?.hit ?? null, now);
+  const settled = resolveClockInstant(
+    clock.hit,
+    targetDay,
+    isNamedFutureDay(day?.hit ?? null),
+    now,
+    text,
+    lang,
+    false,
+  );
+  if ("ambiguous" in settled) {
+    return {
+      status: "ambiguous",
+      reason: settled.ambiguous,
+      normalized: text,
+      detail: { hour12: settled.hour12 },
+    };
+  }
   const start = settled.at;
   return {
     status: "resolved",

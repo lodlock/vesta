@@ -54,8 +54,10 @@ loopback-only MCP server, and a smaller permission set.
   "with a five-minute warning", "a warning at forty" all set two timers (the
   warning first) instead of asking which one you meant. "N before" counts back
   from the end, "at M" is the warning's own length, and bare numbers in this
-  shape are minutes — so "timer for forty-five, warning at forty" works with no
-  unit words at all.
+  shape are minutes when no unit is spoken at all — so "timer for forty-five,
+  warning at forty" works with no unit words in it. A bare warning number
+  otherwise borrows the timer's unit: "give me two hours, warn me at one" is a
+  one-HOUR warning, not one minute.
 - **Asks instead of guessing** — a recognized scheduling command that isn't
   safely resolvable still asks: missing duration/time/subject, a bare "twelve",
   two genuinely different actions ("an alarm for seven and a timer for ten
@@ -65,8 +67,14 @@ loopback-only MCP server, and a smaller permission set.
 - **A bare hour resolves to the next plausible occurrence** — of the two
   readings, whichever comes sooner, rolling past midnight when both have passed.
   "Alarm for four" is 04:00 said at 02:00 and 16:00 said at 13:00. An explicit
-  am/pm, a part-of-day word, a wake-up phrasing or a named day all take
-  precedence, and a bare "twelve" asks.
+  am/pm, a part-of-day word and a wake-up phrasing take precedence.
+- **A named future day with a bare hour asks instead of guessing** — "alarm
+  tomorrow at four" now asks "4 AM or 4 PM?" rather than picking one. With a
+  clock to lean on the next-occurrence rule is safe; across a day boundary it
+  is a coin flip, and an alarm that is twelve hours wrong is worse than one
+  more question. "Tomorrow at four in the morning", "tomorrow at four PM",
+  "tomorrow at 16:00" and "wake me tomorrow at seven" all still resolve
+  straight away, and "today at four" keeps the next-occurrence rule.
 - **Scheduling works with no model loaded** — a timer or an alarm still runs
   while a model is downloading or failed to load.
 - Sub-minute timers are confirmed as "30 seconds" rather than "0.5 minutes".
@@ -99,7 +107,8 @@ loopback-only MCP server, and a smaller permission set.
   later change to the file is detectable — `activate()` rejects a model whose
   size no longer matches, and a Verify action re-hashes on demand. Imports also
   get a cheap GGUF header check (magic, version, plausible counts, truncation)
-  before llama.cpp opens the file.
+  before llama.cpp opens the file, and never write over an existing model file:
+  two models can share a name, so a colliding import takes a free one.
 - **Fewer Android permissions** — `SYSTEM_ALERT_WINDOW`, `WRITE_CONTACTS`,
   `READ_EXTERNAL_STORAGE` and `WRITE_EXTERNAL_STORAGE` were reaching the
   generated manifest from the Expo template and from `expo-contacts` without any

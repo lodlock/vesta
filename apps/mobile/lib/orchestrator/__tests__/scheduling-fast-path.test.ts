@@ -55,7 +55,7 @@ describe("fast path — resolved commands never reach the model", () => {
   });
 
   it("gates a self-corrected alarm for confirmation instead of arming it", async () => {
-    const res = await send("alarm for eight… no, eight thirty tomorrow");
+    const res = await send("alarm for eight… no, eight thirty tomorrow morning");
 
     expect(mockGenerate).not.toHaveBeenCalled();
     expect(res.type).toBe("pending_tool_call");
@@ -106,6 +106,14 @@ describe("fast path — resolved commands never reach the model", () => {
     expect(res.type).toBe("tool_call");
     // The warning timer failed; saying "both set" would be a lie.
     if (res.type === "tool_call") expect(res.result.success).toBe(false);
+  });
+
+  it("asks which half of the day a bare hour on a named day means", async () => {
+    const res = await send("set an alarm tomorrow at four");
+
+    expect(mockGenerate).not.toHaveBeenCalled();
+    expect(res).toEqual({ type: "text", content: "Do you mean 4 AM or 4 PM?" });
+    expect(mockDispatch).not.toHaveBeenCalled();
   });
 
   it("asks in Italian when the language is Italian", async () => {

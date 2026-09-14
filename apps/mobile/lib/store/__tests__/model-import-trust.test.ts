@@ -184,6 +184,43 @@ describe("importLocalModel — user-supplied GGUF", () => {
     expect(row.displayName).toBe("my-merge");
   });
 
+  it("copies into app-private storage and imports from THAT copy", async () => {
+    await importIt();
+
+    // The SAF URI is a copy source and nothing else: the header check, the
+    // hash and the registry row all point at the app-private copy.
+    expect(mockFS.copyAsync).toHaveBeenCalledWith({
+      from: URI,
+      to: "file:///docs/models/my-merge.gguf",
+    });
+    expect(mockHeader).toHaveBeenCalledWith("file:///docs/models/my-merge.gguf");
+    expect(mockSha).toHaveBeenCalledWith("file:///docs/models/my-merge.gguf");
+    expect(mockInsert).toHaveBeenCalledWith(
+      expect.objectContaining({ filePath: "file:///docs/models/my-merge.gguf" }),
+    );
+  });
+
+  it("never imports onto an existing file — it takes a free name", async () => {
+    // A model called my-merge.gguf is already installed. Adopting its bytes
+    // would import the wrong file, and a checksum mismatch would then delete a
+    // model the user still has.
+    mockFS.getInfoAsync.mockImplementation(async (path: string) =>
+      path === "file:///docs/models/my-merge.gguf"
+        ? ({ exists: true, size: 123 } as never)
+        : ({ exists: false } as never),
+    );
+
+    await importIt();
+
+    expect(mockFS.copyAsync).toHaveBeenCalledWith({
+      from: URI,
+      to: "file:///docs/models/my-merge-2.gguf",
+    });
+    expect(mockInsert).toHaveBeenCalledWith(
+      expect.objectContaining({ filePath: "file:///docs/models/my-merge-2.gguf" }),
+    );
+  });
+
   it("rejects a file that fails the GGUF header check before llama sees it", async () => {
     mockHeader.mockResolvedValue({ ok: false, error: "Not a GGUF file (bad magic bytes)." });
 

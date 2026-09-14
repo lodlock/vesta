@@ -76,12 +76,19 @@ describe("timers — stammered and fuzzy", () => {
 });
 
 describe("alarms — self-correction and meridiem", () => {
-  it('"alarm for eight… no, eight thirty tomorrow" → 08:30 tomorrow', () => {
-    expect(resolved(parse("alarm for eight… no, eight thirty tomorrow"))).toMatchObject({
-      kind: "alarm",
-      time: "08:30",
-      date: "2026-09-17",
-    });
+  it('"alarm for eight… no, eight thirty tomorrow morning" → 08:30 tomorrow', () => {
+    // The correction wins; "morning" is what makes 08:30 rather than 20:30.
+    expect(
+      resolved(parse("alarm for eight… no, eight thirty tomorrow morning")),
+    ).toMatchObject({ kind: "alarm", time: "08:30", date: "2026-09-17" });
+  });
+
+  it("asks AM or PM for that same sentence without the daypart word", () => {
+    const p = parse("alarm for eight… no, eight thirty tomorrow");
+    if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
+    expect(p.reason).toBe("ambiguous-meridiem");
+    // The correction still won — the question is about EIGHT thirty.
+    expect(p.detail?.hour12).toBe(8);
   });
 
   it('"wake me tomorrow at seven… actually seven fifteen" keeps tomorrow from the first segment', () => {
@@ -168,16 +175,44 @@ describe("alarms — self-correction and meridiem", () => {
       });
     });
 
-    it("a named day uses the daytime reading, where 'nearest' means nothing", () => {
-      // "tomorrow at four" is 16:00 — the 04:00 reading is nearer but nobody
-      // means it.
-      expect(alarmAt("set an alarm tomorrow at four", at(13))).toMatchObject({
+    it("a named future day with a bare hour ASKS instead of guessing", () => {
+      // Nothing here says which half of tomorrow, and unlike the rule above
+      // there is no clock to lean on. Guessing is a 12-hour coin flip.
+      for (const text of [
+        "set an alarm tomorrow at four",
+        "set an alarm on friday at four",
+      ]) {
+        const p = parse(text, "en", at(13));
+        if (p.status !== "ambiguous") throw new Error(`expected ambiguous for ${text}`);
+        expect(p.reason).toBe("ambiguous-meridiem");
+        expect(p.detail?.hour12).toBe(4);
+      }
+    });
+
+    it("a named future day resolves as soon as anything disambiguates it", () => {
+      expect(alarmAt("set an alarm tomorrow at four in the morning", at(13))).toMatchObject({
+        time: "04:00",
+        date: "2026-09-17",
+      });
+      expect(alarmAt("set an alarm tomorrow at four pm", at(13))).toMatchObject({
         time: "16:00",
         date: "2026-09-17",
       });
-      expect(alarmAt("set an alarm tomorrow at nine", at(13))).toMatchObject({
-        time: "09:00",
+      expect(alarmAt("set an alarm tomorrow at 16:00", at(13))).toMatchObject({
+        time: "16:00",
         date: "2026-09-17",
+      });
+      // The wake-up cue counts as disambiguation, as documented in rule 3.
+      expect(alarmAt("wake me tomorrow at seven", at(13))).toMatchObject({
+        time: "07:00",
+        date: "2026-09-17",
+      });
+    });
+
+    it("'today' keeps the next-occurrence rule — it needs no extra question", () => {
+      expect(alarmAt("set an alarm today at four", at(13))).toMatchObject({
+        time: "16:00",
+        date: "2026-09-16",
       });
     });
   });
@@ -304,11 +339,20 @@ describe("declines — leaves the model alone", () => {
 
 describe("calendar events", () => {
   it("resolves title + start when both are clear", () => {
-    const intent = resolved(parse("schedule a dentist appointment tomorrow at three"));
+    const intent = resolved(
+      parse("schedule a dentist appointment tomorrow at three in the afternoon"),
+    );
     if (intent.kind !== "calendarEvent") throw new Error("expected an event");
     expect(intent.title).toBe("dentist");
     expect(intent.start.getHours()).toBe(15);
     expect(intent.start.getDate()).toBe(17);
+  });
+
+  it("asks AM or PM for a named day with a bare hour", () => {
+    const p = parse("schedule a dentist appointment tomorrow at three");
+    if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
+    expect(p.reason).toBe("ambiguous-meridiem");
+    expect(p.detail?.hour12).toBe(3);
   });
 });
 
@@ -337,9 +381,64 @@ describe("timer with an earlier warning", () => {
     expect(pair("timer for forty five, give me a warning at forty")).toEqual([40, 45]);
   });
 
-  it("reads bare numbers as minutes in this shape", () => {
+  it("reads bare numbers as minutes when no unit is spoken at all", () => {
     // Not a unit word in sight — and "forty five ... forty" can only be minutes.
     expect(pair("timer for forty five, warning at forty")).toEqual([40, 45]);
+  });
+
+  // A bare warning number borrows the timer's unit. Reading "warn me at one"
+  // against a two-hour timer as ONE MINUTE would fire 119 minutes early, which
+  // is the whole reason this rule exists.
+  describe("unit inheritance for a bare warning quantity", () => {
+    const secs = (text: string) => {
+      const intent = resolved(parse(text));
+      if (intent.kind !== "timerWithWarning") {
+        throw new Error(`expected timerWithWarning, got ${intent.kind}`);
+      }
+      return [intent.warningSeconds, intent.durationSeconds];
+    };
+
+    it("borrows hours from an hours timer", () => {
+      expect(secs("give me two hours, warn me at one")).toEqual([3600, 7200]);
+    });
+
+    it("borrows minutes from a minutes timer", () => {
+      expect(secs("give me ninety minutes, warn me at sixty")).toEqual([3600, 5400]);
+      expect(secs("give me forty-five minutes, warn me at forty")).toEqual([2400, 2700]);
+    });
+
+    it("borrows seconds from a seconds timer", () => {
+      expect(secs("set a timer for ninety seconds, warn me at sixty")).toEqual([60, 90]);
+    });
+
+    it("lets an explicit unit win over the borrowed one", () => {
+      // Thirty MINUTES before the end of a two-hour timer → 90 minutes in.
+      expect(secs("give me two hours, warn me thirty minutes before")).toEqual([5400, 7200]);
+      expect(secs("give me two hours, warn me one hour before")).toEqual([3600, 7200]);
+    });
+
+    it("falls back to minutes when the borrowed unit is impossible", () => {
+      // 90 hours cannot be a warning on a 2-hour timer; 90 minutes can.
+      expect(secs("give me two hours, warn me at ninety")).toEqual([5400, 7200]);
+    });
+
+    it("asks when no unit makes the number work", () => {
+      // 300 hours and 300 minutes are both past the end of a two-hour timer,
+      // so there is nothing plausible left to pick.
+      const p = parse("give me two hours, warn me at 300");
+      expect(p.status).toBe("ambiguous");
+    });
+
+    it("survives fillers and stammers around the inherited unit", () => {
+      expect(secs("give me uh two two hours, warn me at at one")).toEqual([3600, 7200]);
+      expect(secs("give me ninety minutes, uh warn me at sixty sixty")).toEqual([3600, 5400]);
+    });
+
+    it("takes the corrected timer when the unit is corrected too", () => {
+      // The correction restates the whole pair in seconds.
+      expect(secs("give me two hours no wait ninety seconds, warn me at sixty"))
+        .toEqual([60, 90]);
+    });
   });
 
   it("survives fillers and a stammered repeat", () => {

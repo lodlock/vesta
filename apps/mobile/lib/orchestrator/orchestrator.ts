@@ -77,7 +77,10 @@ async function tryDeterministicScheduling(
 
   if (parsed.status === "ambiguous") {
     // Recognized as scheduling but not safely resolvable — ask, don't guess.
-    return { type: "text", content: clarificationFor(parsed.reason, lang) };
+    return {
+      type: "text",
+      content: clarificationFor(parsed.reason, lang, parsed.detail),
+    };
   }
   if (parsed.status !== "resolved") return null;
 

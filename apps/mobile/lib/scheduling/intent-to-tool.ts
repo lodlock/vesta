@@ -6,7 +6,7 @@
 
 import { localDateStr, pad2, addDays } from "../orchestrator/date-utils";
 import type { Language } from "../orchestrator/types";
-import type { AmbiguityReason, ScheduleIntent } from "./parse";
+import type { AmbiguityDetail, AmbiguityReason, ScheduleIntent } from "./parse";
 
 export interface ResolvedToolCall {
   tool: string;
@@ -195,12 +195,26 @@ export function intentToToolCall(
 export function clarificationFor(
   reason: AmbiguityReason,
   lang: Language,
+  detail?: AmbiguityDetail,
 ): string {
+  // The meridiem question names the hour it is asking about, because "AM or
+  // PM?" on its own makes the user reconstruct what Vesta heard. Twelve gets
+  // its own wording: "12 AM" is the one form people reliably misread.
+  const hour = detail?.hour12;
+  const meridiemEn =
+    hour === undefined || hour === 12
+      ? "Do you mean 12 noon or 12 midnight?"
+      : `Do you mean ${hour} AM or ${hour} PM?`;
+  const meridiemIt =
+    hour === undefined || hour === 12
+      ? "Intendi mezzogiorno o mezzanotte?"
+      : `Intendi le ${hour} del mattino o le ${hour + 12}?`;
+
   const en: Record<AmbiguityReason, string> = {
     "missing-duration": "How long should the timer be?",
     "missing-time": "What time should I set it for?",
     "missing-subject": "What should I remind you about?",
-    "ambiguous-meridiem": "Do you mean 12 noon or 12 midnight?",
+    "ambiguous-meridiem": meridiemEn,
     "compound-request":
       "That sounded like two things at once — which should I set first?",
     "out-of-range": "That duration doesn't look right — how long should it be?",
@@ -210,7 +224,7 @@ export function clarificationFor(
     "missing-duration": "Di quanto deve essere il timer?",
     "missing-time": "A che ora lo imposto?",
     "missing-subject": "Cosa devo ricordarti?",
-    "ambiguous-meridiem": "Intendi mezzogiorno o mezzanotte?",
+    "ambiguous-meridiem": meridiemIt,
     "compound-request":
       "Mi sembrano due cose insieme — quale imposto per prima?",
     "out-of-range": "Quella durata non torna — di quanto deve essere?",
