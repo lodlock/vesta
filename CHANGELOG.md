@@ -8,13 +8,15 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/spec
 ## [Unreleased]
 
 Fase 6 — MCP + Advanced begins with a local MCP server: expose Vesta's on-device
-tools to an agent on your laptop (Claude Code / Desktop) over your Wi-Fi, with the
-private data never leaving the phone.
+tools to an agent on your laptop (Claude Code / Desktop), with the private data
+never leaving the phone. Plus a hardening pass for scheduling-focused use:
+deterministic parsing of spoken timers and alarms, verified model downloads, a
+loopback-only MCP server, and a smaller permission set.
 
 ### Added — Fase 6
 
 - **Local MCP server (slice 1)** — a Model Context Protocol server that a laptop
-  agent can call over the LAN. It exposes exactly the three read-only tools
+  agent can call. It exposes exactly the three read-only tools
   (`get_calendar_events`, `search_contacts`, `query_document`) and returns their
   structured data, not a generated answer: over MCP the host agent does the
   reasoning, so Vesta skips the orchestrator's generation loop and hands back the
@@ -30,8 +32,66 @@ private data never leaving the phone.
   (`POST /mcp`, JSON-RPC 2.0, no SSE) is a dumb transport + auth gate: it checks
   the bearer token, forwards the raw request body to JS over the same
   device-event bridge as the memory-pressure signal, and blocks on a
-  `CompletableFuture` until the TypeScript MCP engine responds. Binds `0.0.0.0`
-  and the Settings screen shows the LAN URL. Single-client by design.
+  `CompletableFuture` until the TypeScript MCP engine responds. Single-client by
+  design. (Shipped binding `0.0.0.0`; now binds loopback — see Security below.)
+
+### Added — scheduling
+
+- **Deterministic scheduling parser** (`lib/scheduling`) — timers, alarms,
+  reminders and calendar events are now resolved from the transcript itself,
+  before the model is consulted. It tolerates what dictation actually produces:
+  fillers ("set a **uh** set a five five minute timer"), stammered repeats, and
+  mid-sentence self-corrections ("alarm for eight… **no, eight thirty
+  tomorrow**", "wake me tomorrow at seven… **actually seven fifteen**"), taking
+  the corrected value while keeping a qualifier the correction didn't restate.
+  Resolves to a small structured intent — `timer(durationSeconds, label?)`,
+  `alarm(time, date?, label?)`, `reminder(dateTime, text)`,
+  `calendarEvent(start, title)` — which maps onto the existing tool call, the
+  existing confirmation gate and the existing Android intents. English and
+  Italian.
+- **Asks instead of guessing** — a recognized scheduling command that isn't
+  safely resolvable now asks a question rather than picking a time: missing
+  duration/time/subject, a bare "twelve", a compound request ("forty-five
+  minutes, but remind me five minutes before too"), an implausible length.
+  Anything it doesn't recognize as scheduling goes to the model exactly as
+  before.
+- **Scheduling works with no model loaded** — a timer or an alarm still runs
+  while a model is downloading or failed to load.
+- Sub-minute timers are confirmed as "30 seconds" rather than "0.5 minutes".
+
+### Security
+
+- **The MCP server binds `127.0.0.1` by default** — it previously bound every
+  interface, putting a plaintext bearer token and the read tools' output
+  (calendar, contacts, document passages) on whatever Wi-Fi the phone was on.
+  LAN exposure is now a separate, explicitly confirmed opt-in; the pairing
+  command for the default case leads with `adb reverse tcp:8420 tcp:8420`. The
+  server remains off by default.
+- **Downloaded models are verified by SHA-256** — the finished file is hashed
+  (natively, streaming) and compared against HuggingFace's LFS oid *before* the
+  rename that promotes it to the model directory. A mismatch is quarantined and
+  the download fails; previously only the file size was checked, so a
+  substituted or corruptly-resumed file could be loaded as weights. Models that
+  can't be verified (no published oid) are reported as such instead of passing
+  silently.
+- **Fewer Android permissions** — `SYSTEM_ALERT_WINDOW`, `WRITE_CONTACTS`,
+  `READ_EXTERNAL_STORAGE` and `WRITE_EXTERNAL_STORAGE` were reaching the
+  generated manifest from the Expo template and from `expo-contacts` without any
+  Vesta code path using them; they are now stripped (including from library
+  manifest merges). A new `VESTA_SCHEDULING_ONLY=1` prebuild also drops
+  `READ_CONTACTS`, for a build that only does scheduling.
+- `SECURITY.md` no longer claims Vesta has "no network communication": it now
+  documents the two real paths (HuggingFace model downloads out, the optional
+  loopback MCP server in) and states plainly that there is no telemetry, no
+  analytics, no crash reporting and no cloud inference.
+
+### Fixed
+
+- **Voice input language** — the system recognizer was handed a `Locale` object
+  where `EXTRA_LANGUAGE` is read as a string, so recognizers saw `null` and fell
+  back to their own default language. It now receives an IETF language tag.
+  Vesta continues to use the Android system recognizer (so FUTO Voice Input and
+  any other user-chosen engine keep working) and ships no STT of its own.
 
 ## [0.2.0] — 2026-07-07
 

@@ -207,9 +207,12 @@ This is a massive positioning upgrade: from "offline assistant" to "the local ag
 - Use case: Claude Code asks Vesta to "check my calendar for tomorrow" → Vesta reads local calendar → returns data → Claude Code uses it in its workflow. All without the calendar data ever leaving the device.
 
 **Slice 1 — Local MCP server: SHIPPED (verified on a Pixel 10 Pro, 2026-07-08).**
-Read-only MCP server over the LAN: a native NanoHTTPD transport + auth gate in the
-Android layer (`POST /mcp`, JSON-RPC 2.0, no SSE, binds `0.0.0.0`) forwards raw
-requests to a TypeScript MCP engine that reuses the tool registry and dispatcher.
+Read-only MCP server: a native NanoHTTPD transport + auth gate in the Android
+layer (`POST /mcp`, JSON-RPC 2.0, no SSE) forwards raw requests to a TypeScript
+MCP engine that reuses the tool registry and dispatcher. It binds **127.0.0.1**
+(hardening pass, ADR-017 — it shipped binding `0.0.0.0`); reaching it from a
+laptop is `adb reverse tcp:8420 tcp:8420`, and LAN binding is a separate
+explicit opt-in that states what plaintext exposure means.
 Exposes exactly the three `returnsData` read tools (`get_calendar_events`,
 `search_contacts`, `query_document`) and returns their **structured data, not a
 generated answer** — over MCP the host agent reasons, so Vesta skips the
@@ -223,8 +226,10 @@ contacts, and a retrieved PDF passage for `query_document` — retrieval ran, ge
 skipped); a non-read tool (`make_call`) was refused (`isError`, never dispatched); an
 absent/wrong/revoked token → 401 (`{"error":"unauthorized"}`), a non-`/mcp` path → 404;
 revoking a client in-app made its token fail instantly. Slice 1 assumes Vesta is
-foregrounded during MCP use. Deferred to later slices: action (write) tools with a
-remote-confirm UX, mDNS discovery, TLS, boot-time auto-restore, and a
+foregrounded during MCP use. (That exit gate was met with the server on
+`0.0.0.0`; the same checks hold over `adb reverse` now that it binds loopback.)
+Deferred to later slices: action (write) tools with a remote-confirm UX, mDNS
+discovery, TLS, boot-time auto-restore, and a
 `ConnectivityManager.NetworkCallback` rebind on network change.
 
 **Other Fase 6 candidates:**

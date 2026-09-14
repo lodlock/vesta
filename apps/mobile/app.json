@@ -36,7 +36,8 @@
       "expo-notifications",
       "llama.rn",
       "./plugins/with-system-actions",
-      "./plugins/with-android-signing"
+      "./plugins/with-android-signing",
+      "./plugins/with-permission-profile"
     ],
     "ios": {
       "bundleIdentifier": "com.cosmico.vesta"

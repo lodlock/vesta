@@ -490,13 +490,49 @@ Hub connesso → delega dei task pesanti al modello 70B; Hub assente → tutto l
 
 **Motivazione**: l'embedding è l'unica risorsa davvero cheap-to-rebuild. Il modello chat vale il costo di tenerlo; se la pressione è tale che l'OS ci uccide comunque, il Foreground Service è START_STICKY e la prefix session cache (ADR-012) rende la ripartenza ~3s. La session cache su disco NON va toccata sotto pressione: non ha lavoro pendente cancellabile (il debounce è un gate su `Date.now()`, non un timer) e cancellarla eliminerebbe proprio ciò che rende economico il restart.
 
+### ADR-017: Il server MCP ascolta su loopback; la LAN è un opt-in a parte
+
+**Contesto (Fase 6, slice 1)**: il trasporto nativo NanoHTTPD apriva `0.0.0.0`. Il server è spento di default e ogni richiesta passa da un bearer token, ma il trasporto è HTTP in chiaro e i tre tool esposti restituiscono calendario, numeri di telefono e passaggi dei documenti: su una Wi-Fi qualsiasi (hotel, ufficio, coinquilini) significa token e dati privati in chiaro, raggiungibili da qualunque host della rete.
+
+**Decisione**: `McpServerModule.startServer(port, bindLan)` lega `127.0.0.1` salvo opt-in esplicito. La LAN è un secondo interruttore (`mcp_bind_lan`, di default off) con una conferma che dice cosa comporta. Cambiare binding a server acceso chiude il socket e rilega. Dal laptop, il caso loopback si raggiunge con `adb reverse tcp:8420 tcp:8420` (il comando di pairing lo mostra).
+
+**Motivazione**: il valore di slice 1 — un agente sul computer dell'utente che chiede dati a Vesta — non richiede la LAN. Chi la vuole la accende sapendo cosa accende, invece di scoprirlo. Finché non c'è TLS, "rete domestica fidata" è il limite dichiarato.
+
+### ADR-018: I GGUF scaricati si verificano con SHA-256, non con la dimensione
+
+**Contesto (Fase 6)**: il downloader confrontava solo i byte totali (con 1 KB di tolleranza, e solo quando la dimensione era autorevole), poi rinominava il file nella directory dei modelli, dove llama.cpp lo mmappa come pesi. Un file sostituito, troncato-e-ripadded o ripreso male passava. L'oid LFS di HuggingFace — che è proprio lo sha256 — arrivava fino alla riga del DB e non veniva mai usato.
+
+**Decisione**: prima del rename, il file temporaneo viene digerito e confrontato con l'oid atteso. Il digest è nativo (`SystemActionsModule.sha256File`, streaming a blocchi da 1 MB su un thread dedicato): un file da più GB non può attraversare il bridge né bloccare il thread dei moduli nativi. Un mismatch mette il file in quarantena (`<final>.corrupt`) e fallisce con un messaggio chiaro — mai rinominato, e mai lasciato sul path temporaneo dove una resume ci appenderebbe sopra. I casi non verificabili (repo senza oid, build senza hashing nativo) vengono detti, non spacciati per verificati.
+
+**Motivazione**: la dimensione non dice niente sul contenuto, e il contenuto qui viene eseguito come pesi del modello. Il controllo di cancellazione resta DOPO l'hash, così un cancel durante il digest (che è lungo) vince comunque sul commit.
+
+### ADR-019: Lo scheduling si risolve in modo deterministico, prima del modello
+
+**Contesto (hardening Android)**: timer, sveglie, promemoria ed eventi sono i comandi che armano stato reale del dispositivo, e sono anche quelli che la dettatura maltratta di più (esitazioni, ripetizioni, correzioni a metà frase). Farli passare da un 4B campionato rendeva il percorso più rischioso anche il meno prevedibile.
+
+**Decisione**: `lib/scheduling` normalizza la trascrizione (via i filler, collassa le ripetizioni, spezza sulle marche di correzione) e legge i valori dall'ULTIMO segmento che li dichiara, così una correzione vince mentre un qualificatore non ripetuto (tipicamente il giorno) resta. Se è sicuro produce un intent strutturato — `timer(durationSeconds, label?)`, `alarm(time, date?, label?)`, `reminder(dateTime, text)`, `calendarEvent(start, title)` — che `intent-to-tool.ts` mappa sulla chiamata al tool ESISTENTE; se non è sicuro chiede (durata/ora/oggetto mancante, un "dodici" nudo, una richiesta doppia); se non riconosce un comando di scheduling restituisce `none` e la strada resta quella del modello, invariata. Un'ora nuda segue una regola diurna fissa (1-6 → pomeriggio, 7-11 → mattina) invece di "la prossima occorrenza": la stessa frase non può valere 04:00 adesso e 16:00 tra sei ore.
+
+**Motivazione**: determinismo dove sbagliare costa di più, e latenza zero sul comando più frequente. L'esecuzione non cambia — stesso dispatcher, stesso confirm gate, stessi Intent Android — quindi il parser decide gli argomenti, mai l'esecuzione. Effetto collaterale utile: lo scheduling funziona anche mentre un modello si scarica o non è riuscito a caricarsi.
+
 ---
 
 ## 8. Sicurezza
 
 ### 8.1 Threat Model
 
-- **Nessun attacco di rete**: l'app non comunica con server esterni (l'unico traffico è il download modelli, avviato dall'utente).
+- **Superficie di rete (due sole direzioni, entrambe avviate dall'utente)**:
+  - *In uscita*: `lib/models/hf-client.ts` verso `huggingface.co` (elenco dei
+    `.gguf` di un repo e download del file, che redirige sulla CDN di HF). È
+    l'UNICA `fetch()` dell'app. Nessuna telemetria, nessuna analytics, nessun
+    crash reporting, nessuna inferenza cloud — e nessun SDK che possa
+    aggiungerli. Il file scaricato viene verificato con SHA-256 contro l'oid LFS
+    pubblicato da HF **prima** di essere promosso a modello utilizzabile (vedi
+    ADR-018); un mismatch va in quarantena e il download fallisce.
+  - *In ingresso*: il server MCP opzionale (Fase 6), **spento di default** e,
+    quando acceso, in ascolto su **127.0.0.1**. L'esposizione in LAN è un
+    secondo opt-in esplicito e confermato: è HTTP in chiaro, quindi il bearer
+    token e i dati (calendario, contatti, estratti dei documenti) attraversano
+    il Wi-Fi in chiaro. Token per-client, revocabili all'istante. Niente TLS.
 - **Accesso fisico al device**: conversazioni e documenti sono sul device, nel sandbox dell'app. Encryption at rest del database: **non implementata** (il DB vive nella private app dir; FDE/FBE di Android è la mitigazione corrente). Candidata per una fase futura.
 - **Prompt injection via documenti**: un PDF malizioso potrebbe contenere testo che manipola il modello. Mitigazione: i chunk sono iniettati come tool result con istruzione di rispondere SOLO sugli estratti; le azioni di sistema restano dietro il confirm gate.
 - **Azioni non autorizzate**: il modello potrebbe hallucinate un'azione non richiesta. Mitigazione: step di conferma esplicito nella UI prima di ogni azione; `make_call`/`send_sms` sono sempre confermati e comunque non partono da soli (ACTION_DIAL/ACTION_SENDTO aprono l'app di sistema — l'utente preme l'ultimo bottone).
@@ -509,9 +545,50 @@ Permessi effettivamente dichiarati (`apps/mobile/app.json`):
 |---|---|
 | `com.android.alarm.permission.SET_ALARM` | Sveglie e timer |
 | `READ_CALENDAR` / `WRITE_CALENDAR` | Leggere e creare eventi |
-| `READ_CONTACTS` | Cercare contatti per nome |
+| `READ_CONTACTS` | Cercare contatti per nome (NON serve allo scheduling — vedi sotto) |
 | `POST_NOTIFICATIONS` | Reminder (notifiche locali) + notifica del Foreground Service |
 | `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_SPECIAL_USE` | Tenere il modello in memoria |
 | `RECORD_AUDIO` | Input vocale dal widget (riconoscitore di sistema) |
 
-Permessi che il design originale prevedeva e che NON servono: `CALL_PHONE` e `SEND_SMS` (le azioni usano `ACTION_DIAL`/`ACTION_SENDTO`: aprono l'app di sistema precompilata, l'utente conferma lì); `READ_EXTERNAL_STORAGE` (documenti e modelli importati via Storage Access Framework); `ACCESS_NETWORK_STATE` (serviva al Mac Hub, parcheggiato).
+Non sono in `app.json` ma finiscono comunque nel manifest generato, quindi vanno
+contati:
+
+| Permesso | Da dove arriva | Perché serve |
+|---|---|---|
+| `INTERNET` | manifest di `expo-file-system` + template Expo | Download dei modelli (unica uscita di rete) |
+| `VIBRATE` | blocco "optional" del template Expo | Notifiche dei promemoria |
+| `RECEIVE_BOOT_COMPLETED` | manifest di `expo-notifications` | Riarmare i promemoria dopo un riavvio |
+
+**Permessi rimossi dal manifest** (`plugins/with-permission-profile.js`), perché
+nessun percorso di codice li raggiunge: `SYSTEM_ALERT_WINDOW` (overlay, dal
+blocco "optional" del template — widget e quick chat sono normali Activity),
+`WRITE_CONTACTS` (aggiunto da `expo-contacts`; Vesta i contatti li legge
+soltanto), `READ_EXTERNAL_STORAGE` / `WRITE_EXTERNAL_STORAGE` (storage legacy
+dal template; documenti e modelli passano dallo Storage Access Framework e
+vivono nella app-private dir). Il plugin li toglie sia dalla nostra
+dichiarazione sia, con `tools:node="remove"`, da quelle che una libreria
+potrebbe unire in fase di build.
+
+**Build "solo scheduling"**: con `VESTA_SCHEDULING_ONLY=1 npx expo prebuild
+--platform android --clean` viene tolto anche `READ_CONTACTS`. Le funzioni che
+lo usano (`search_contacts`, `make_call`, `send_sms`) degradano in modo onesto —
+il permesso risulta negato e i tool rispondono già "mi servono i permessi per
+accedere ai contatti" — mentre timer, sveglie, promemoria ed eventi non toccano
+la rubrica. Di default la build resta completa.
+
+Permessi che il design originale prevedeva e che NON servono: `CALL_PHONE` e `SEND_SMS` (le azioni usano `ACTION_DIAL`/`ACTION_SENDTO`: aprono l'app di sistema precompilata, l'utente conferma lì); `ACCESS_NETWORK_STATE` (serviva al Mac Hub, parcheggiato). Nessun Accessibility Service, nessun accesso al registro chiamate, nessun permesso SMS.
+
+### 8.3 Input vocale
+
+L'input vocale passa dal riconoscitore **di sistema**
+(`RecognizerIntent.ACTION_RECOGNIZE_SPEECH` in `VestaVoiceActivity`), non da un
+motore incluso nell'app: chiunque l'utente abbia impostato come riconoscitore
+gestisce l'audio, quindi un motore offline come FUTO Voice Input funziona senza
+modifiche e Vesta non spedisce né conserva audio. Non sostituire questo percorso
+con un Whisper integrato: l'offline-first sta lì, e il riconoscitore di sistema è
+già caldo quando l'utente tocca il microfono.
+
+Il testo che ne esce è quello che una persona dice davvero — esitazioni,
+ripetizioni, correzioni a metà frase — e per i comandi di scheduling viene
+normalizzato e interpretato in modo deterministico in `lib/scheduling` (vedi
+ADR-019) prima ancora di considerare il modello.

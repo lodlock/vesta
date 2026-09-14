@@ -26,14 +26,14 @@
 
 ## What is Vesta?
 
-Vesta is an AI assistant that lives on your phone, not in the cloud. It runs open language models locally with [llama.cpp](https://github.com/ggerganov/llama.cpp) (via [llama.rn](https://github.com/mybigday/llama.rn)) and turns natural language into real device actions — setting alarms, creating calendar events, scheduling reminders — **without sending a single byte to the internet.**
+Vesta is an AI assistant that lives on your phone, not in the cloud. It runs open language models locally with [llama.cpp](https://github.com/ggerganov/llama.cpp) (via [llama.rn](https://github.com/mybigday/llama.rn)) and turns natural language into real device actions — setting alarms, creating calendar events, scheduling reminders — **without sending a single byte of your data to the internet.**
 
 It's a real chat assistant too: ask questions, brainstorm, draft text, get a recipe. Automation is the bonus, not the whole point.
 
 Named after the Roman goddess of the hearth, Vesta is the sacred fire that never goes out.
 
-- **Offline-first.** Chat, actions, memory, and storage all work in airplane mode. No API keys, no subscriptions, no telemetry. (Voice input is the one optional extra that delegates to the system speech recognizer.)
-- **Private by design.** Conversations, memories, and documents stay on your device. Period.
+- **Offline-first.** Chat, actions, memory, and storage all work in airplane mode. No API keys, no subscriptions, no telemetry, no analytics, no crash reporting. (Voice input is the one optional extra, and it delegates to the system speech recognizer — so an offline engine like FUTO Voice Input works as-is.)
+- **Private by design.** Conversations, memories, and documents stay on your device. Period. The app makes exactly one kind of outbound request — downloading a model you picked, from HuggingFace — and the downloaded file is verified against its published SHA-256 before it is used. See [SECURITY.md](SECURITY.md).
 - **Real actions, not just chat.** Natural language maps to native Android intents — `"svegliami alle 7"` actually sets a 07:00 alarm.
 - **Bring your own model.** Any GGUF model runs. Download a curated pick in-app, or import your own `.gguf`.
 - **Bilingual from day one.** English and Italian, with more languages on the roadmap.
@@ -66,6 +66,7 @@ Named after the Roman goddess of the hearth, Vesta is the sacred fire that never
 | 📄 **Document RAG** | Import a PDF, Word, text, or Markdown file and ask questions answered from its contents — on-device embeddings, fully offline. |
 | 🪪 **Conversation memory** | Personal facts are extracted and stored locally, then injected into future prompts for continuity. |
 | 📄 **Knowledge files** | Import `.md` / `.txt` files as portable, always-offline personal context. |
+| ⏱️ **Fuzzy spoken scheduling** | Timers, alarms, reminders and events are parsed deterministically from what you actually said — fillers, stammers and mid-sentence corrections included ("set a uh set a five five minute timer", "alarm for eight… no, eight thirty tomorrow"). No model in the loop, and it asks rather than guessing when a command is ambiguous. |
 | 🕘 **Conversation history** | Full persistence with SQLite — browse, switch, and delete past chats. |
 | 📱 **Home-screen widget** | A 2×2 widget with a quick-chat bar and voice entry — one tap to talk to Vesta. |
 | 🔁 **Query loop** | Read tools (calendar, contacts) run inline, so questions like "che appuntamenti ho domani?" get answered in natural language from your real on-device data. |
