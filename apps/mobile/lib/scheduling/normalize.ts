@@ -28,7 +28,9 @@ const FILLERS: Record<Language, string[]> = {
 // "no wait" wins over a bare "no".
 const CORRECTIONS: Record<Language, string[]> = {
   en: [
-    "no wait", "wait no", "hold on", "scratch that", "make it", "let's say",
+    // Apostrophes are stripped by basicClean, so markers are written without
+    // them ("lets say", not "let's say") or they could never match.
+    "no wait", "wait no", "hold on", "scratch that", "make it", "lets say",
     "actually", "sorry", "i mean", "i meant", "rather", "instead", "no",
   ],
   it: [
