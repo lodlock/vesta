@@ -69,6 +69,25 @@ export async function listGgufFiles(repo: string): Promise<HfFile[]> {
   return parseGgufTree(json);
 }
 
+// Network: the published digest for ONE known file in a repo. Used to
+// re-verify a model that is already on disk — a download that predates
+// verification, say — without re-fetching gigabytes.
+//
+// Returns null when the repo lists no such file or publishes no LFS oid for it;
+// that is "no authoritative digest exists", which callers must report rather
+// than treat as a pass. Network failures throw, so "couldn't reach HuggingFace"
+// stays distinguishable from "HuggingFace has nothing to check against".
+export async function fetchExpectedSha256(
+  repo: string,
+  fileName: string,
+): Promise<string | null> {
+  const files = await listGgufFiles(repo);
+  const base = (path: string) => path.split("/").pop() ?? path;
+  const wanted = base(fileName).toLowerCase();
+  const match = files.find((f) => base(f.path).toLowerCase() === wanted);
+  return match?.sha256 ?? null;
+}
+
 export interface AccessResult {
   ok: boolean;
   status: number;

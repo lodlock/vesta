@@ -35,6 +35,26 @@ loopback-only MCP server, and a smaller permission set.
   `CompletableFuture` until the TypeScript MCP engine responds. Single-client by
   design. (Shipped binding `0.0.0.0`; now binds loopback — see Security below.)
 
+### Fixed — models
+
+- **Downloaded models could become unselectable with no way back** — a model
+  left in an errored state (a failed load, or a recorded size that no longer
+  matched) showed no explanation on the catalog card and no action except
+  Delete, so the only visible difference was its trust label. Trust was never
+  the cause: nothing gates activation on it. Both the Models screen and
+  `activate()` now read ONE policy (`lib/models/activation`), so a row that
+  looks selectable is, and one that isn't says why.
+- **Verify now repairs instead of just reporting** — for a model downloaded
+  from a repo, it fetches that file's published SHA-256, hashes the copy on
+  disk, and on a match records `verified_upstream` and makes the model usable
+  again. No re-download, and nothing is deleted. A mismatch errors the model
+  and never activates it. If no digest can be obtained — the repo publishes
+  none, or it can't be reached — the model stays explicitly unverified rather
+  than being credited with a check that didn't happen.
+- **Embedding models are no longer offered as the chat model** — Nomic Embed
+  showed "Use this model", which would have loaded an embedding model into the
+  chat context and left it unable to answer anything.
+
 ### Added — assistant
 
 - **The assistant answers anything now** — a request the scheduling parser

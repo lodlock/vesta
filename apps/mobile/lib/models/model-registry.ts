@@ -186,15 +186,33 @@ export async function finalizeModel(
 }
 
 // Records the outcome of an on-demand integrity re-check (Models → Verify).
+//
+// `state` is part of it because verification is also the way BACK: a row marked
+// errored by a failed load, or by a size that no longer matched, is provably
+// fine once its bytes hash to the digest its repo publishes, and should become
+// usable again without re-downloading gigabytes. `sizeBytes` likewise — a stale
+// recorded size is exactly what sends a healthy model to 'error'.
 export async function setModelIntegrity(
   id: string,
-  fields: { sha256: string; trust: ModelTrust },
+  fields: {
+    sha256?: string | null;
+    trust?: ModelTrust;
+    state?: DownloadStatus;
+    sizeBytes?: number;
+  },
 ): Promise<void> {
   const d = await getDatabase();
   await d.runAsync(
-    "UPDATE models SET sha256 = ?, trust = ? WHERE id = ?",
-    fields.sha256,
-    fields.trust,
+    `UPDATE models
+       SET sha256 = COALESCE(?, sha256),
+           trust = COALESCE(?, trust),
+           state = COALESCE(?, state),
+           size_bytes = COALESCE(?, size_bytes)
+     WHERE id = ?`,
+    fields.sha256 ?? null,
+    fields.trust ?? null,
+    fields.state ?? null,
+    fields.sizeBytes ?? null,
     id,
   );
 }

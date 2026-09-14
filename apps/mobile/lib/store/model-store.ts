@@ -29,7 +29,13 @@ import {
   ensureModelsDir,
   modelPathFor,
 } from "../models/download-manager";
-import { listGgufFiles, resolveUrl, type HfFile } from "../models/hf-client";
+import {
+  listGgufFiles,
+  resolveUrl,
+  fetchExpectedSha256,
+  type HfFile,
+} from "../models/hf-client";
+import { canActivate } from "../models/activation";
 import { checkGgufFile } from "../models/gguf-header";
 import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
 import { sha256File, normalizeSha256 } from "../native/file-hash";
@@ -292,45 +298,107 @@ export const useModelStore = create<ModelState>((set, get) => ({
     }
   },
 
-  // On-demand full re-check: re-hash the file and compare it to the digest on
-  // record. This is what turns the import baseline into something useful — it
-  // answers "is this still the file I imported?". Deliberately manual: hashing
-  // a multi-GB model takes seconds, so it does not belong on every app start
-  // (activate() does the cheap size check instead).
+  // On-demand re-check, and the way back for a model that has been marked
+  // unusable.
+  //
+  // Re-downloading multi-GB weights to fix a DATABASE row is the wrong answer,
+  // and deleting the user's file to "fix" it is worse. So this re-establishes
+  // the facts from the bytes that are already on disk:
+  //
+  //   digest matches the repo's published oid → verified_upstream, usable again
+  //   digest matches the one on record        → trust kept, usable again
+  //   digest mismatch                         → errored, NOT activated, said plainly
+  //   no digest obtainable                    → stays unverified (nothing is
+  //                                             claimed), but an intact file is
+  //                                             made usable rather than stranded
+  //
+  // Manual by design: hashing several GB takes seconds, which does not belong
+  // in a cold start (activate() does the cheap size check instead).
   verifyIntegrity: async (id: string) => {
     set({ busy: true, error: null });
     try {
       const model = await getModelById(id);
       if (!model) return;
+
       const info = await FileSystem.getInfoAsync(model.filePath);
       if (!info.exists) {
         await setModelState(id, "error");
-        set({ error: "Model file is missing — re-download or re-import it." });
+        await get().refresh();
+        set({ error: `${model.displayName}: the file is gone — re-download it.` });
         return;
       }
+      const actualSize = info.size ?? 0;
+
       const digest = await sha256File(model.filePath);
       if (digest === null) {
         set({ error: "File hashing is unavailable on this build." });
         return;
       }
-      if (!model.sha256) {
-        // Nothing on record to compare against (an older row): adopt this as the
-        // baseline rather than claiming anything about where the file came from.
-        await setModelIntegrity(id, { sha256: digest, trust: "user_supplied_baseline" });
-        await get().refresh();
-        set({ error: `Recorded a new integrity baseline for ${model.displayName}.` });
-        return;
+
+      // The authoritative digest, when the model came from a repo. A network
+      // failure here is NOT a verification failure — it is not knowing.
+      let upstream: string | null = null;
+      let upstreamReachable = true;
+      if (model.hfRepo && model.hfFile) {
+        try {
+          upstream = normalizeSha256(await fetchExpectedSha256(model.hfRepo, model.hfFile));
+        } catch {
+          upstreamReachable = false;
+        }
       }
-      if (digest !== model.sha256) {
+
+      if (upstream) {
+        if (digest === upstream) {
+          await setModelIntegrity(id, {
+            sha256: digest,
+            trust: "verified_upstream",
+            state: "ready",
+            sizeBytes: actualSize,
+          });
+          await get().refresh();
+          set({ error: `${model.displayName} verified against ${model.hfRepo}. Ready to use.` });
+          return;
+        }
         await setModelState(id, "error");
         await get().refresh();
         set({
-          error: `${model.displayName} has CHANGED since it was recorded — the file no longer matches its SHA-256. It has been marked unusable.`,
+          error: `${model.displayName} does NOT match the SHA-256 published by ${model.hfRepo}. It has not been activated — delete and re-download it.`,
         });
         return;
       }
+
+      // No upstream digest. Fall back to whatever was recorded for this file.
+      const recorded = normalizeSha256(model.sha256);
+      if (recorded) {
+        if (digest === recorded) {
+          await setModelIntegrity(id, { state: "ready", sizeBytes: actualSize });
+          await get().refresh();
+          set({ error: `${model.displayName} still matches its recorded SHA-256.` });
+          return;
+        }
+        await setModelState(id, "error");
+        await get().refresh();
+        set({
+          error: `${model.displayName} has CHANGED since it was recorded. It has not been activated.`,
+        });
+        return;
+      }
+
+      // Nothing authoritative to check against. Say so rather than implying a
+      // pass — but an intact file should not be stranded either, so record the
+      // digest as a baseline and let it be used, still labelled unverified.
+      await setModelIntegrity(id, {
+        sha256: digest,
+        trust: "unverified",
+        state: "ready",
+        sizeBytes: actualSize,
+      });
       await get().refresh();
-      set({ error: `${model.displayName} still matches its recorded SHA-256.` });
+      set({
+        error: upstreamReachable
+          ? `${model.displayName}: its repository publishes no SHA-256, so it stays unverified. The file is intact and usable.`
+          : `${model.displayName}: couldn't reach ${model.hfRepo} to check it, so it stays unverified. The file is intact and usable.`,
+      });
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -341,8 +409,18 @@ export const useModelStore = create<ModelState>((set, get) => ({
   activate: async (id: string) => {
     set({ error: null });
     const model = await getModelById(id);
-    if (!model || model.state !== "ready") {
+    if (!model) {
       set({ error: "Model is not ready." });
+      return;
+    }
+    // The SAME check the Models screen draws its buttons from, so a row that
+    // looks selectable is selectable and a row that isn't says why. Note what
+    // it does not consider: trust. An unverified model is labelled, not
+    // blocked — blocking here while the UI didn't would be a second, invisible
+    // policy.
+    const check = canActivate(model);
+    if (!check.ok) {
+      set({ error: check.message });
       return;
     }
     const info = await FileSystem.getInfoAsync(model.filePath);
@@ -360,7 +438,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
       await setModelState(id, "error");
       await get().refresh();
       set({
-        error: `${model.displayName} changed on disk (${info.size ?? 0} bytes, expected ${model.sizeBytes}). It was not loaded — verify or re-import it.`,
+        error: `${model.displayName} changed on disk (${info.size ?? 0} bytes, expected ${model.sizeBytes}). Tap Verify to check it against its source.`,
       });
       return;
     }

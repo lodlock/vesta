@@ -15,6 +15,7 @@ import { CATALOG } from "../lib/models/catalog";
 import { listGgufFiles, type HfFile } from "../lib/models/hf-client";
 import type { CatalogModel, InstalledModel, ModelTrust } from "../lib/models/types";
 import { formatBytes, formatDuration, percent, fitLabel, type FitLabel } from "../lib/models/format";
+import { canActivate, canVerify } from "../lib/models/activation";
 import { colors, spacing, radii, typography } from "../lib/theme";
 
 export default function ModelsScreen() {
@@ -103,6 +104,7 @@ export default function ModelsScreen() {
           onActivate={activate}
           onCancel={cancel}
           onRemove={confirmRemove}
+          onVerify={verifyIntegrity}
         />
       ))}
 
@@ -205,6 +207,7 @@ function CatalogRow({
   onActivate,
   onCancel,
   onRemove,
+  onVerify,
 }: {
   model: CatalogModel;
   installed: InstalledModel | undefined;
@@ -214,9 +217,11 @@ function CatalogRow({
   onActivate: (id: string) => void;
   onCancel: (id: string) => void;
   onRemove: (m: InstalledModel) => void;
+  onVerify: (id: string) => void;
 }) {
   const prog = installed ? progress[installed.id] : undefined;
   const downloading = prog?.status === "downloading";
+  const activation = installed ? canActivate(installed) : null;
 
   return (
     <View style={[styles.card, installed?.isActive && styles.cardActive]}>
@@ -239,6 +244,12 @@ function CatalogRow({
       {installed && !downloading && (
         <Text style={styles.rowHint}>{TRUST_LABEL[installed.trust]}</Text>
       )}
+      {/* Why a downloaded model can't be selected. Without this the row simply
+          lost its button and the only visible difference was a trust label —
+          which is not the reason, and looked like it was. */}
+      {installed && !downloading && activation && !activation.ok && (
+        <Text style={styles.rowError}>{activation.message}</Text>
+      )}
 
       {downloading && prog && (
         <ProgressBar written={prog.bytesWritten} total={prog.bytesTotal} etaSeconds={prog.etaSeconds} />
@@ -255,9 +266,14 @@ function CatalogRow({
             <Text style={styles.btnOutlineText}>Cancel</Text>
           </TouchableOpacity>
         )}
-        {installed && installed.state === "ready" && !installed.isActive && (
+        {installed && activation?.ok && !installed.isActive && (
           <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={() => onActivate(installed.id)} activeOpacity={0.7}>
             <Text style={styles.btnPrimaryText}>Use this model</Text>
+          </TouchableOpacity>
+        )}
+        {installed && !downloading && canVerify(installed) && (
+          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(installed.id)} activeOpacity={0.7}>
+            <Text style={styles.btnOutlineText}>Verify</Text>
           </TouchableOpacity>
         )}
         {installed?.isActive && (
@@ -302,6 +318,7 @@ function InstalledRow({
   onVerify: (id: string) => void;
 }) {
   const downloading = progress?.status === "downloading";
+  const activation = canActivate(model);
   return (
     <View style={[styles.card, model.isActive && styles.cardActive]}>
       <View style={styles.rowHeader}>
@@ -310,7 +327,9 @@ function InstalledRow({
       </View>
       {model.hfRepo && <Text style={styles.rowHint}>{model.hfRepo}</Text>}
       {!downloading && <Text style={styles.rowHint}>{TRUST_LABEL[model.trust]}</Text>}
-      {model.state === "error" && <Text style={styles.rowError}>Failed — re-download or delete.</Text>}
+      {!downloading && !activation.ok && (
+        <Text style={styles.rowError}>{activation.message}</Text>
+      )}
 
       {downloading && progress && (
         <ProgressBar written={progress.bytesWritten} total={progress.bytesTotal} etaSeconds={progress.etaSeconds} />
@@ -322,7 +341,7 @@ function InstalledRow({
             <Text style={styles.btnOutlineText}>Cancel</Text>
           </TouchableOpacity>
         )}
-        {model.state === "ready" && !model.isActive && (
+        {activation.ok && !model.isActive && (
           <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={() => onActivate(model.id)} activeOpacity={0.7}>
             <Text style={styles.btnPrimaryText}>Use this model</Text>
           </TouchableOpacity>
@@ -332,9 +351,9 @@ function InstalledRow({
             <Text style={styles.btnActiveText}>● Active</Text>
           </View>
         )}
-        {!downloading && model.sha256 && (
-          <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={() => onVerify(model.id)} activeOpacity={0.7}>
-            <Text style={styles.btnGhostText}>Verify</Text>
+        {!downloading && canVerify(model) && (
+          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(model.id)} activeOpacity={0.7}>
+            <Text style={styles.btnOutlineText}>Verify</Text>
           </TouchableOpacity>
         )}
         {!downloading && (
