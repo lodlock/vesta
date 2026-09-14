@@ -24,6 +24,8 @@ import {
 import { getKnowledgeForPrompt } from "./knowledge-manager";
 import { getConfig } from "../storage/database";
 import { toolRequiresConfirmation, toolReturnsData } from "../tools/tool-registry";
+import { parseSchedulingCommand } from "../scheduling/parse";
+import { intentToToolCall, clarificationFor } from "../scheduling/intent-to-tool";
 
 const MAX_HISTORY_MESSAGES = 20;
 // Once the conversation exceeds the window, `slice(-MAX)` would re-slice to a
@@ -54,6 +56,50 @@ export function executeToolCall(
   return dispatchToolCall(tool, parameters, lang);
 }
 
+// Deterministic scheduling fast path. Timers, alarms, reminders and calendar
+// events are the commands where a sampled model is most expensive to get wrong
+// — they arm a real device alarm — and where the phrasing is most predictable.
+// When the parser is confident, the tool call is built from the transcript
+// itself: no generation, no temperature, identical output every time, and it
+// works with no model loaded at all. Anything it isn't confident about returns
+// null here and takes the normal LLM route, unchanged.
+//
+// The resolved call still goes through dispatchToolCall and the same
+// confirmation gate as a model-routed one — this decides the arguments, never
+// the execution.
+async function tryDeterministicScheduling(
+  userText: string,
+  lang: Language,
+  now: Date,
+  confirmEnabled: boolean,
+): Promise<OrchestratorResponse | null> {
+  const parsed = parseSchedulingCommand(userText, { now, lang });
+
+  if (parsed.status === "ambiguous") {
+    // Recognized as scheduling but not safely resolvable — ask, don't guess.
+    return { type: "text", content: clarificationFor(parsed.reason, lang) };
+  }
+  if (parsed.status !== "resolved") return null;
+
+  const call = intentToToolCall(parsed.intent, now, lang);
+  if (toolRequiresConfirmation(call.tool, confirmEnabled)) {
+    return {
+      type: "pending_tool_call",
+      tool: call.tool,
+      parameters: call.parameters,
+      message: call.message,
+    };
+  }
+  const result = await dispatchToolCall(call.tool, call.parameters, lang);
+  return {
+    type: "tool_call",
+    tool: call.tool,
+    parameters: call.parameters,
+    message: call.message,
+    result,
+  };
+}
+
 export async function processMessage(
   userText: string,
   history: Message[],
@@ -69,24 +115,38 @@ export async function processMessage(
   // construction, which is the KV-cache invariant. Defaults to now.
   sentAt: Date = new Date(),
 ): Promise<OrchestratorResponse> {
+  // The confirmation setting gates both routes below (default ON for safety).
+  let confirmEnabled = true;
+  try {
+    confirmEnabled = (await getConfig("confirm_destructive_actions")) !== "false";
+  } catch (err) {
+    console.warn("[Orchestrator] Failed to read the confirmation setting:", err);
+  }
+
+  // Deterministic scheduling first — before the model-loaded check, so a timer
+  // or an alarm still works while a model is downloading or failed to load.
+  const scheduled = await tryDeterministicScheduling(
+    userText,
+    lang,
+    sentAt,
+    confirmEnabled,
+  );
+  if (scheduled) return scheduled;
+
   if (!isLoaded()) {
     return { type: "error", error: "No model loaded" };
   }
 
-  // Fetch relevant memories and knowledge files for context injection, plus the
-  // destructive-action confirmation setting (default ON for safety).
+  // Fetch relevant memories and knowledge files for context injection.
   let memoriesBlock: string | null = null;
   let knowledgeBlock: string | null = null;
-  let confirmEnabled = true;
   try {
-    const [m, k, confirmCfg] = await Promise.all([
+    const [m, k] = await Promise.all([
       getMemoriesForPrompt(),
       getKnowledgeForPrompt(),
-      getConfig("confirm_destructive_actions"),
     ]);
     memoriesBlock = m;
     knowledgeBlock = k;
-    confirmEnabled = confirmCfg !== "false";
   } catch (err) {
     console.warn("[Orchestrator] Failed to fetch context:", err);
   }

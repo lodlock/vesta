@@ -54,6 +54,17 @@ export async function setAlarm(
   }
 }
 
+// Spoken timers are often sub-minute ("thirty seconds"), which arrives here as
+// a fraction of a minute — "0.5 minutes" is not something to say back to a user.
+function describeSeconds(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  const parts: string[] = [];
+  if (m) parts.push(`${m} ${m === 1 ? "minute" : "minutes"}`);
+  if (s) parts.push(`${s} ${s === 1 ? "second" : "seconds"}`);
+  return parts.join(" ");
+}
+
 export async function setTimer(
   minutes: number,
   label?: string,
@@ -68,12 +79,20 @@ export async function setTimer(
     };
   }
 
+  const seconds = Math.round(minutes * 60);
+  if (seconds < 1) {
+    return {
+      success: false,
+      message: "Invalid timer duration",
+      error: `Timer must be at least 1 second, got ${minutes} minutes`,
+    };
+  }
+
   try {
-    await SystemActionsModule.setTimer(Math.round(minutes * 60), label || "");
-    const unit = minutes === 1 ? "minute" : "minutes";
+    await SystemActionsModule.setTimer(seconds, label || "");
     return {
       success: true,
-      message: `Timer set for ${minutes} ${unit}${label ? ` (${label})` : ""}`,
+      message: `Timer set for ${describeSeconds(seconds)}${label ? ` (${label})` : ""}`,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

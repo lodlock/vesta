@@ -4,6 +4,11 @@
 //
 // Only the native-touching modules are mocked; response-parser, tool-registry
 // and prompt-builder run for real so the retry decision is exercised end-to-end.
+//
+// The user text in these tests must be something the deterministic scheduling
+// parser does NOT claim (see lib/scheduling): a recognized scheduling command
+// returns before any generate() call, which is the wrong path to test here.
+// What the mocked model replies with is what drives each case.
 
 import { processMessage } from "../orchestrator";
 import { generate } from "../../llm/llm-engine";
@@ -64,7 +69,7 @@ describe("processMessage — malformed-JSON retry-once-with-correction", () => {
       message: "Timer impostato per 5 minuti",
     });
 
-    const res = await processMessage("timer di 5 minuti", [], "it");
+    const res = await processMessage("puoi darmi una mano", [], "it");
 
     expect(mockGenerate).toHaveBeenCalledTimes(2);
     // The correction turn must ask for JSON-only.
@@ -96,7 +101,7 @@ describe("processMessage — malformed-JSON retry-once-with-correction", () => {
       .mockResolvedValueOnce(gen('{"tool":"set_timer","parameters":{"minutes":'))
       .mockResolvedValueOnce(gen("Certo, posso aiutarti a impostare un timer."));
 
-    const res = await processMessage("timer", [], "it");
+    const res = await processMessage("ho una richiesta strana", [], "it");
 
     expect(mockGenerate).toHaveBeenCalledTimes(2);
     expect(res).toEqual({
@@ -111,7 +116,7 @@ describe("processMessage — malformed-JSON retry-once-with-correction", () => {
       .mockResolvedValueOnce(gen('{"tool":"set_alarm","parameters":{"time":"07:'))
       .mockResolvedValueOnce(gen('{"tool":"set_alarm","parameters":{"time":"07:'));
 
-    const res = await processMessage("wake me", [], "en");
+    const res = await processMessage("help me out here", [], "en");
 
     expect(mockGenerate).toHaveBeenCalledTimes(2);
     expect(res.type).toBe("text");
@@ -127,7 +132,7 @@ describe("processMessage — malformed-JSON retry-once-with-correction", () => {
     );
     mockDispatch.mockResolvedValue({ success: true, message: "ok" });
 
-    const res = await processMessage("timer 10", [], "en");
+    const res = await processMessage("tell me something", [], "en");
 
     expect(mockGenerate).toHaveBeenCalledTimes(1);
     expect(res.type).toBe("tool_call");
@@ -150,7 +155,7 @@ describe("processMessage — malformed-JSON retry-once-with-correction", () => {
       }),
     );
 
-    const res = await processMessage("timer di 5 minuti", [], "it");
+    const res = await processMessage("puoi darmi una mano", [], "it");
 
     // No correction pass — the user asked to stop.
     expect(mockGenerate).toHaveBeenCalledTimes(1);
@@ -164,7 +169,7 @@ describe("processMessage — malformed-JSON retry-once-with-correction", () => {
       .mockResolvedValueOnce(gen('{"tool":"set_timer","parameters":{"minutes":'))
       .mockResolvedValueOnce(gen("   ")); // whitespace-only retry
 
-    const res = await processMessage("timer", [], "it");
+    const res = await processMessage("ho una richiesta strana", [], "it");
 
     expect(mockGenerate).toHaveBeenCalledTimes(2);
     expect(res.type).toBe("text");

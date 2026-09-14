@@ -16,6 +16,13 @@ import java.util.Locale
  * Transparent activity launched from the widget's mic button.
  * Starts Android's speech recognizer, then forwards the transcribed text
  * to MainActivity via a deep link intent (vesta://chat?voice_text=...).
+ *
+ * Deliberately the SYSTEM recognizer (RecognizerIntent.ACTION_RECOGNIZE_SPEECH),
+ * not a bundled engine: whatever the user has set as their recognizer handles
+ * the audio, so an offline one such as FUTO Voice Input works unchanged and
+ * Vesta never ships its own STT. Do not replace this with Whisper or route it
+ * through a service — offline-first is the point, and the system recognizer is
+ * already warm when the user taps.
  */
 class VestaVoiceActivity : Activity() {
 
@@ -60,9 +67,22 @@ class VestaVoiceActivity : Activity() {
     private fun startSpeechRecognition() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            // EXTRA_LANGUAGE is read with getStringExtra: it must be an IETF
+            // language tag ("en-US"), not a Locale. Passing the Locale object
+            // stored a Serializable that every recognizer read back as null and
+            // silently fell back to its own default language.
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
             putExtra(RecognizerIntent.EXTRA_PROMPT, "Talk to Vesta...")
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            // Scheduling commands are short: stop listening promptly after the
+            // user stops talking instead of waiting out the recognizer's
+            // default silence window. Both are hints — a recognizer that
+            // ignores them (FUTO does) behaves exactly as before.
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
+            putExtra(
+                RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                1000L,
+            )
         }
 
         try {
