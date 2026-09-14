@@ -2,6 +2,7 @@ package com.cosmico.vesta
 
 import android.app.ActivityManager
 import android.app.role.RoleManager
+import android.content.ActivityNotFoundException
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
@@ -42,7 +43,7 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
         // path and the transcript can only be consumed once.
         VestaAssistBridge.onOffer = {
             if (reactApplicationContext.hasActiveReactInstance()) {
-                reactApplicationContext.emitDeviceEvent("vestaAssist", null)
+                reactApplicationContext.emitDeviceEvent("vestaAssist")
             }
         }
     }
@@ -129,10 +130,18 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun startAssistCapture(promise: Promise) {
+        // Called from the assist screen, so Vesta is on screen and the
+        // recognizer belongs in the same task — no NEW_TASK, and back returns
+        // to the question that prompted it.
         val intent = Intent(reactApplicationContext, VestaVoiceActivity::class.java)
             .setAction(Intent.ACTION_ASSIST)
-        if (launch(intent)) promise.resolve(null)
-        else promise.reject("ASSIST_CAPTURE_ERROR", "Could not start voice capture")
+        when (startFromForeground(intent)) {
+            Launch.STARTED -> promise.resolve(null)
+            Launch.NO_ACTIVITY ->
+                promise.reject("ASSIST_CAPTURE_ERROR", "Vesta is not in the foreground")
+            Launch.NO_HANDLER ->
+                promise.reject("ASSIST_CAPTURE_ERROR", "Voice capture activity not found")
+        }
     }
 
     /** Whether Vesta currently holds the assistant role. */
@@ -159,8 +168,8 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
      * the voice-input settings screen. Either way the user makes the choice in
      * a system screen; there is no path here that sets the default itself.
      *
-     * Resolves "held", "requested", "settings" or "unavailable" so the UI can
-     * say something accurate.
+     * Resolves "held", "requested", "settings", "no-activity" or "unavailable"
+     * so the UI can say something accurate.
      */
     @ReactMethod
     fun requestAssistantRole(promise: Promise) {
@@ -172,42 +181,78 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
                     return
                 }
                 if (roles != null && roles.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
-                    try {
-                        val intent = roles.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT)
-                        if (launch(intent)) {
-                            promise.resolve("requested")
-                            return
-                        }
+                    // createRequestRoleIntent throws for a role this build does
+                    // not let an app request; that is a fall-through to the
+                    // settings screen, not a failure.
+                    val request = try {
+                        roles.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT)
                     } catch (e: Exception) {
-                        // Non-requestable on this build — fall through.
+                        null
+                    }
+                    if (request != null) {
+                        when (startFromForeground(request)) {
+                            // The role dialog is answered on top of the app that
+                            // asked, so with no foreground Activity there is
+                            // nothing sensible to show. Say so.
+                            Launch.NO_ACTIVITY -> {
+                                promise.resolve("no-activity")
+                                return
+                            }
+                            Launch.STARTED -> {
+                                promise.resolve("requested")
+                                return
+                            }
+                            Launch.NO_HANDLER -> {
+                                // No role UI on this build — try settings below.
+                            }
+                        }
                     }
                 }
             }
-            val settings = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
-            if (launch(settings)) {
-                promise.resolve("settings")
-                return
+            // Fallback: the system voice-input/assistant settings screen. Also
+            // launched from the Activity — it is navigation the user asked for,
+            // and it should land on top of Vesta like any other screen.
+            when (startFromForeground(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))) {
+                Launch.STARTED -> promise.resolve("settings")
+                Launch.NO_ACTIVITY -> promise.resolve("no-activity")
+                Launch.NO_HANDLER -> promise.resolve("unavailable")
             }
-            promise.resolve("unavailable")
         } catch (e: Exception) {
             promise.reject("ASSISTANT_ROLE_ERROR", e.message, e)
         }
     }
 
-    // Prefers the current activity so the chooser lands on top of Vesta; falls
-    // back to a new task when the app has no foreground activity.
-    private fun launch(intent: Intent): Boolean {
+    private enum class Launch { STARTED, NO_ACTIVITY, NO_HANDLER }
+
+    /**
+     * Starts an activity from Vesta's own foreground Activity.
+     *
+     * The Activity context is deliberate, not incidental. Every caller here is a
+     * user-initiated navigation from a Vesta screen — a chooser, a settings
+     * page — and it should open on top of Vesta and come back to it. That also
+     * means NO FLAG_ACTIVITY_NEW_TASK: the flag is only required for an
+     * application-context launch, and using it to cover a missing Activity
+     * would be papering over the problem — Android 10+ blocks background
+     * activity starts anyway, so that path fails silently rather than helping.
+     *
+     * The Activity is fetched fresh on every call and never stored: ReactContext
+     * holds it in a WeakReference and it is null whenever the UI is not in the
+     * foreground, which is a state to report, not to work around.
+     *
+     * `reactApplicationContext.currentActivity` is the API this React Native
+     * (0.83) exposes. The inherited `getCurrentActivity()` is deprecated as of
+     * 0.80 and, because ReactContextBaseJavaModule is itself Kotlin now, is a
+     * method rather than a property — there is no bare `currentActivity` to
+     * reference from a subclass. ReactContext is still Java, so its
+     * `getCurrentActivity()` does synthesize the property used here.
+     */
+    private fun startFromForeground(intent: Intent): Launch {
+        val activity = reactApplicationContext.currentActivity ?: return Launch.NO_ACTIVITY
         return try {
-            val activity = currentActivity
-            if (activity != null) {
-                activity.startActivity(intent)
-            } else {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                reactApplicationContext.startActivity(intent)
-            }
-            true
-        } catch (e: Exception) {
-            false
+            activity.startActivity(intent)
+            Launch.STARTED
+        } catch (e: ActivityNotFoundException) {
+            Launch.NO_HANDLER
         }
     }
 

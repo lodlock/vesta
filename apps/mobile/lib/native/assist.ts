@@ -59,7 +59,12 @@ export async function isDefaultAssistant(): Promise<boolean> {
   }
 }
 
-export type AssistantRoleOutcome = "held" | "requested" | "settings" | "unavailable";
+export type AssistantRoleOutcome =
+  | "held" // Vesta already holds the role
+  | "requested" // the system role dialog is up
+  | "settings" // no role dialog on this build; the settings screen is up
+  | "no-activity" // Vesta has no foreground Activity to host the chooser
+  | "unavailable"; // no assistant setting reachable at all
 
 /**
  * Opens the system UI for picking the digital assistant. Never sets it —

@@ -419,6 +419,8 @@ function AssistantCard() {
       if (outcome === "held") setNote("Vesta is already your assistant.");
       else if (outcome === "settings")
         setNote("Pick Vesta under “Digital assistant app”.");
+      else if (outcome === "no-activity")
+        setNote("Open Vesta and try again.");
       else if (outcome === "unavailable")
         setNote("This device has no assistant setting.");
       else setNote(null);
