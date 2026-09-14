@@ -68,12 +68,44 @@ describe("fast path — resolved commands never reach the model", () => {
   });
 
   it("asks for clarification instead of guessing an ambiguous time", async () => {
-    const res = await send("give me forty-five minutes, but remind me five minutes before too");
+    const res = await send("set an alarm for seven and a timer for ten minutes");
 
     expect(mockGenerate).not.toHaveBeenCalled();
     expect(res.type).toBe("text");
     if (res.type === "text") expect(res.content).toMatch(/two things at once/i);
     expect(mockDispatch).not.toHaveBeenCalled();
+  });
+
+  it("sets both timers for a timer-plus-warning, warning first", async () => {
+    const res = await send(
+      "give me forty-five minutes, but remind me five minutes before too",
+    );
+
+    expect(mockGenerate).not.toHaveBeenCalled();
+    expect(mockDispatch).toHaveBeenNthCalledWith(
+      1,
+      "set_timer",
+      { minutes: 40, label: "Warning" },
+      "en",
+    );
+    expect(mockDispatch).toHaveBeenNthCalledWith(2, "set_timer", { minutes: 45 }, "en");
+    expect(res.type).toBe("tool_call");
+    if (res.type === "tool_call") {
+      // The bubble describes the whole request, not just the last call.
+      expect(res.message).toMatch(/45 minutes, with a warning at 40 minutes/);
+    }
+  });
+
+  it("reports a failure from either half of the pair", async () => {
+    mockDispatch
+      .mockResolvedValueOnce({ success: false, message: "Failed to set timer" })
+      .mockResolvedValueOnce({ success: true, message: "ok" });
+
+    const res = await send("give me an hour but warn me ten minutes before");
+
+    expect(res.type).toBe("tool_call");
+    // The warning timer failed; saying "both set" would be a lie.
+    if (res.type === "tool_call") expect(res.result.success).toBe(false);
   });
 
   it("asks in Italian when the language is Italian", async () => {

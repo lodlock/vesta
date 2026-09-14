@@ -25,7 +25,7 @@ import { getKnowledgeForPrompt } from "./knowledge-manager";
 import { getConfig } from "../storage/database";
 import { toolRequiresConfirmation, toolReturnsData } from "../tools/tool-registry";
 import { parseSchedulingCommand } from "../scheduling/parse";
-import { intentToToolCall, clarificationFor } from "../scheduling/intent-to-tool";
+import { intentToToolCalls, clarificationFor } from "../scheduling/intent-to-tool";
 
 const MAX_HISTORY_MESSAGES = 20;
 // Once the conversation exceeds the window, `slice(-MAX)` would re-slice to a
@@ -81,22 +81,40 @@ async function tryDeterministicScheduling(
   }
   if (parsed.status !== "resolved") return null;
 
-  const call = intentToToolCall(parsed.intent, now, lang);
-  if (toolRequiresConfirmation(call.tool, confirmEnabled)) {
+  // Almost always one call; a timer with an earlier warning is two (Android
+  // takes one duration per timer). The LAST call is the primary one and carries
+  // the confirmation describing the whole request.
+  const calls = intentToToolCalls(parsed.intent, now, lang);
+  const primary = calls[calls.length - 1];
+
+  if (toolRequiresConfirmation(primary.tool, confirmEnabled)) {
+    // Confirm-gated tools are never compound — only timers are, and timers are
+    // not gated — so handing the single proposed call to the UI is exact.
     return {
       type: "pending_tool_call",
-      tool: call.tool,
-      parameters: call.parameters,
-      message: call.message,
+      tool: primary.tool,
+      parameters: primary.parameters,
+      message: primary.message,
     };
   }
-  const result = await dispatchToolCall(call.tool, call.parameters, lang);
+
+  // Run them in order (warning first, so a failure to set it surfaces before
+  // the user is told both are set). Report the first failure if there is one:
+  // claiming success for a pair where half of it didn't happen is worse than a
+  // slightly noisier message.
+  let failure: ToolCallResult | null = null;
+  let last: ToolCallResult | null = null;
+  for (const call of calls) {
+    last = await dispatchToolCall(call.tool, call.parameters, lang);
+    if (!last.success && !failure) failure = last;
+  }
+
   return {
     type: "tool_call",
-    tool: call.tool,
-    parameters: call.parameters,
-    message: call.message,
-    result,
+    tool: primary.tool,
+    parameters: primary.parameters,
+    message: primary.message,
+    result: failure ?? last!,
   };
 }
 

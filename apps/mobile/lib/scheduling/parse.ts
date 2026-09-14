@@ -21,6 +21,15 @@ import { normalizeUtterance } from "./normalize";
 
 export type ScheduleIntent =
   | { kind: "timer"; durationSeconds: number; label?: string }
+  // A timer plus an earlier heads-up timer — "45 minutes, warn me 5 before".
+  // Two timers, one utterance; kept as one intent so the pair is resolved (and
+  // validated against each other) in one place.
+  | {
+      kind: "timerWithWarning";
+      durationSeconds: number;
+      warningSeconds: number;
+      label?: string;
+    }
   // HH:MM (+ optional YYYY-MM-DD) rather than a Date: this is what Android's
   // AlarmClock intent takes, and the date is advisory (see intent-to-tool).
   | { kind: "alarm"; time: string; date?: string; label?: string }
@@ -77,7 +86,7 @@ const UNITS: Record<Language, Record<string, number>> = {
 
 const TRIGGERS: Record<Language, Record<Family, string[]>> = {
   en: {
-    timer: ["timer", "countdown", "time me"],
+    timer: ["timer", "timers", "countdown", "time me"],
     alarm: ["alarm", "wake me", "wake up", "set an alarm"],
     reminder: ["remind me", "reminder", "remind"],
     calendar: ["schedule", "appointment", "meeting", "calendar", "book"],
@@ -132,10 +141,34 @@ const STOPWORDS: Record<Language, string[]> = {
   it: ["imposta", "metti", "un", "uno", "una", "il", "la", "lo", "le", "i", "gli", "per", "alle", "alla", "all", "a", "di", "da", "mi", "me", "e", "ed", "con", "fai", "fammi", "dammi", "crea", "aggiungi", "nuovo", "nuova", "che", "su", "timer", "sveglia", "svegliami", "promemoria", "ricordami", "appuntamento", "evento", "agenda", "calendario", "fissa", "ricorda", "qualcosa"],
 };
 
-// Connectors that mark a second, separate request in the same utterance.
-const ALSO_WORDS: Record<Language, string[]> = {
-  en: ["also", "too", "as well", "and also"],
-  it: ["anche", "pure"],
+// Phrases that introduce an earlier heads-up alongside a timer. These say
+// "warning" and little else, so a pair built on one of them is safe even when
+// the utterance never says "timer" ("forty-five minutes, with a five-minute
+// warning").
+const WARNING_MARKERS: Record<Language, string[]> = {
+  en: ["warn me", "warning", "heads up", "another one", "another timer", "second timer"],
+  it: ["avvisami", "avviso", "un altro timer", "un altro", "secondo timer"],
+};
+
+// "remind me" introduces a warning too ("45 minutes, but remind me 5 before"),
+// but it is also how every ordinary reminder starts. It only counts as a
+// warning phrase when there is already a timer in the utterance to warn about
+// — otherwise "remind me the meeting is in forty-five minutes" could be read
+// as a timer pair.
+const WARNING_MARKERS_GENERIC: Record<Language, string[]> = {
+  en: ["remind me"],
+  it: ["ricordami"],
+};
+
+// "five minutes BEFORE" is measured back from the end; "a warning AT forty" is
+// measured from the start. Same sentence shape, opposite arithmetic.
+const BEFORE_WORDS: Record<Language, string[]> = {
+  en: ["before", "beforehand", "prior"],
+  it: ["prima"],
+};
+const AT_WORDS: Record<Language, string[]> = {
+  en: ["at"],
+  it: ["a", "alle"],
 };
 
 // A timer longer than this is almost certainly a misparse (a 25-hour countdown
@@ -147,6 +180,10 @@ const MAX_TIMER_SECONDS = 24 * 3600;
 interface Span {
   start: number;
   end: number; // exclusive
+}
+
+function segmentsOf(segments: string[]): string[][] {
+  return segments.map((seg) => seg.split(" ").filter(Boolean));
 }
 
 function hasPhrase(text: string, phrase: string): boolean {
@@ -167,7 +204,13 @@ function readNumber(
   if (/^\d{1,4}$/.test(tok)) return { value: Number(tok), next: i + 1 };
 
   const first = words[tok];
-  if (first === undefined) return null;
+  if (first === undefined) {
+    // Italian writes compounds as ONE word — "quarantacinque", "ventotto",
+    // "trentuno" — so a recognizer hands them over as a single token that no
+    // dictionary lookup will find.
+    const compound = lang === "it" ? readItalianCompound(tok) : null;
+    return compound === null ? null : { value: compound, next: i + 1 };
+  }
 
   // Tens followed by a unit: "forty five" → 45. Only for 20..90 + 1..9.
   if (first >= 20 && first % 10 === 0) {
@@ -179,11 +222,75 @@ function readNumber(
   return { value: first, next: i + 1 };
 }
 
+// "quarantacinque" → 45. The tens word loses its final vowel before a unit
+// ("quaranta" + "cinque" → "quarant" + "a" + "cinque"), and drops the linking
+// vowel entirely before one that starts with one ("vent" + "otto" → ventotto).
+export function readItalianCompound(token: string): number | null {
+  const words = NUMBER_WORDS.it;
+  for (const [tensWord, tens] of Object.entries(words)) {
+    if (tens < 20 || tens % 10 !== 0) continue;
+    const stem = tensWord.slice(0, -1); // vent, trent, quarant, cinquant...
+    if (!token.startsWith(stem) || token === tensWord) continue;
+    let rest = token.slice(stem.length);
+    // Put back, or drop, the linking vowel.
+    if (words[rest] === undefined && /^[aeiou]/.test(rest)) {
+      rest = rest.slice(1);
+    }
+    const unit = words[rest];
+    if (unit !== undefined && unit >= 1 && unit <= 9) return tens + unit;
+  }
+  return null;
+}
+
 // ── Duration ────────────────────────────────────────────────────────────────
 
 interface DurationHit {
   seconds: number;
   spans: Span[];
+}
+
+// One duration as spoken, with where it sits in the token list. Distinct from
+// scanDuration's total: to tell "45 minutes" from "5 minutes" in "45 minutes,
+// warn me 5 minutes before", the two must stay separate quantities.
+export interface DurationQuantity {
+  seconds: number;
+  start: number;
+  end: number; // exclusive
+}
+
+// Joins quantities that are one spoken duration split across two unit phrases:
+// "one hour and thirty minutes" is 5400, not 3600 and 1800. Adjacent means
+// touching, or separated only by "and"/"e".
+function mergeAdjacent(
+  hits: DurationQuantity[],
+  tokens: string[],
+  lang: Language,
+): DurationQuantity[] {
+  const joiner = lang === "it" ? "e" : "and";
+  const out: DurationQuantity[] = [];
+  for (const hit of hits) {
+    const prev = out[out.length - 1];
+    const gap = prev ? tokens.slice(prev.end, hit.start) : null;
+    const touching =
+      gap !== null &&
+      (gap.length === 0 || (gap.length === 1 && gap[0] === joiner));
+    if (prev && touching) {
+      prev.seconds += hit.seconds;
+      prev.end = hit.end;
+    } else {
+      out.push({ ...hit });
+    }
+  }
+  return out;
+}
+
+// Every duration in the token list, in order, as separate quantities.
+export function scanDurationQuantities(
+  tokens: string[],
+  lang: Language,
+): DurationQuantity[] {
+  const raw = scanDurationRaw(tokens, lang);
+  return mergeAdjacent(raw, tokens, lang);
 }
 
 // Sums every `<number> <unit>` pair in the token list, so "an hour and thirty
@@ -192,10 +299,21 @@ export function scanDuration(
   tokens: string[],
   lang: Language,
 ): DurationHit | null {
+  const quantities = scanDurationRaw(tokens, lang);
+  if (quantities.length === 0) return null;
+  return {
+    seconds: quantities.reduce((sum, q) => sum + q.seconds, 0),
+    spans: quantities.map((q) => ({ start: q.start, end: q.end })),
+  };
+}
+
+// The scanner both of the above are built on: unmerged, in token order.
+function scanDurationRaw(
+  tokens: string[],
+  lang: Language,
+): DurationQuantity[] {
   const units = UNITS[lang];
-  let seconds = 0;
-  const spans: Span[] = [];
-  let found = false;
+  const hits: DurationQuantity[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
     // "half an hour" / "mezz ora" / "mezza ora"
@@ -203,10 +321,9 @@ export function scanDuration(
       (lang === "en" && tokens[i] === "half" && tokens[i + 1] === "an" && units[tokens[i + 2] ?? ""] === 3600) ||
       (lang === "it" && /^mezz[ao]?$/.test(tokens[i]) && units[tokens[i + 1] ?? ""] === 3600)
     ) {
-      seconds += 1800;
-      spans.push({ start: i, end: lang === "en" ? i + 3 : i + 2 });
-      i = (lang === "en" ? i + 3 : i + 2) - 1;
-      found = true;
+      const end = lang === "en" ? i + 3 : i + 2;
+      hits.push({ seconds: 1800, start: i, end });
+      i = end - 1;
       continue;
     }
     // "a quarter of an hour" / "un quarto d ora"
@@ -215,10 +332,8 @@ export function scanDuration(
       (lang === "it" && tokens[i] === "quarto" && tokens[i + 1] === "d" && units[tokens[i + 2] ?? ""] === 3600)
     ) {
       const end = lang === "en" ? i + 4 : i + 3;
-      seconds += 900;
-      spans.push({ start: i, end });
+      hits.push({ seconds: 900, start: i, end });
       i = end - 1;
-      found = true;
       continue;
     }
 
@@ -237,13 +352,11 @@ export function scanDuration(
       value += 1800;
       end += lang === "en" ? 3 : 2;
     }
-    seconds += value;
-    spans.push({ start: i, end });
+    hits.push({ seconds: value, start: i, end });
     i = end - 1;
-    found = true;
   }
 
-  return found ? { seconds, spans } : null;
+  return hits;
 }
 
 // ── Clock time ──────────────────────────────────────────────────────────────
@@ -437,6 +550,17 @@ export function scanDay(tokens: string[], lang: Language): DayHit | null {
   return null;
 }
 
+// Phrasings that mean "get me up", which settles a bare hour as morning.
+// Italian "sveglia" is the alarm-clock noun AND the wake-up verb — "metti la
+// sveglia alle sette" is 07:00 to any Italian speaker — so the noun counts
+// there while English needs an explicit "wake me".
+function prefersMorning(text: string, lang: Language): boolean {
+  if (lang === "it") {
+    return ["sveglia", "svegliami", "sveglie"].some((w) => hasPhrase(text, w));
+  }
+  return hasPhrase(text, "wake me") || hasPhrase(text, "wake up");
+}
+
 function itWeekdayIndex(word: string): number {
   const map: Record<string, number> = {
     domenica: 0, lunedì: 1, lunedi: 1, martedì: 2, martedi: 2,
@@ -444,6 +568,164 @@ function itWeekdayIndex(word: string): number {
     venerdì: 5, venerdi: 5, sabato: 6,
   };
   return map[word] ?? 0;
+}
+
+// ── Timer + warning ─────────────────────────────────────────────────────────
+
+// "45 minutes, but warn me 5 minutes before" is two timers, not two requests.
+// Resolving it here is what keeps it out of the compound-request question.
+export type WarningPair =
+  | { kind: "none" } // no warning phrase — not this shape at all
+  | { kind: "unresolved" } // a warning phrase, but the relationship isn't clear
+  | { kind: "pair"; durationSeconds: number; warningSeconds: number };
+
+// Span of the first warning marker in the token list, or null.
+function findWarningMarker(
+  tokens: string[],
+  lang: Language,
+  allowGeneric: boolean,
+): { start: number; end: number } | null {
+  const text = tokens.join(" ");
+  const markers = allowGeneric
+    ? [...WARNING_MARKERS[lang], ...WARNING_MARKERS_GENERIC[lang]]
+    : WARNING_MARKERS[lang];
+  for (const marker of markers) {
+    if (!hasPhrase(text, marker)) continue;
+    const size = marker.split(" ").length;
+    for (let i = 0; i + size <= tokens.length; i++) {
+      if (tokens.slice(i, i + size).join(" ") === marker) {
+        return { start: i, end: i + size };
+      }
+    }
+  }
+  return null;
+}
+
+// How many tokens may sit between the marker and the quantity it introduces
+// ("warn me [about] five minutes before").
+const WARNING_LOOKAHEAD = 3;
+
+// Which of the two quantities is the warning.
+//
+// A quantity FOLLOWING the marker wins: "warn me five minutes before", "a
+// warning at forty" — the marker announces it. Only when nothing follows does
+// the one before it count, which is the "with a five-minute warning" shape.
+//
+// Raw token distance cannot decide this: in "timer for forty-five, warning at
+// forty" the timer's own quantity ends exactly at the marker (distance 0) while
+// the warning sits one token past it, so nearest-wins picks the timer and the
+// arithmetic comes out negative.
+function pickWarningQuantity(
+  quantities: DurationQuantity[],
+  marker: { start: number; end: number },
+): DurationQuantity | null {
+  const after = quantities.find(
+    (q) => q.start >= marker.end && q.start - marker.end <= WARNING_LOOKAHEAD,
+  );
+  if (after) return after;
+  const before = [...quantities].reverse().find((q) => q.end <= marker.start);
+  return before ?? null;
+}
+
+// A bare number in a timer+warning sentence is a duration in MINUTES:
+// "timer for forty five, warning at forty" has no unit words at all, and
+// minutes is the only reading anyone means. Deliberately scoped to this
+// resolver — elsewhere a bare number could be a clock time, and guessing
+// between the two is how "set a timer for seven" silently becomes 7 minutes.
+function bareMinuteQuantities(
+  tokens: string[],
+  lang: Language,
+): DurationQuantity[] {
+  const out: DurationQuantity[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const num = readNumber(tokens, i, lang);
+    if (!num) continue;
+    // A number that carries its own unit is already a real quantity.
+    if (UNITS[lang][tokens[num.next] ?? ""] !== undefined) {
+      i = num.next;
+      continue;
+    }
+    // Ignore 1. "a"/"an"/"one" parse as the number one, but in this shape they
+    // are almost always an article or a pronoun ("a warning", "another ONE
+    // five minutes before"), and a bare one-minute warning is not a thing
+    // people say. Reading them as durations produced phantom quantities that
+    // pushed real pairs out of range.
+    if (num.value <= 1) {
+      i = num.next - 1;
+      continue;
+    }
+    out.push({ seconds: num.value * 60, start: i, end: num.next });
+    i = num.next - 1;
+  }
+  return out;
+}
+
+/**
+ * Reads a timer + earlier-warning pair out of one utterance.
+ *
+ * The warning quantity is the one NEAREST the warning phrase, whichever side it
+ * falls on — that is what makes "warn me five minutes before" and "with a
+ * five-minute warning" the same shape despite the opposite word order. The
+ * other quantity is the timer itself.
+ *
+ * Then the arithmetic: "five BEFORE" counts back from the end (45 → warn at
+ * 40), "a warning AT forty" is already the warning's own length (45 → warn at
+ * 40). With neither word ("a five-minute warning") it counts back, which is
+ * what a warning means.
+ *
+ * Exactly two quantities are required. One is not a pair ("give me a warning
+ * sometime before forty-five minutes"), three is not a shape this should guess
+ * at, and none is just a warning phrase with nothing to measure.
+ */
+export function findWarningPair(
+  tokens: string[],
+  lang: Language,
+  opts: { allowGeneric?: boolean } = {},
+): WarningPair {
+  const marker = findWarningMarker(tokens, lang, opts.allowGeneric ?? false);
+  if (!marker) return { kind: "none" };
+
+  let quantities = scanDurationQuantities(tokens, lang);
+  if (quantities.length < 2 && scanClock(tokens, lang) === null) {
+    // No units spoken ("forty five ... forty"), or only one of the two carried
+    // a unit: read bare numbers as minutes to fill the gap.
+    //
+    // Only when the utterance holds no clock time at all. Otherwise "remind me
+    // to call mum at six and take the bread out in ten minutes" would read
+    // "six" as a six-minute timer and turn a reminder into a timer pair.
+    const bare = bareMinuteQuantities(tokens, lang).filter(
+      (b) => !quantities.some((q) => b.start < q.end && q.start < b.end),
+    );
+    quantities = [...quantities, ...bare].sort((a, b) => a.start - b.start);
+  }
+  if (quantities.length !== 2) return { kind: "unresolved" };
+
+  const warning = pickWarningQuantity(quantities, marker);
+  if (!warning) return { kind: "unresolved" };
+  const rest = quantities.filter((q) => q !== warning);
+  if (rest.length !== 1) return { kind: "unresolved" };
+  const main = rest[0];
+
+  // "before" anywhere from the marker on means the warning is an offset back
+  // from the end; an "at" immediately before the number means it is absolute.
+  const tail = tokens.slice(marker.start);
+  const isRelative = BEFORE_WORDS[lang].some((w) => tail.includes(w));
+  const isAbsolute =
+    !isRelative && AT_WORDS[lang].includes(tokens[warning.start - 1] ?? "");
+
+  const warningSeconds = isAbsolute
+    ? warning.seconds
+    : main.seconds - warning.seconds;
+
+  if (
+    main.seconds <= 0 ||
+    main.seconds > MAX_TIMER_SECONDS ||
+    warningSeconds <= 0 ||
+    warningSeconds >= main.seconds
+  ) {
+    return { kind: "unresolved" };
+  }
+  return { kind: "pair", durationSeconds: main.seconds, warningSeconds };
 }
 
 // ── Intent detection ────────────────────────────────────────────────────────
@@ -540,34 +822,78 @@ function atTime(day: Date, hour: number, minute: number): Date {
   return d;
 }
 
-// Settles a bare 12-hour reading.
-//
-// Explicit am/pm and 24-hour readings pass through unchanged. A part-of-day
-// word ("tonight", "in the morning") decides it. A wake-up trigger means
-// morning. Otherwise the DAYTIME rule applies: 7-11 is morning, 1-6 is
-// afternoon/evening — "at four" is 16:00, "at nine" is 09:00.
-//
-// The daytime rule is deliberately independent of the current time. Picking
-// "the soonest future reading" instead would make the same sentence mean
-// 04:00 or 16:00 depending on when it was said, which is exactly the kind of
-// surprise an alarm must not have. 12 stays genuinely two-way and asks.
-function settleHour(
+/**
+ * Turns a spoken clock reading into an actual instant.
+ *
+ * THE RULE, in order — the first line that applies decides it:
+ *
+ *  1. An explicit am/pm, or a 24-hour reading ("19:30", "at 0 hundred"), is
+ *     taken as spoken.
+ *  2. A part-of-day word anywhere in the utterance decides it: "in the
+ *     morning" → am, "tonight" / "this evening" / "at night" → pm.
+ *  3. A wake-up phrasing ("wake me", Italian "sveglia") means morning.
+ *  4. A bare "twelve" with none of the above is genuinely two-way — noon and
+ *     midnight are twelve hours apart and both are plausible — so it ASKS.
+ *  5. An explicit day or weekday was named: read 7-11 as morning and 1-6 as
+ *     afternoon on that day. Across a day boundary "the next occurrence" stops
+ *     meaning anything — "tomorrow at four" is 16:00, not 04:00.
+ *  6. Otherwise: the NEXT PLAUSIBLE OCCURRENCE. Of the two readings (h and
+ *     h+12), take whichever comes sooner from now, rolling into tomorrow when
+ *     both have passed today.
+ *
+ * Rule 6 is why "alarm for four" means 04:00 said at 02:00 and 16:00 said at
+ * 13:00: at 02:00 the morning reading is two hours away and the afternoon one
+ * fourteen. It is fully deterministic — the same (utterance, instant) pair
+ * always gives the same answer — and it crosses midnight naturally, since a
+ * reading that has passed today is simply tried again tomorrow.
+ */
+function resolveClockInstant(
   clock: ClockHit,
+  day: Date | null,
+  now: Date,
   text: string,
   lang: Language,
   preferAm: boolean,
-): { hour: number } | { ambiguous: "ambiguous-meridiem" } {
-  if (clock.explicit) return { hour: clock.hour };
+): { at: Date } | { ambiguous: "ambiguous-meridiem" } {
+  const { minute } = clock;
 
+  // The next time this hour:minute comes around, today or tomorrow.
+  const nextOccurrence = (hour: number): Date => {
+    const today = atTime(now, hour, minute);
+    return today.getTime() > now.getTime() ? today : atTime(addDays(now, 1), hour, minute);
+  };
+
+  // 1. As spoken.
+  if (clock.explicit) {
+    return { at: day ? atTime(day, clock.hour, minute) : nextOccurrence(clock.hour) };
+  }
+
+  const fixed = (hour: number) => ({
+    at: day ? atTime(day, hour, minute) : nextOccurrence(hour),
+  });
+
+  // 2. Part of day.
   if (AM_HINTS[lang].some((w) => hasPhrase(text, w))) {
-    return { hour: clock.hour === 12 ? 0 : clock.hour };
+    return fixed(clock.hour === 12 ? 0 : clock.hour);
   }
   if (PM_HINTS[lang].some((w) => hasPhrase(text, w))) {
-    return { hour: clock.hour === 12 ? 12 : (clock.hour % 12) + 12 };
+    return fixed(clock.hour === 12 ? 12 : (clock.hour % 12) + 12);
   }
+
+  // 4. Noon or midnight — ask. (Checked before the wake-up rule: "wake me at
+  // twelve" is no less ambiguous for being a wake-up.)
   if (clock.hour === 12) return { ambiguous: "ambiguous-meridiem" };
-  if (preferAm) return { hour: clock.hour };
-  return { hour: clock.hour <= 6 ? clock.hour + 12 : clock.hour };
+
+  // 3. Wake-up phrasing.
+  if (preferAm) return fixed(clock.hour);
+
+  // 5. A named day.
+  if (day) return { at: atTime(day, clock.hour <= 6 ? clock.hour + 12 : clock.hour, minute) };
+
+  // 6. Next plausible occurrence.
+  const am = nextOccurrence(clock.hour);
+  const pm = nextOccurrence(clock.hour + 12);
+  return { at: am.getTime() <= pm.getTime() ? am : pm };
 }
 
 export interface ParseOptions {
@@ -596,17 +922,56 @@ export function parseSchedulingCommand(
     scanDuration(tokens, lang) !== null;
   if (implicitTimer) families.push("timer");
 
-  if (families.length === 0) return { status: "none" };
   if (isQuestion(raw, text, lang)) return { status: "none" };
 
-  // Two different actions in one utterance ("a 45 minute timer, but remind me
-  // 5 minutes before too"). One turn executes one action, and picking which is
+  // A timer with an earlier warning is ONE request in two parts, so it is read
+  // before anything is called compound.
+  //
+  // Attempted on the strength of the warning phrase alone, not on a timer
+  // trigger: "set thirty minutes, no wait forty-five, and warn me five before"
+  // never says "timer". It is safe because it only ACCEPTS a result that holds
+  // two durations and a warning phrase — a shape nothing else produces. "Remind
+  // me to call mum at six" has one time and no second duration, so it falls
+  // straight through to the reminder branch.
+  //
+  // The last segment is tried first so a correction wins (45 + 40 above, not
+  // 30 + 40); the whole utterance is the fallback for when the correction
+  // restated only part of it.
+  const pairOpts = { allowGeneric: families.includes("timer") };
+  const lastSegment = segmentsOf(norm.segments).at(-1) ?? tokens;
+  const fromLast = findWarningPair(lastSegment, lang, pairOpts);
+  const warningPair: WarningPair =
+    fromLast.kind === "pair" ? fromLast : findWarningPair(tokens, lang, pairOpts);
+
+  if (warningPair.kind === "pair") {
+    return {
+      status: "resolved",
+      normalized: text,
+      intent: {
+        kind: "timerWithWarning",
+        durationSeconds: warningPair.durationSeconds,
+        warningSeconds: warningPair.warningSeconds,
+      },
+    };
+  }
+
+  // Nothing recognizable as a scheduling command (and not the pair shape
+  // above, which needs no trigger word of its own).
+  if (families.length === 0) return { status: "none" };
+
+  // Two different actions in one utterance ("set an alarm for seven and a timer
+  // for ten minutes"). One turn executes one action, and picking which is
   // exactly the guess this parser must not make.
-  const alsoConnector = ALSO_WORDS[lang].some((w) => hasPhrase(text, w));
-  if (families.length > 1 || (alsoConnector && families.length >= 1 && norm.segments.length > 1)) {
-    if (families.length > 1) {
-      return { status: "ambiguous", reason: "compound-request", normalized: text };
-    }
+  if (families.length > 1) {
+    return { status: "ambiguous", reason: "compound-request", normalized: text };
+  }
+
+  // A warning phrase alongside a timer, but no usable pair — "warn me before
+  // the timer", "give me a warning sometime before forty-five minutes". The
+  // missing piece is always a length. Gated on the timer family so a plain
+  // reminder is never asked how long it should be.
+  if (warningPair.kind === "unresolved" && families.includes("timer")) {
+    return { status: "ambiguous", reason: "missing-duration", normalized: text };
   }
 
   const family = families[0];
@@ -614,7 +979,7 @@ export function parseSchedulingCommand(
   // Values are read from the LAST segment that states one: a self-correction
   // supersedes everything before it. A qualifier the correction didn't restate
   // (typically the day) still carries over from the earlier segment.
-  const segmentTokens = norm.segments.map((s) => s.split(" ").filter(Boolean));
+  const segmentTokens = segmentsOf(norm.segments);
   const pickLast = <T,>(fn: (t: string[]) => T | null): { hit: T; tokens: string[] } | null => {
     for (let i = segmentTokens.length - 1; i >= 0; i--) {
       const hit = fn(segmentTokens[i]);
@@ -650,13 +1015,19 @@ export function parseSchedulingCommand(
 
   if (family === "alarm") {
     if (!clock) return { status: "ambiguous", reason: "missing-time", normalized: text };
-    const preferAm = hasPhrase(text, "wake me") || hasPhrase(text, "wake up") || hasPhrase(text, "svegliami");
     const targetDay = dateForHit(day?.hit ?? null, now);
-    const settled = settleHour(clock.hit, text, lang, preferAm);
+    const settled = resolveClockInstant(
+      clock.hit,
+      targetDay,
+      now,
+      text,
+      lang,
+      prefersMorning(text, lang),
+    );
     if ("ambiguous" in settled) {
       return { status: "ambiguous", reason: settled.ambiguous, normalized: text };
     }
-    const time = `${pad2(settled.hour)}:${pad2(clock.hit.minute)}`;
+    const time = `${pad2(settled.at.getHours())}:${pad2(settled.at.getMinutes())}`;
     const label = leftoverPhrase(clock.tokens, clock.hit.spans, lang);
     return {
       status: "resolved",
@@ -664,7 +1035,11 @@ export function parseSchedulingCommand(
       intent: {
         kind: "alarm",
         time,
-        ...(targetDay ? { date: localDateStr(targetDay) } : {}),
+        // Always carry the resolved day, even when the user didn't name one:
+        // rule 6 may have rolled past midnight, and the confirmation should say
+        // so. intent-to-tool adds Android's next-occurrence caveat when the
+        // date is one the AlarmClock intent cannot honour.
+        date: localDateStr(settled.at),
         ...(label ? { label } : {}),
       },
     };
@@ -693,13 +1068,19 @@ export function parseSchedulingCommand(
     if (!clock) return { status: "ambiguous", reason: "missing-time", normalized: text };
 
     const targetDay = dateForHit(day?.hit ?? null, now);
-    const settled = settleHour(clock.hit, text, lang, false);
+    const settled = resolveClockInstant(
+      clock.hit,
+      targetDay,
+      now,
+      text,
+      lang,
+      prefersMorning(text, lang),
+    );
     if ("ambiguous" in settled) {
       return { status: "ambiguous", reason: settled.ambiguous, normalized: text };
     }
-    let when = atTime(targetDay ?? now, settled.hour, clock.hit.minute);
-    // No day given and the time already passed → the next occurrence.
-    if (!targetDay && when.getTime() <= now.getTime()) when = addDays(when, 1);
+    const when = settled.at;
+    // Only reachable when the user named a day and that time on it has gone.
     if (when.getTime() <= now.getTime()) {
       return { status: "ambiguous", reason: "time-in-past", normalized: text };
     }
@@ -716,14 +1097,13 @@ export function parseSchedulingCommand(
   // which is good at exactly this.
   if (!clock) return { status: "none" };
   const targetDay = dateForHit(day?.hit ?? null, now);
-  const settled = settleHour(clock.hit, text, lang, false);
+  const settled = resolveClockInstant(clock.hit, targetDay, now, text, lang, false);
   if ("ambiguous" in settled) {
     return { status: "ambiguous", reason: settled.ambiguous, normalized: text };
   }
   const title = leftoverPhrase(clock.tokens, clock.hit.spans, lang);
   if (!title) return { status: "none" };
-  let start = atTime(targetDay ?? now, settled.hour, clock.hit.minute);
-  if (!targetDay && start.getTime() <= now.getTime()) start = addDays(start, 1);
+  const start = settled.at;
   return {
     status: "resolved",
     normalized: text,

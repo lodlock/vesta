@@ -2,6 +2,7 @@
 // `now` is injected everywhere, so these tests are clock-independent.
 
 import { parseSchedulingCommand, type ScheduleParse } from "../parse";
+import { intentToToolCalls } from "../intent-to-tool";
 
 // Wednesday 2026-09-16, 10:00 local.
 const NOW = new Date(2026, 8, 16, 10, 0, 0);
@@ -105,16 +106,79 @@ describe("alarms — self-correction and meridiem", () => {
     expect(resolved(parse("set an alarm for 19:30"))).toMatchObject({ time: "19:30" });
   });
 
-  it("reads a bare hour by the daytime rule, not by what time it is now", () => {
-    // 1-6 is afternoon, 7-11 is morning...
-    expect(resolved(parse("set an alarm for four"))).toMatchObject({ time: "16:00" });
-    expect(resolved(parse("set an alarm for nine"))).toMatchObject({ time: "09:00" });
-    // ...and the SAME sentence means the same thing whenever it is said. A
-    // "soonest future" rule would make this one 04:00, which is the kind of
-    // surprise an alarm must never have.
-    const evening = new Date(2026, 8, 16, 17, 0, 0);
-    expect(resolved(parse("set an alarm for four", "en", evening))).toMatchObject({
-      time: "16:00",
+  // Rule 6: a bare hour resolves to the NEXT PLAUSIBLE OCCURRENCE — whichever
+  // of {h, h+12} comes sooner, rolling into tomorrow when both have passed.
+  describe("a bare hour resolves to the next plausible occurrence", () => {
+    const at = (h: number, m = 0) => new Date(2026, 8, 16, h, m, 0);
+    const alarmAt = (text: string, now: Date) => resolved(parse(text, "en", now));
+
+    it("just after midnight, 'four' is this morning", () => {
+      expect(alarmAt("set an alarm for four", at(0, 30))).toMatchObject({
+        time: "04:00",
+        date: "2026-09-16",
+      });
+    });
+
+    it("at 02:00, 'four' is two hours away, not fourteen", () => {
+      expect(alarmAt("set an alarm for four", at(2))).toMatchObject({
+        time: "04:00",
+        date: "2026-09-16",
+      });
+    });
+
+    it("in the early morning, 'nine' is this morning", () => {
+      expect(alarmAt("set an alarm for nine", at(6))).toMatchObject({
+        time: "09:00",
+        date: "2026-09-16",
+      });
+    });
+
+    it("in the late morning, 'nine' has passed and means tonight", () => {
+      expect(alarmAt("set an alarm for nine", at(11))).toMatchObject({
+        time: "21:00",
+        date: "2026-09-16",
+      });
+    });
+
+    it("in the afternoon, 'four' is this afternoon", () => {
+      expect(alarmAt("set an alarm for four", at(13))).toMatchObject({
+        time: "16:00",
+        date: "2026-09-16",
+      });
+    });
+
+    it("in the evening, 'four' is tomorrow morning — the nearer of the two", () => {
+      expect(alarmAt("set an alarm for four", at(20))).toMatchObject({
+        time: "04:00",
+        date: "2026-09-17",
+      });
+    });
+
+    it("crosses midnight: at 23:30, 'four' is 04:00 the next day", () => {
+      expect(alarmAt("set an alarm for four", at(23, 30))).toMatchObject({
+        time: "04:00",
+        date: "2026-09-17",
+      });
+    });
+
+    it("crosses midnight for an explicit 24-hour time too", () => {
+      expect(alarmAt("set an alarm for 19:30", at(22))).toMatchObject({
+        time: "19:30",
+        date: "2026-09-17",
+      });
+    });
+
+    it("a named day uses the daytime reading, where 'nearest' means nothing", () => {
+      // "tomorrow at four" is 16:00 — the 04:00 reading is nearer but nobody
+      // means it.
+      expect(alarmAt("set an alarm tomorrow at four", at(13))).toMatchObject({
+        time: "16:00",
+        date: "2026-09-17",
+      });
+      expect(alarmAt("set an alarm tomorrow at nine", at(13))).toMatchObject({
+        time: "09:00",
+        date: "2026-09-17",
+      });
     });
   });
 
@@ -176,12 +240,6 @@ describe("ambiguity — asks instead of guessing", () => {
     if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
     return p.reason;
   };
-
-  it('"give me forty-five minutes, but remind me five minutes before too" is compound', () => {
-    expect(
-      ambiguous("give me forty-five minutes, but remind me five minutes before too"),
-    ).toBe("compound-request");
-  });
 
   it("a timer with no duration asks for one", () => {
     expect(ambiguous("set a timer")).toBe("missing-duration");
@@ -251,5 +309,95 @@ describe("calendar events", () => {
     expect(intent.title).toBe("dentist");
     expect(intent.start.getHours()).toBe(15);
     expect(intent.start.getDate()).toBe(17);
+  });
+});
+
+describe("timer with an earlier warning", () => {
+  const pair = (text: string, lang: "en" | "it" = "en") => {
+    const intent = resolved(parse(text, lang));
+    if (intent.kind !== "timerWithWarning") {
+      throw new Error(`expected timerWithWarning, got ${intent.kind}`);
+    }
+    return [intent.warningSeconds / 60, intent.durationSeconds / 60];
+  };
+
+  it("reads 'N before' as an offset back from the end", () => {
+    expect(pair("give me forty-five minutes, but remind me five minutes before too"))
+      .toEqual([40, 45]);
+    expect(pair("give me an hour but warn me ten minutes before")).toEqual([50, 60]);
+    expect(pair("set a thirty minute timer and another one five minutes before that"))
+      .toEqual([25, 30]);
+  });
+
+  it("reads a bare warning as an offset too", () => {
+    expect(pair("forty-five minutes, with a five-minute warning")).toEqual([40, 45]);
+  });
+
+  it("reads 'a warning at M' as the warning's own length", () => {
+    expect(pair("timer for forty five, give me a warning at forty")).toEqual([40, 45]);
+  });
+
+  it("reads bare numbers as minutes in this shape", () => {
+    // Not a unit word in sight — and "forty five ... forty" can only be minutes.
+    expect(pair("timer for forty five, warning at forty")).toEqual([40, 45]);
+  });
+
+  it("survives fillers and a stammered repeat", () => {
+    expect(pair("give me uh forty-five minutes but warn me five five minutes before"))
+      .toEqual([40, 45]);
+    expect(pair("timer for forty-five, warning at uh forty")).toEqual([40, 45]);
+  });
+
+  it("takes the corrected duration, even with no 'timer' word anywhere", () => {
+    expect(pair("set thirty minutes no wait forty-five, and warn me five before"))
+      .toEqual([40, 45]);
+  });
+
+  it("works in Italian", () => {
+    expect(pair("dammi quarantacinque minuti ma avvisami cinque minuti prima", "it"))
+      .toEqual([40, 45]);
+  });
+
+  it("still asks when the relationship is not stated", () => {
+    const ask = (text: string) => {
+      const p = parse(text);
+      if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
+      return p.reason;
+    };
+    expect(ask("set two timers before dinner")).toBe("missing-duration");
+    expect(ask("warn me before the timer")).toBe("missing-duration");
+    expect(ask("give me a warning sometime before forty-five minutes")).toBe(
+      "missing-duration",
+    );
+  });
+
+  it("refuses a warning that isn't before the end", () => {
+    // A 50-minute warning on a 45-minute timer is not a warning.
+    const p = parse("give me forty-five minutes but warn me fifty minutes before");
+    expect(p.status).toBe("ambiguous");
+  });
+
+  it("does not drag a plain reminder into a timer pair", () => {
+    const intent = resolved(parse("remind me to call mum at six"));
+    expect(intent.kind).toBe("reminder");
+  });
+
+  it("dispatches as two timers, warning first", () => {
+    const calls = intentToToolCalls(
+      { kind: "timerWithWarning", durationSeconds: 2700, warningSeconds: 2400 },
+      NOW,
+      "en",
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({
+      tool: "set_timer",
+      parameters: { minutes: 40, label: "Warning" },
+    });
+    expect(calls[1]).toMatchObject({
+      tool: "set_timer",
+      parameters: { minutes: 45 },
+    });
+    // The primary (last) call confirms the whole request.
+    expect(calls[1].message).toBe("Timer set for 45 minutes, with a warning at 40 minutes");
   });
 });

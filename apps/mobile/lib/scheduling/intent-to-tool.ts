@@ -67,12 +67,65 @@ function alarmCaveat(time: string, date: string | undefined, now: Date, lang: La
     : ` (Android arms the next occurrence of this time, not ${date}.)`;
 }
 
+/**
+ * The tool calls an intent becomes, in the order they must run.
+ *
+ * Almost always one. A timer with a warning is two — Android's ACTION_SET_TIMER
+ * takes one duration, so an earlier heads-up is simply a second, shorter timer.
+ * The LAST call is the primary one: its message is the confirmation the user
+ * sees, and it describes the whole request.
+ */
+export function intentToToolCalls(
+  intent: ScheduleIntent,
+  now: Date,
+  lang: Language,
+): ResolvedToolCall[] {
+  if (intent.kind === "timerWithWarning") {
+    const total = formatDuration(intent.durationSeconds, lang);
+    const warn = formatDuration(intent.warningSeconds, lang);
+    const warnLabel = intent.label
+      ? `${intent.label} — ${lang === "it" ? "avviso" : "warning"}`
+      : lang === "it"
+        ? "Avviso"
+        : "Warning";
+    return [
+      {
+        tool: "set_timer",
+        parameters: { minutes: intent.warningSeconds / 60, label: warnLabel },
+        message:
+          lang === "it"
+            ? `Avviso a ${warn}`
+            : `Warning at ${warn}`,
+      },
+      {
+        tool: "set_timer",
+        parameters: {
+          minutes: intent.durationSeconds / 60,
+          ...(intent.label ? { label: intent.label } : {}),
+        },
+        // The confirmation for the whole request: both timers, in the order the
+        // user will meet them.
+        message:
+          lang === "it"
+            ? `Timer di ${total}${intent.label ? ` (${intent.label})` : ""}, con un avviso a ${warn}`
+            : `Timer set for ${total}${intent.label ? ` (${intent.label})` : ""}, with a warning at ${warn}`,
+      },
+    ];
+  }
+  return [intentToToolCall(intent, now, lang)];
+}
+
 export function intentToToolCall(
   intent: ScheduleIntent,
   now: Date,
   lang: Language,
 ): ResolvedToolCall {
   switch (intent.kind) {
+    case "timerWithWarning": {
+      // Unreachable: intentToToolCalls handles the pair. Kept so the switch
+      // stays exhaustive if the type gains a case.
+      return intentToToolCalls(intent, now, lang)[1];
+    }
     case "timer": {
       const pretty = formatDuration(intent.durationSeconds, lang);
       return {

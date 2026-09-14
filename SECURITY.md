@@ -40,10 +40,24 @@ device.
 
 Downloaded models are verified before use: the finished file is hashed
 (SHA-256, natively and streaming) and compared against HuggingFace's published
-LFS oid **before** it is renamed into the model directory. A mismatch is
-quarantined and the download fails — size alone is never accepted as proof.
-When a repo publishes no oid, the model is installed but the app says plainly
-that it could not be verified.
+LFS oid **before** it is renamed into the model directory. Size alone is never
+accepted as proof.
+
+Verification **fails closed**. When a digest was published, the file is
+committed only on a match — a mismatch, a hashing error, and hashing being
+unavailable on the build all quarantine the file and fail the download. That is
+not the same as a repo publishing no digest at all: with nothing authoritative
+to check against, the model installs and is labelled unverified.
+
+A `.gguf` you import yourself is supported as a first-class model and is not
+required to come from HuggingFace. You can supply its SHA-256 (pasted, or an
+adjacent `.sha256`), in which case it must match or nothing is imported; with
+no checksum the import proceeds — choosing the file is your decision — and
+Vesta still hashes it and keeps that as a baseline, so a later unexpected change
+to the file is detectable. Each model records which of these applies rather than
+a flat verified/unverified, and imports get a cheap GGUF header sanity check
+before llama.cpp opens them (early rejection of obviously-bad files, not a
+safety boundary).
 
 ### Inbound: the local MCP server (off by default)
 

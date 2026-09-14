@@ -49,12 +49,24 @@ loopback-only MCP server, and a smaller permission set.
   `calendarEvent(start, title)` — which maps onto the existing tool call, the
   existing confirmation gate and the existing Android intents. English and
   Italian.
+- **Timer plus an earlier warning, in one command** — "give me forty-five
+  minutes, but remind me five minutes before too", "warn me ten minutes before",
+  "with a five-minute warning", "a warning at forty" all set two timers (the
+  warning first) instead of asking which one you meant. "N before" counts back
+  from the end, "at M" is the warning's own length, and bare numbers in this
+  shape are minutes — so "timer for forty-five, warning at forty" works with no
+  unit words at all.
 - **Asks instead of guessing** — a recognized scheduling command that isn't
-  safely resolvable now asks a question rather than picking a time: missing
-  duration/time/subject, a bare "twelve", a compound request ("forty-five
-  minutes, but remind me five minutes before too"), an implausible length.
-  Anything it doesn't recognize as scheduling goes to the model exactly as
-  before.
+  safely resolvable still asks: missing duration/time/subject, a bare "twelve",
+  two genuinely different actions ("an alarm for seven and a timer for ten
+  minutes"), a warning with nothing to measure ("warn me before the timer"), an
+  implausible length. Anything it doesn't recognize as scheduling goes to the
+  model exactly as before.
+- **A bare hour resolves to the next plausible occurrence** — of the two
+  readings, whichever comes sooner, rolling past midnight when both have passed.
+  "Alarm for four" is 04:00 said at 02:00 and 16:00 said at 13:00. An explicit
+  am/pm, a part-of-day word, a wake-up phrasing or a named day all take
+  precedence, and a bare "twelve" asks.
 - **Scheduling works with no model loaded** — a timer or an alarm still runs
   while a model is downloading or failed to load.
 - Sub-minute timers are confirmed as "30 seconds" rather than "0.5 minutes".
@@ -67,13 +79,27 @@ loopback-only MCP server, and a smaller permission set.
   LAN exposure is now a separate, explicitly confirmed opt-in; the pairing
   command for the default case leads with `adb reverse tcp:8420 tcp:8420`. The
   server remains off by default.
-- **Downloaded models are verified by SHA-256** — the finished file is hashed
-  (natively, streaming) and compared against HuggingFace's LFS oid *before* the
-  rename that promotes it to the model directory. A mismatch is quarantined and
-  the download fails; previously only the file size was checked, so a
-  substituted or corruptly-resumed file could be loaded as weights. Models that
-  can't be verified (no published oid) are reported as such instead of passing
-  silently.
+- **Downloaded models are verified by SHA-256, and verification fails closed** —
+  the finished file is hashed (natively, streaming) and compared against
+  HuggingFace's LFS oid *before* the rename that promotes it to the model
+  directory. Previously only the file size was checked, so a substituted or
+  corruptly-resumed file could be loaded as weights. When a digest was
+  published, the download commits only on a match: a mismatch, a hashing error
+  and hashing being unavailable all quarantine the file and fail. A repo that
+  publishes no digest is a different case — that installs, labelled unverified.
+- **Model trust levels** — a model now records *which* claim applies to its
+  bytes (`verified_upstream`, `verified_user_checksum`, `user_supplied_baseline`,
+  `unverified`) instead of a flat verified/unverified, and the Models screen
+  states each in its own words.
+- **Imported GGUFs keep full support, with optional verification** — a file you
+  downloaded elsewhere, merged or quantized yourself still imports through the
+  system file picker with no HuggingFace repo or catalog filename required. You
+  can give it a SHA-256 (pasted, or an adjacent `.sha256`) and then it must
+  match; with none, the import proceeds and Vesta hashes it as a baseline, so a
+  later change to the file is detectable — `activate()` rejects a model whose
+  size no longer matches, and a Verify action re-hashes on demand. Imports also
+  get a cheap GGUF header check (magic, version, plausible counts, truncation)
+  before llama.cpp opens the file.
 - **Fewer Android permissions** — `SYSTEM_ALERT_WINDOW`, `WRITE_CONTACTS`,
   `READ_EXTERNAL_STORAGE` and `WRITE_EXTERNAL_STORAGE` were reaching the
   generated manifest from the Expo template and from `expo-contacts` without any
