@@ -10,17 +10,43 @@ import {
 } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { useChatStore } from "../lib/store/chat-store";
+import { useAssistStore } from "../lib/store/assist-store";
+import { AssistOverlay } from "../components/AssistOverlay";
+import { consumeAssistRequest, onAssistRequest } from "../lib/native/assist";
 import { unloadEmbeddingModel, isEmbeddingLoaded } from "../lib/llm/embed-engine";
 import { colors } from "../lib/theme";
 
 export default function RootLayout() {
   const init = useChatStore((s) => s.init);
   const [ready, setReady] = useState(false);
+  const assistActive = useAssistStore((s) => s.active);
 
   useEffect(() => {
-    init()
-      .catch((err) => console.error("Init failed:", err))
-      .finally(() => setReady(true));
+    (async () => {
+      // Assistant invocation? The transcript is waiting in the native bridge.
+      // Reading it BEFORE init decides whether this launch loads the model at
+      // all: a spoken timer is handled by the parser, so an assistant boot
+      // skips the GGUF (and the keep-alive service) entirely.
+      const assist = await consumeAssistRequest();
+      try {
+        await init({ loadModel: assist === null });
+      } catch (err) {
+        console.error("Init failed:", err);
+      }
+      setReady(true);
+      if (assist) useAssistStore.getState().handle(assist);
+    })();
+  }, []);
+
+  useEffect(() => {
+    // A later invocation while the app is already running. The event is only a
+    // signal; the transcript is read back the same way as on a cold start, so
+    // it is acted on exactly once.
+    return onAssistRequest(() => {
+      consumeAssistRequest().then((text) => {
+        if (text) useAssistStore.getState().handle(text);
+      });
+    });
   }, []);
 
   useEffect(() => {
@@ -58,6 +84,23 @@ export default function RootLayout() {
       <View style={{ flex: 1, backgroundColor: colors.bg, justifyContent: "center", alignItems: "center" }}>
         <ActivityIndicator size="large" color={colors.accent} />
       </View>
+    );
+  }
+
+  // The assistant surface replaces the navigator rather than sitting on top of
+  // it: the chat screen never mounts, so nothing in it can pull the model in.
+  // Leaving it (Open chat) loads the model in the background, since the chat is
+  // useless without one.
+  if (assistActive) {
+    return (
+      <SafeAreaProvider>
+        <StatusBar style="dark" />
+        <AssistOverlay
+          onOpenChat={() => {
+            useChatStore.getState().ensureModelLoaded().catch(() => {});
+          }}
+        />
+      </SafeAreaProvider>
     );
   }
 

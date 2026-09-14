@@ -68,7 +68,8 @@ interface ChatState {
   pendingConfirmation: PendingConfirmation | null;
 
   // Actions
-  init: () => Promise<void>;
+  init: (opts?: { loadModel?: boolean }) => Promise<void>;
+  ensureModelLoaded: () => Promise<void>;
   sendMessage: (text: string) => Promise<void>;
   stopGenerating: () => void;
   resolveConfirmation: (confirmed: boolean) => Promise<void>;
@@ -102,7 +103,13 @@ export const useChatStore = create<ChatState>((set, get) => {
   notice: null,
   pendingConfirmation: null,
 
-  init: async () => {
+  // `loadModel: false` boots everything EXCEPT the GGUF and the keep-alive
+  // service. The assistant path uses it: a spoken "set a 30 second timer" is
+  // answered by the deterministic parser, and loading multi-GB weights to do
+  // that would add seconds and hundreds of MB to a gesture that needs neither.
+  // The model is loaded later, on demand, by ensureModelLoaded().
+  init: async (opts?: { loadModel?: boolean }) => {
+    const wantModel = opts?.loadModel !== false;
     const lang = await getConfig("language");
     if (lang === "it" || lang === "en") set({ language: lang });
 
@@ -124,13 +131,25 @@ export const useChatStore = create<ChatState>((set, get) => {
       set({ conversationId, messages: [] });
     }
 
-    // Start foreground service to keep process alive
-    startVestaService().catch(() => {});
+    // Keep-alive service and model go together: both exist to hold weights in
+    // memory, so an assist-only boot starts neither.
+    if (wantModel) {
+      startVestaService().catch(() => {});
+      await get().ensureModelLoaded();
+    }
 
-    // Auto-load the active model from the registry (migrating any legacy
-    // model_path on first run). Don't erase the selection on a transient load
-    // failure — only mark it errored when the file is genuinely gone, so a
-    // low-memory boot doesn't force re-downloading a multi-GB model.
+    // Run memory decay on startup (lightweight)
+    runMemoryDecay().catch(() => {});
+  },
+
+  // Loads the active model from the registry (migrating any legacy model_path
+  // on first run). Don't erase the selection on a transient load failure — only
+  // mark it errored when the file is genuinely gone, so a low-memory boot
+  // doesn't force re-downloading a multi-GB model.
+  //
+  // Idempotent: a model already loaded is left alone, so calling this from the
+  // assistant's LLM fallback after an assist-only boot is safe.
+  ensureModelLoaded: async () => {
     let active: InstalledModel | null = null;
     try {
       await ensureLegacyMigration();
@@ -168,9 +187,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       modelLoaded: info.loaded,
       modelPath: info.path ?? null,
     });
-
-    // Run memory decay on startup (lightweight)
-    runMemoryDecay().catch(() => {});
   },
 
   sendMessage: async (text: string) => {

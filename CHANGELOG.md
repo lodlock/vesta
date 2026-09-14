@@ -35,6 +35,27 @@ loopback-only MCP server, and a smaller permission set.
   `CompletableFuture` until the TypeScript MCP engine responds. Single-client by
   design. (Shipped binding `0.0.0.0`; now binds loopback — see Security below.)
 
+### Added — assistant
+
+- **Vesta can be the system digital assistant** — it now handles
+  `ACTION_ASSIST`, which is what makes a package a `ROLE_ASSISTANT` candidate,
+  so it appears under Settings → Default apps → Digital assistant app. It
+  previously declared neither an assist activity nor a `VoiceInteractionService`
+  and so was never listed. Settings → Digital assistant opens the system
+  chooser; Vesta never sets itself as the default.
+- **The assistant gesture goes straight to a spoken command** — transparent
+  voice activity → the system recognizer (FUTO or whatever the user chose) →
+  the deterministic scheduling parser → the Android timer/alarm/reminder
+  intent. No chat screen, and **no GGUF**: an assistant launch boots with
+  `loadModel: false`, so "set a 30 second timer" reaches the clock app without
+  the weights entering memory. The model is loaded only if the user taps the
+  fallback, which only appears once the parser has declined the utterance.
+  A clarification ("4 AM or 4 PM?") can be answered by voice — the answer
+  completes the original sentence, so it still resolves without a model.
+- No new permissions: an `ACTION_ASSIST` assistant needs none, and
+  `VESTA_SCHEDULING_ONLY=1` builds are unchanged. No hotword, no background
+  capture — the microphone opens only inside the recognizer the user invoked.
+
 ### Added — scheduling
 
 - **Deterministic scheduling parser** (`lib/scheduling`) — timers, alarms,

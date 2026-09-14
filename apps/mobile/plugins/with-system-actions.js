@@ -185,20 +185,61 @@ function withSystemActions(config) {
       });
     }
 
-    // Voice input activity
-    const hasVoiceActivity = mainApplication.activity.some(
+    // Voice input activity — also Vesta's ASSISTANT entry point.
+    //
+    // Handling ACTION_ASSIST is what makes the package a ROLE_ASSISTANT
+    // candidate: the system's role controller probes for exactly two things,
+    // a VoiceInteractionService and an ACTION_ASSIST activity, and before this
+    // Vesta declared neither (this activity had no intent filter at all and
+    // was not exported), so it never appeared under Digital assistant app.
+    //
+    // ACTION_ASSIST rather than a VoiceInteractionService, deliberately — see
+    // ADR-020. The short version: a VoiceInteractionService must name an
+    // `android:recognitionService` in its metadata, and the platform points
+    // Settings.Secure.VOICE_RECOGNITION_SERVICE at it when the assistant is
+    // selected. Vesta ships no recognizer on purpose (it delegates to whatever
+    // the user chose, e.g. FUTO), so it has nothing honest to name there, and
+    // claiming one would risk taking dictation away from other apps. The
+    // activity route also means no always-running bound service, which fits an
+    // assistant that is only ever invoked explicitly.
+    //
+    // CATEGORY_DEFAULT is required for the bare `new Intent(ACTION_ASSIST)`
+    // the system fires to resolve here; exported must be true for the system
+    // to launch it at all.
+    //
+    // This entry is REWRITTEN rather than skipped-if-present. android/ is
+    // generated but not always regenerated from scratch — a prebuild over an
+    // existing directory finds the activity already there, and a
+    // skip-if-present check would silently keep whatever shape it had, which
+    // is precisely how a rebuild would end up without the assist filter and
+    // Vesta would stay missing from the assistant list.
+    const voiceActivity = {
+      $: {
+        "android:name": ".VestaVoiceActivity",
+        "android:theme": "@android:style/Theme.Translucent.NoTitleBar",
+        "android:exported": "true",
+        "android:excludeFromRecents": "true",
+        "android:taskAffinity": "",
+      },
+      "intent-filter": [
+        {
+          action: [
+            { $: { "android:name": "android.intent.action.ASSIST" } },
+            { $: { "android:name": "android.intent.action.VOICE_COMMAND" } },
+          ],
+          category: [
+            { $: { "android:name": "android.intent.category.DEFAULT" } },
+          ],
+        },
+      ],
+    };
+    const voiceIndex = mainApplication.activity.findIndex(
       (a) => a.$?.["android:name"] === ".VestaVoiceActivity"
     );
-    if (!hasVoiceActivity) {
-      mainApplication.activity.push({
-        $: {
-          "android:name": ".VestaVoiceActivity",
-          "android:theme": "@android:style/Theme.Translucent.NoTitleBar",
-          "android:exported": "false",
-          "android:excludeFromRecents": "true",
-          "android:taskAffinity": "",
-        },
-      });
+    if (voiceIndex >= 0) {
+      mainApplication.activity[voiceIndex] = voiceActivity;
+    } else {
+      mainApplication.activity.push(voiceActivity);
     }
 
     const hasWidget = mainApplication.receiver.some(

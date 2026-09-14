@@ -13,16 +13,28 @@ import androidx.core.content.ContextCompat
 import java.util.Locale
 
 /**
- * Transparent activity launched from the widget's mic button.
- * Starts Android's speech recognizer, then forwards the transcribed text
- * to MainActivity via a deep link intent (vesta://chat?voice_text=...).
+ * Transparent activity that runs one round of speech input. It is the entry
+ * point for BOTH ways Vesta is spoken to:
+ *
+ *  - the widget's mic button (no action set), which pre-fills the chat input
+ *    over a `vesta://chat?voice_text=...` deep link, and
+ *  - the system assistant button/gesture (ACTION_ASSIST / ACTION_VOICE_COMMAND),
+ *    which hands the transcript to the scheduling fast path to be ACTED ON.
+ *
+ * The two differ only in what happens to the transcript, and they must: the
+ * deep link is a BROWSABLE URI that any app or web page can fire, so it only
+ * ever pre-fills. The assistant path executes, so its transcript travels
+ * through VestaAssistBridge — an in-process static nothing outside this app can
+ * write — rather than through an Intent extra.
  *
  * Deliberately the SYSTEM recognizer (RecognizerIntent.ACTION_RECOGNIZE_SPEECH),
  * not a bundled engine: whatever the user has set as their recognizer handles
  * the audio, so an offline one such as FUTO Voice Input works unchanged and
  * Vesta never ships its own STT. Do not replace this with Whisper or route it
  * through a service — offline-first is the point, and the system recognizer is
- * already warm when the user taps.
+ * already warm when the user taps. There is no hotword and no background
+ * capture anywhere in this path: the microphone opens only inside the
+ * recognizer the user explicitly invoked.
  */
 class VestaVoiceActivity : Activity() {
 
@@ -30,6 +42,11 @@ class VestaVoiceActivity : Activity() {
         private const val REQUEST_SPEECH = 1001
         private const val REQUEST_MIC_PERMISSION = 1002
     }
+
+    // True when the system assistant invoked us, rather than the widget.
+    private val fromAssistant: Boolean
+        get() = intent?.action == Intent.ACTION_ASSIST ||
+            intent?.action == "android.intent.action.VOICE_COMMAND"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -103,13 +120,27 @@ class VestaVoiceActivity : Activity() {
                 val spokenText = results?.firstOrNull()
 
                 if (!spokenText.isNullOrBlank()) {
-                    // Launch MainActivity with the transcribed text
-                    val launchIntent = Intent(this, MainActivity::class.java).apply {
-                        action = Intent.ACTION_VIEW
-                        this.data = Uri.parse("vesta://chat?voice_text=${Uri.encode(spokenText)}")
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    if (fromAssistant) {
+                        // Assistant invocation: hand the transcript over
+                        // in-process and just bring the app up. JS reads it back
+                        // through SystemActionsModule.consumeAssistRequest() —
+                        // the same call for a cold start and for a warm one, so
+                        // there is one code path and the text is consumed once.
+                        VestaAssistBridge.offer(spokenText)
+                        startActivity(
+                            Intent(this, MainActivity::class.java).addFlags(
+                                Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                            )
+                        )
+                    } else {
+                        // Widget: pre-fill the chat input, never auto-send.
+                        val launchIntent = Intent(this, MainActivity::class.java).apply {
+                            action = Intent.ACTION_VIEW
+                            this.data = Uri.parse("vesta://chat?voice_text=${Uri.encode(spokenText)}")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                        }
+                        startActivity(launchIntent)
                     }
-                    startActivity(launchIntent)
                 }
             }
             finish()

@@ -26,6 +26,11 @@ import {
   DEFAULT_PERF,
   type PerfSettings,
 } from "../lib/llm/perf-config";
+import {
+  isDefaultAssistant,
+  requestAssistantRole,
+  type AssistantRoleOutcome,
+} from "../lib/native/assist";
 import { colors, spacing, radii, typography } from "../lib/theme";
 import type { Language } from "../lib/orchestrator/types";
 
@@ -364,6 +369,10 @@ export default function SettingsScreen() {
         </TouchableOpacity>
       </View>
 
+      {/* Assistant section */}
+      <Text style={styles.sectionTitle}>Digital assistant</Text>
+      <AssistantCard />
+
       {/* MCP Server section */}
       <Text style={styles.sectionTitle}>MCP Server</Text>
       <View style={styles.card}>
@@ -389,6 +398,55 @@ export default function SettingsScreen() {
         <Text style={styles.versionText}>v0.1.0 — Fase 5 (Reliability &amp; Release)</Text>
       </View>
     </ScrollView>
+  );
+}
+
+// Lets the user make Vesta the system assistant, so the assistant gesture
+// goes straight to a spoken scheduling command. Opens a SYSTEM screen and
+// nothing more — an app cannot, and should not, make itself the default.
+function AssistantCard() {
+  const [isDefault, setIsDefault] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    isDefaultAssistant().then(setIsDefault).catch(() => setIsDefault(false));
+  }, []);
+  useEffect(refresh, [refresh]);
+
+  const request = async () => {
+    try {
+      const outcome: AssistantRoleOutcome = await requestAssistantRole();
+      if (outcome === "held") setNote("Vesta is already your assistant.");
+      else if (outcome === "settings")
+        setNote("Pick Vesta under “Digital assistant app”.");
+      else if (outcome === "unavailable")
+        setNote("This device has no assistant setting.");
+      else setNote(null);
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    }
+    // The choice happens in a system screen we don't get a result from.
+    setTimeout(refresh, 1500);
+  };
+
+  return (
+    <View style={styles.card}>
+      <Text style={styles.knowledgeDesc}>
+        {isDefault
+          ? "Vesta is your digital assistant. The assistant gesture starts voice input and runs timers, alarms and reminders without loading the model."
+          : "Make Vesta your digital assistant, and the assistant gesture will start voice input and run timers, alarms and reminders straight away."}
+      </Text>
+      {note && <Text style={styles.knowledgeDesc}>{note}</Text>}
+      <TouchableOpacity
+        style={[styles.btn, styles.btnPrimary, styles.knowledgeAddBtn]}
+        onPress={request}
+        activeOpacity={0.8}
+      >
+        <Text style={styles.btnPrimaryText}>
+          {isDefault ? "Assistant settings" : "Set Vesta as assistant"}
+        </Text>
+      </TouchableOpacity>
+    </View>
   );
 }
 

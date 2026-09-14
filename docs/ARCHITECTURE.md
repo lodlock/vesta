@@ -527,6 +527,18 @@ La verifica **fallisce chiusa**: quando un digest atteso esiste, il commit avvie
 
 **Motivazione**: determinismo dove sbagliare costa di più, e latenza zero sul comando più frequente. L'esecuzione non cambia — stesso dispatcher, stesso confirm gate, stessi Intent Android — quindi il parser decide gli argomenti, mai l'esecuzione. Effetto collaterale utile: lo scheduling funziona anche mentre un modello si scarica o non è riuscito a caricarsi.
 
+### ADR-020: Assistente di sistema via ACTION_ASSIST, non VoiceInteractionService
+
+**Contesto**: l'APK installato non compariva in Impostazioni → App predefinite → App di assistenza digitale. Il role controller di Android cerca esattamente due cose per candidare un pacchetto a `ROLE_ASSISTANT`: un servizio che risponda a `android.service.voice.VoiceInteractionService`, oppure un'activity che gestisca `android.intent.action.ASSIST`. Vesta non dichiarava né l'uno né l'altra — `VestaVoiceActivity` non aveva alcun intent filter ed era `exported="false"`, raggiungibile solo dal PendingIntent del widget — quindi entrambe le query di sistema restituivano zero risultati.
+
+**Decisione**: `VestaVoiceActivity` diventa anche il punto di ingresso dell'assistente, con un intent filter `ASSIST` + `VOICE_COMMAND` e `CATEGORY_DEFAULT`, esportata. Niente `VoiceInteractionService`.
+
+**Motivazione**: un `VoiceInteractionService` deve dichiarare nei metadata un `android:recognitionService`, e quando l'assistente viene selezionato la piattaforma punta `Settings.Secure.VOICE_RECOGNITION_SERVICE` su quello. Vesta un riconoscitore non ce l'ha per scelta — delega a quello di sistema, tipicamente FUTO (vedi §8.3) — quindi non avrebbe niente di onesto da dichiarare lì, e dichiarare un no-op rischierebbe di togliere la dettatura alle altre app. In più il servizio resterebbe sempre legato dal sistema, mentre qui l'invocazione è solo esplicita: nessun hotword, nessuna cattura in background, niente microfono aperto fuori dal riconoscitore che l'utente ha invocato.
+
+**Costo accettato**: niente assist context (screenshot/gerarchia delle view — non ci serve), niente invocazione da lockscreen, e su alcune shell OEM un tasto assistente hardware potrebbe onorare solo un `VoiceInteractionService`. Se dovesse servire, la strada è aggiungere il servizio E un `RecognitionService` che deleghi davvero — non prima.
+
+**Percorso**: gesto assistente → `VestaVoiceActivity` (trasparente, nessuna UI di chat) → riconoscitore di sistema → trascrizione → `VestaAssistBridge` (statico in-process: la deep link `vesta://` è BROWSABLE e quindi falsificabile, e una richiesta dell'assistente viene ESEGUITA, non pre-riempita) → `consumeAssistRequest()` da JS → `processMessage`, il cui fast path deterministico gira prima di ogni controllo sul modello → Intent Android. `chat-store.init({ loadModel: false })` fa sì che un avvio da assistente non carichi il GGUF né avvii il foreground service: "timer di 30 secondi" arriva all'orologio senza che i pesi tocchino la RAM. Il modello si carica solo se l'utente chiede esplicitamente il fallback, cioè quando il parser ha già dichiarato che non era un comando di scheduling.
+
 ---
 
 ## 8. Sicurezza
@@ -594,7 +606,8 @@ Permessi che il design originale prevedeva e che NON servono: `CALL_PHONE` e `SE
 ### 8.3 Input vocale
 
 L'input vocale passa dal riconoscitore **di sistema**
-(`RecognizerIntent.ACTION_RECOGNIZE_SPEECH` in `VestaVoiceActivity`), non da un
+(`RecognizerIntent.ACTION_RECOGNIZE_SPEECH` in `VestaVoiceActivity`), sia dal
+widget sia dal gesto dell'assistente di sistema (ADR-020), non da un
 motore incluso nell'app: chiunque l'utente abbia impostato come riconoscitore
 gestisce l'audio, quindi un motore offline come FUTO Voice Input funziona senza
 modifiche e Vesta non spedisce né conserva audio. Non sostituire questo percorso

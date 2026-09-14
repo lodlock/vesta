@@ -1,12 +1,14 @@
 package com.cosmico.vesta
 
 import android.app.ActivityManager
+import android.app.role.RoleManager
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.os.Build
 import android.provider.AlarmClock
+import android.provider.Settings
 import android.provider.CalendarContract
 import com.facebook.react.bridge.*
 import java.io.File
@@ -34,9 +36,19 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
     override fun initialize() {
         super.initialize()
         reactApplicationContext.applicationContext.registerComponentCallbacks(this)
+        // Wake JS when the assistant hands over a transcript while the app is
+        // already running. The event carries no payload: JS reads it back with
+        // consumeAssistRequest() either way, so warm and cold starts share one
+        // path and the transcript can only be consumed once.
+        VestaAssistBridge.onOffer = {
+            if (reactApplicationContext.hasActiveReactInstance()) {
+                reactApplicationContext.emitDeviceEvent("vestaAssist", null)
+            }
+        }
     }
 
     override fun invalidate() {
+        VestaAssistBridge.onOffer = null
         reactApplicationContext.applicationContext.unregisterComponentCallbacks(this)
         super.invalidate()
     }
@@ -95,6 +107,107 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
             promise.resolve(map)
         } catch (e: Exception) {
             promise.reject("DEVICE_INFO_ERROR", e.message, e)
+        }
+    }
+
+    // ── Assistant role ───────────────────────────────────────────────────
+    // Vesta qualifies for ROLE_ASSISTANT by handling ACTION_ASSIST (see
+    // VestaVoiceActivity and the manifest). These methods only report and
+    // REQUEST — the default assistant is the user's choice to make, and
+    // nothing here changes it silently.
+
+    /** The pending assistant transcript, consumed. Null when there isn't one. */
+    @ReactMethod
+    fun consumeAssistRequest(promise: Promise) {
+        promise.resolve(VestaAssistBridge.consume())
+    }
+
+    /**
+     * Re-opens the system recognizer for a follow-up turn (answering a
+     * clarification). ACTION_ASSIST so the transcript comes back through the
+     * assistant bridge and is handled exactly like the first turn.
+     */
+    @ReactMethod
+    fun startAssistCapture(promise: Promise) {
+        val intent = Intent(reactApplicationContext, VestaVoiceActivity::class.java)
+            .setAction(Intent.ACTION_ASSIST)
+        if (launch(intent)) promise.resolve(null)
+        else promise.reject("ASSIST_CAPTURE_ERROR", "Could not start voice capture")
+    }
+
+    /** Whether Vesta currently holds the assistant role. */
+    @ReactMethod
+    fun isDefaultAssistant(promise: Promise) {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                promise.resolve(false)
+                return
+            }
+            val roles = reactApplicationContext.getSystemService(RoleManager::class.java)
+            promise.resolve(roles?.isRoleHeld(RoleManager.ROLE_ASSISTANT) == true)
+        } catch (e: Exception) {
+            promise.resolve(false)
+        }
+    }
+
+    /**
+     * Opens the system UI for choosing the digital assistant.
+     *
+     * ROLE_ASSISTANT is not a role an app can pop a "grant?" dialog for on
+     * every Android build — it is exclusive and some versions mark it
+     * non-requestable — so this tries the role request first and falls back to
+     * the voice-input settings screen. Either way the user makes the choice in
+     * a system screen; there is no path here that sets the default itself.
+     *
+     * Resolves "held", "requested", "settings" or "unavailable" so the UI can
+     * say something accurate.
+     */
+    @ReactMethod
+    fun requestAssistantRole(promise: Promise) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val roles = reactApplicationContext.getSystemService(RoleManager::class.java)
+                if (roles != null && roles.isRoleHeld(RoleManager.ROLE_ASSISTANT)) {
+                    promise.resolve("held")
+                    return
+                }
+                if (roles != null && roles.isRoleAvailable(RoleManager.ROLE_ASSISTANT)) {
+                    try {
+                        val intent = roles.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT)
+                        if (launch(intent)) {
+                            promise.resolve("requested")
+                            return
+                        }
+                    } catch (e: Exception) {
+                        // Non-requestable on this build — fall through.
+                    }
+                }
+            }
+            val settings = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
+            if (launch(settings)) {
+                promise.resolve("settings")
+                return
+            }
+            promise.resolve("unavailable")
+        } catch (e: Exception) {
+            promise.reject("ASSISTANT_ROLE_ERROR", e.message, e)
+        }
+    }
+
+    // Prefers the current activity so the chooser lands on top of Vesta; falls
+    // back to a new task when the app has no foreground activity.
+    private fun launch(intent: Intent): Boolean {
+        return try {
+            val activity = currentActivity
+            if (activity != null) {
+                activity.startActivity(intent)
+            } else {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                reactApplicationContext.startActivity(intent)
+            }
+            true
+        } catch (e: Exception) {
+            false
         }
     }
 
