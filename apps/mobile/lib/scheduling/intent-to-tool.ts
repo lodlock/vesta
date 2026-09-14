@@ -212,6 +212,7 @@ export function clarificationFor(
 
   const en: Record<AmbiguityReason, string> = {
     "missing-duration": "How long should the timer be?",
+    "missing-warning-time": "How long before the end should I warn you?",
     "missing-time": "What time should I set it for?",
     "missing-subject": "What should I remind you about?",
     "ambiguous-meridiem": meridiemEn,
@@ -222,6 +223,7 @@ export function clarificationFor(
   };
   const it: Record<AmbiguityReason, string> = {
     "missing-duration": "Di quanto deve essere il timer?",
+    "missing-warning-time": "Quanto prima della fine devo avvisarti?",
     "missing-time": "A che ora lo imposto?",
     "missing-subject": "Cosa devo ricordarti?",
     "ambiguous-meridiem": meridiemIt,

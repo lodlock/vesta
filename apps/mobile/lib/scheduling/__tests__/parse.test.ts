@@ -465,8 +465,11 @@ describe("timer with an earlier warning", () => {
     };
     expect(ask("set two timers before dinner")).toBe("missing-duration");
     expect(ask("warn me before the timer")).toBe("missing-duration");
+    // This one states a length (forty-five minutes) but not when to warn, so
+    // the question is about the warning. Asking for a duration the user just
+    // gave is the bug the device regression exposed, in miniature.
     expect(ask("give me a warning sometime before forty-five minutes")).toBe(
-      "missing-duration",
+      "missing-warning-time",
     );
   });
 
@@ -506,5 +509,111 @@ describe("timer with an earlier warning", () => {
     });
     // The primary (last) call confirms the whole request.
     expect(calls[1].message).toBe("Timer set for 45 minutes, with a warning at 40 minutes");
+  });
+});
+
+// Reported from the device: "Set a 30 second timer" was transcribed correctly
+// and still asked "How long should the timer be?", and answering "30 seconds."
+// asked again. The duration parsed fine throughout — the warning-marker
+// "second timer" matched the middle of "30 SECOND TIMER", so the utterance was
+// treated as a warning-pair with one quantity, which short-circuits to a
+// clarification before the plain-timer branch ever runs.
+describe("second-unit timers (device regression)", () => {
+  const seconds = (text: string) => {
+    const intent = resolved(parse(text));
+    if (intent.kind !== "timer") throw new Error(`expected timer, got ${intent.kind}`);
+    return intent.durationSeconds;
+  };
+
+  it("resolves the exact transcript that failed on device", () => {
+    expect(seconds("Set a 30 second timer")).toBe(30);
+  });
+
+  it("resolves every phrasing of the same request", () => {
+    expect(seconds("Set a thirty second timer")).toBe(30);
+    expect(seconds("Set a timer for 30 seconds")).toBe(30);
+    expect(seconds("30 second timer")).toBe(30);
+    expect(seconds("Timer, 30 seconds")).toBe(30);
+    expect(seconds("Set a uh 30 second timer")).toBe(30);
+    expect(seconds("Set a thirty thirty second timer")).toBe(30);
+  });
+
+  it("resolves a timer in EVERY unit word, singular and plural", () => {
+    // The structural guard: no warning marker may collide with a unit. This
+    // fails if one ever does again.
+    const units: [string, number, number][] = [
+      // [unit, spoken number, expected seconds] — hours use 2, since 30 hours
+      // is past the 24h cap a timer is allowed to be.
+      ["second", 30, 30], ["seconds", 30, 30], ["sec", 30, 30], ["secs", 30, 30],
+      ["minute", 30, 1800], ["minutes", 30, 1800], ["min", 30, 1800], ["mins", 30, 1800],
+      ["hour", 2, 7200], ["hours", 2, 7200], ["hr", 2, 7200], ["hrs", 2, 7200],
+    ];
+    for (const [unit, spoken, expected] of units) {
+      expect(seconds(`set a ${spoken} ${unit} timer`)).toBe(expected);
+    }
+  });
+
+  it("resolves other units unchanged", () => {
+    expect(seconds("Set a 5 minute timer")).toBe(300);
+    expect(seconds("Set a 2 hour timer")).toBe(7200);
+  });
+
+  it("asks rather than reinterpreting an unsupported unit", () => {
+    // Milliseconds are not a unit Vesta knows. Silently reading "500" as 500
+    // of something else would be the worst possible answer.
+    const p = parse("Set a 500 millisecond timer");
+    if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
+    expect(p.reason).toBe("missing-duration");
+  });
+
+  it("reads 'a second timer' as ANOTHER timer, not a one-second one", () => {
+    // The article is ordinal here. Arming a 1-second timer would be worse than
+    // asking, so this asks.
+    const p = parse("Set a second timer");
+    if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
+    expect(p.reason).toBe("missing-duration");
+  });
+});
+
+// The clarification turn rebuilds "<original> <answer>" and re-parses it, so
+// the answer has to complete the sentence rather than stand alone.
+describe("clarification completes a timer request", () => {
+  const seconds = (text: string) => {
+    const intent = resolved(parse(text));
+    if (intent.kind !== "timer") throw new Error(`expected timer, got ${intent.kind}`);
+    return intent.durationSeconds;
+  };
+
+  it("asks when the length is genuinely absent", () => {
+    const p = parse("Set a timer");
+    if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
+    expect(p.reason).toBe("missing-duration");
+  });
+
+  it("resolves the rebuilt sentence, including the exact device transcript", () => {
+    // assist-store joins them with a space; "30 seconds." is what the
+    // recognizer returned, full stop included.
+    expect(seconds("Set a timer 30 seconds.")).toBe(30);
+    expect(seconds("Set a timer thirty seconds")).toBe(30);
+    expect(seconds("Set a timer for 30 seconds")).toBe(30);
+    expect(seconds("Set a timer 30 second timer")).toBe(30);
+  });
+});
+
+describe("the warning question names the piece that is missing", () => {
+  const reasonFor = (text: string) => {
+    const p = parse(text);
+    if (p.status !== "ambiguous") throw new Error(`expected ambiguous, got ${p.status}`);
+    return p.reason;
+  };
+
+  it("asks about the WARNING when the timer length was given", () => {
+    // Asking "how long should the timer be?" at someone who just said "ten
+    // minute timer" is the same failure as the marker collision, only quieter.
+    expect(reasonFor("set a ten minute timer and warn me")).toBe("missing-warning-time");
+  });
+
+  it("still asks about the duration when neither is given", () => {
+    expect(reasonFor("warn me before the timer")).toBe("missing-duration");
   });
 });

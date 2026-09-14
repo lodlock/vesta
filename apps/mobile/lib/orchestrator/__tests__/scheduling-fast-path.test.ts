@@ -54,6 +54,29 @@ describe("fast path — resolved commands never reach the model", () => {
     expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 5 }, "en");
   });
 
+  it("runs the exact device transcript that regressed, with no model", async () => {
+    // "Set a 30 second timer" asked for a duration it had already been given,
+    // because a warning-marker matched the unit word. End to end, through the
+    // real parser, this must be a timer and nothing else.
+    const res = await send("Set a 30 second timer");
+
+    expect(mockGenerate).not.toHaveBeenCalled();
+    expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 0.5 }, "en");
+    expect(res.type).toBe("tool_call");
+  });
+
+  it("completes a clarified timer from the rebuilt sentence", async () => {
+    expect((await send("Set a timer")).type).toBe("text"); // asks
+    mockDispatch.mockClear();
+
+    // What assist-store re-parses once the user answers "30 seconds."
+    const res = await send("Set a timer 30 seconds.");
+
+    expect(mockGenerate).not.toHaveBeenCalled();
+    expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 0.5 }, "en");
+    expect(res.type).toBe("tool_call");
+  });
+
   it("gates a self-corrected alarm for confirmation instead of arming it", async () => {
     const res = await send("alarm for eight… no, eight thirty tomorrow morning");
 

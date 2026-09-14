@@ -38,6 +38,7 @@ export type ScheduleIntent =
 
 export type AmbiguityReason =
   | "missing-duration"
+  | "missing-warning-time"
   | "missing-time"
   | "missing-subject"
   | "ambiguous-meridiem"
@@ -156,9 +157,18 @@ const STOPWORDS: Record<Language, string[]> = {
 // "warning" and little else, so a pair built on one of them is safe even when
 // the utterance never says "timer" ("forty-five minutes, with a five-minute
 // warning").
+//
+// NO MARKER MAY START WITH A UNIT WORD. "second timer" used to be here, for
+// "set a second timer" meaning another one — and it matched the middle of
+// "set a 30 SECOND TIMER", turning the most ordinary timer request there is
+// into a warning-pair with one quantity, which then asked the user how long
+// the timer should be. Italian's "secondo timer" had the same defect. The
+// ordinal reading is already covered by "another one"/"another timer", and a
+// bare "set a second timer" asks for a length anyway, so nothing is lost.
+// __tests__/parse.test.ts locks this by resolving a timer in every unit.
 const WARNING_MARKERS: Record<Language, string[]> = {
-  en: ["warn me", "warning", "heads up", "another one", "another timer", "second timer"],
-  it: ["avvisami", "avviso", "un altro timer", "un altro", "secondo timer"],
+  en: ["warn me", "warning", "heads up", "another one", "another timer"],
+  it: ["avvisami", "avviso", "un altro timer", "un altro"],
 };
 
 // "remind me" introduces a warning too ("45 minutes, but remind me 5 before"),
@@ -180,6 +190,19 @@ const BEFORE_WORDS: Record<Language, string[]> = {
 const AT_WORDS: Record<Language, string[]> = {
   en: ["at"],
   it: ["a", "alle"],
+};
+
+// Tokens that are only ever articles, never a spoken quantity.
+const ARTICLES: Record<Language, string[]> = {
+  en: ["a", "an"],
+  it: ["un", "una", "uno"],
+};
+
+// The noun a timer request ends on. Used to tell "a second timer" (another one)
+// from "a 30 second timer" (a duration) — see scanDurationRaw.
+const TIMER_NOUNS: Record<Language, string[]> = {
+  en: ["timer", "timers"],
+  it: ["timer"],
 };
 
 // A timer longer than this is almost certainly a misparse (a 25-hour countdown
@@ -361,6 +384,17 @@ function scanDurationRaw(
     if (!num) continue;
     const unit = units[tokens[num.next] ?? ""];
     if (unit === undefined) continue;
+    // "a second timer" is ANOTHER timer, not a one-second one. An article
+    // reading as the number one, directly before a unit, directly before the
+    // word "timer", is the ordinal sense — a real duration says a number ("a
+    // 30 second timer"). Without this the phrase silently armed a 1-second
+    // timer, which is worse than asking.
+    if (
+      ARTICLES[lang].includes(tokens[i]) &&
+      TIMER_NOUNS[lang].includes(tokens[num.next + 1] ?? "")
+    ) {
+      continue;
+    }
     // "an hour and a half"
     let end = num.next + 1;
     let value = num.value * unit;
@@ -652,12 +686,6 @@ function pickWarningQuantity(
   const before = [...quantities].reverse().find((q) => q.end <= marker.start);
   return before ?? null;
 }
-
-// Tokens that are only ever articles, never a spoken quantity.
-const ARTICLES: Record<Language, string[]> = {
-  en: ["a", "an"],
-  it: ["un", "una", "uno"],
-};
 
 // A bare number in a timer+warning sentence — "warning at forty", "warn me at
 // one". The unit is decided later by findWarningPair (it borrows the timer's);
@@ -1054,12 +1082,17 @@ export function parseSchedulingCommand(
     return { status: "ambiguous", reason: "compound-request", normalized: text };
   }
 
-  // A warning phrase alongside a timer, but no usable pair — "warn me before
-  // the timer", "give me a warning sometime before forty-five minutes". The
-  // missing piece is always a length. Gated on the timer family so a plain
-  // reminder is never asked how long it should be.
+  // A warning phrase alongside a timer, but no usable pair. Which question to
+  // ask depends on which half is missing — asking "how long should the timer
+  // be?" at someone who just said "ten minute timer" is the same failure as the
+  // marker collision above, only quieter.
   if (warningPair.kind === "unresolved" && families.includes("timer")) {
-    return { status: "ambiguous", reason: "missing-duration", normalized: text };
+    const stated = scanDuration(tokens, lang);
+    return {
+      status: "ambiguous",
+      reason: stated ? "missing-warning-time" : "missing-duration",
+      normalized: text,
+    };
   }
 
   const family = families[0];
