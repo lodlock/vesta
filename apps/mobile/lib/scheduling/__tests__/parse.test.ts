@@ -382,6 +382,14 @@ describe("timer with an earlier warning", () => {
     expect(intent.kind).toBe("reminder");
   });
 
+  it("does not turn a long chatty sentence into two timers", () => {
+    // Two durations and the word "warning", but no timer command in sight.
+    expect(
+      parse("the warning said it takes forty five minutes and five minutes to cool")
+        .status,
+    ).toBe("none");
+  });
+
   it("dispatches as two timers, warning first", () => {
     const calls = intentToToolCalls(
       { kind: "timerWithWarning", durationSeconds: 2700, warningSeconds: 2400 },

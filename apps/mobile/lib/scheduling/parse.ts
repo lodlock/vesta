@@ -937,11 +937,27 @@ export function parseSchedulingCommand(
   // The last segment is tried first so a correction wins (45 + 40 above, not
   // 30 + 40); the whole utterance is the fallback for when the correction
   // restated only part of it.
-  const pairOpts = { allowGeneric: families.includes("timer") };
+  // Without a timer trigger, a pair rests entirely on the warning phrase, so
+  // keep it to utterance lengths a spoken command actually has. It stops a
+  // narrative sentence that happens to contain two durations and the word
+  // "warning" ("the warning said it takes forty-five minutes and five minutes
+  // to cool") from silently setting two timers. Commands of this shape are
+  // short: the longest one this is built for is eight tokens.
+  const MAX_FAMILYLESS_PAIR_TOKENS = 14;
+  const hasTimerFamily = families.includes("timer");
+  const pairOpts = { allowGeneric: hasTimerFamily };
+  const pairAllowed = (segment: string[]) =>
+    hasTimerFamily || segment.length <= MAX_FAMILYLESS_PAIR_TOKENS;
   const lastSegment = segmentsOf(norm.segments).at(-1) ?? tokens;
-  const fromLast = findWarningPair(lastSegment, lang, pairOpts);
+  const fromLast = pairAllowed(lastSegment)
+    ? findWarningPair(lastSegment, lang, pairOpts)
+    : ({ kind: "none" } as WarningPair);
   const warningPair: WarningPair =
-    fromLast.kind === "pair" ? fromLast : findWarningPair(tokens, lang, pairOpts);
+    fromLast.kind === "pair"
+      ? fromLast
+      : pairAllowed(tokens)
+        ? findWarningPair(tokens, lang, pairOpts)
+        : { kind: "none" };
 
   if (warningPair.kind === "pair") {
     return {
