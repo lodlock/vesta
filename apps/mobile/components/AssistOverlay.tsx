@@ -34,11 +34,15 @@ export function AssistOverlay({ onOpenChat }: { onOpenChat: () => void }) {
           <Text style={styles.transcript}>“{transcript}”</Text>
         )}
 
-        {(phase === "working" || phase === "listening") && (
+        {(phase === "working" || phase === "listening" || phase === "thinking") && (
           <View style={styles.busyRow}>
             <ActivityIndicator color={colors.accent} />
             <Text style={styles.busyText}>
-              {phase === "listening" ? "Listening…" : "Working…"}
+              {phase === "listening"
+                ? "Listening…"
+                : phase === "thinking"
+                  ? "Asking the model…"
+                  : "Working…"}
             </Text>
           </View>
         )}
@@ -47,7 +51,9 @@ export function AssistOverlay({ onOpenChat }: { onOpenChat: () => void }) {
           <Text style={[styles.message, failed && styles.failed]}>{message}</Text>
         )}
 
-        {phase === "answer" && <Text style={styles.message}>{message}</Text>}
+        {phase === "answer" && (
+          <Text style={[styles.message, failed && styles.failed]}>{message}</Text>
+        )}
 
         {phase === "clarify" && (
           <>
@@ -87,8 +93,8 @@ export function AssistOverlay({ onOpenChat }: { onOpenChat: () => void }) {
         {phase === "fallback" && (
           <>
             <Text style={styles.message}>
-              That isn’t a timer, alarm, reminder or event. Vesta can ask the
-              model instead — that loads it into memory first.
+              That isn’t a timer, alarm, reminder or event. Automatic fallback is
+              off, so the model is only loaded if you ask.
             </Text>
             <TouchableOpacity
               style={[styles.btn, styles.btnPrimary]}

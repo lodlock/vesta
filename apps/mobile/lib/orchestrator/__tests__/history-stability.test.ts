@@ -43,6 +43,7 @@ const mockGenerate = generate as jest.MockedFunction<typeof generate>;
 function gen(text: string) {
   return {
     text,
+    content: "",
     reasoningContent: "",
     tokensPredicted: 10,
     tokensEvaluated: 100,

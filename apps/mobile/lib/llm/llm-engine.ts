@@ -18,6 +18,10 @@ export interface CompletionMessage {
 
 export interface CompletionResult {
   text: string;
+  // llama.rn's reasoning- and tool-call-filtered text. Empty when the runtime
+  // could not parse a reasoning format for this model, so treat it as a hint
+  // and not a guarantee — assist mode sanitizes on top of it.
+  content: string;
   reasoningContent: string;
   tokensPredicted: number;
   tokensEvaluated: number;
@@ -269,6 +273,7 @@ export function generate(
 
     return {
       text,
+      content: result.content ?? "",
       reasoningContent: result.reasoning_content ?? "",
       tokensPredicted: result.tokens_predicted,
       tokensEvaluated: result.tokens_evaluated,

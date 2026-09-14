@@ -27,6 +27,14 @@ import { toolRequiresConfirmation, toolReturnsData } from "../tools/tool-registr
 import { parseSchedulingCommand } from "../scheduling/parse";
 import { intentToToolCalls, clarificationFor } from "../scheduling/intent-to-tool";
 
+export interface ProcessOptions {
+  assistMode?: boolean;
+}
+
+// Spoken answers are short by construction: a cap here is what stops the
+// assistant reading out three paragraphs.
+const ASSIST_MAX_TOKENS = 320;
+
 const MAX_HISTORY_MESSAGES = 20;
 // Once the conversation exceeds the window, `slice(-MAX)` would re-slice to a
 // different set every turn — the replayed history's head would shift by one
@@ -135,6 +143,11 @@ export async function processMessage(
   // history replay come from the SAME instant — byte-identical by
   // construction, which is the KV-cache invariant. Defaults to now.
   sentAt: Date = new Date(),
+  // Assist mode: the system-assistant surface, which is spoken aloud and has
+  // no room for thinking-out-loud. Turns OFF the model's reasoning pass at
+  // generation time (the runtime's own switch, not a post-hoc strip) and keeps
+  // the answer short. Ordinary chat passes nothing and is unchanged.
+  options: ProcessOptions = {},
 ): Promise<OrchestratorResponse> {
   // The confirmation setting gates both routes below (default ON for safety).
   let confirmEnabled = true;
@@ -226,7 +239,14 @@ export async function processMessage(
     // tool-selection consistency without hurting chat quality much (LLM-5).
     const result = await generate(
       messages,
-      { maxTokens: 4096, temperature: 0.3 },
+      {
+        maxTokens: options.assistMode ? ASSIST_MAX_TOKENS : 4096,
+        temperature: 0.3,
+        // The runtime's own switch (llama.rn `enable_thinking`), which stops a
+        // reasoning model from producing the block at all rather than hiding it
+        // afterwards. Left undefined for chat so the model's default stands.
+        ...(options.assistMode ? { enableThinking: false } : {}),
+      },
       onToken,
     );
     const raw = result.text;
@@ -387,6 +407,12 @@ export async function processMessage(
           }
         }
       }
+    } else if (options.assistMode) {
+      // Assist mode never shows reasoning. `content` is llama.rn's filtered
+      // text; it is empty when the runtime didn't recognize the model's
+      // reasoning format, so fall back to the raw text and let the caller
+      // sanitize (see lib/assist/response-text).
+      response = { type: "text", content: result.content || raw };
     } else {
       // Plain text response — keep think tags for styled UI rendering
       response = { type: "text", content: raw };

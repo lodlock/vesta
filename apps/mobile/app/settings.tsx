@@ -407,11 +407,30 @@ export default function SettingsScreen() {
 function AssistantCard() {
   const [isDefault, setIsDefault] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  // Both default ON: the assistant is meant to be a catch-all that answers out
+  // loud. Unset reads as on, so an existing install needs no migration.
+  const [autoModel, setAutoModel] = useState(true);
+  const [speakAloud, setSpeakAloud] = useState(true);
 
   const refresh = useCallback(() => {
     isDefaultAssistant().then(setIsDefault).catch(() => setIsDefault(false));
+    getConfig("assist_auto_model")
+      .then((v) => setAutoModel(v !== "false"))
+      .catch(() => setAutoModel(true));
+    getConfig("assist_speak")
+      .then((v) => setSpeakAloud(v !== "false"))
+      .catch(() => setSpeakAloud(true));
   }, []);
   useEffect(refresh, [refresh]);
+
+  const toggleAutoModel = (on: boolean) => {
+    setAutoModel(on);
+    setConfig("assist_auto_model", on ? "true" : "false").catch(() => {});
+  };
+  const toggleSpeak = (on: boolean) => {
+    setSpeakAloud(on);
+    setConfig("assist_speak", on ? "true" : "false").catch(() => {});
+  };
 
   const request = async () => {
     try {
@@ -448,6 +467,36 @@ function AssistantCard() {
           {isDefault ? "Assistant settings" : "Set Vesta as assistant"}
         </Text>
       </TouchableOpacity>
+
+      <View style={[styles.toggleRow, { marginTop: spacing.lg }]}>
+        <View style={styles.toggleInfo}>
+          <Text style={styles.toggleTitle}>Answer anything</Text>
+          <Text style={styles.toggleHint}>
+            Requests that aren’t a timer, alarm, reminder or event go to the
+            local model. Off keeps the assistant scheduling-only and never loads
+            it.
+          </Text>
+        </View>
+        <Switch
+          value={autoModel}
+          onValueChange={toggleAutoModel}
+          trackColor={{ false: colors.disabled, true: colors.accent }}
+        />
+      </View>
+
+      <View style={[styles.toggleRow, { marginTop: spacing.lg }]}>
+        <View style={styles.toggleInfo}>
+          <Text style={styles.toggleTitle}>Speak answers</Text>
+          <Text style={styles.toggleHint}>
+            Reads confirmations and answers aloud with your device’s voice.
+          </Text>
+        </View>
+        <Switch
+          value={speakAloud}
+          onValueChange={toggleSpeak}
+          trackColor={{ false: colors.disabled, true: colors.accent }}
+        />
+      </View>
     </View>
   );
 }

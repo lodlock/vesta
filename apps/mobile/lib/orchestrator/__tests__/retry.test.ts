@@ -44,6 +44,7 @@ const mockDispatch = dispatchToolCall as jest.MockedFunction<typeof dispatchTool
 function gen(text: string, opts: { stoppedByUser?: boolean } = {}) {
   return {
     text,
+    content: "",
     reasoningContent: "",
     tokensPredicted: 0,
     tokensEvaluated: 0,

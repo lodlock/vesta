@@ -50,8 +50,53 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
 
     override fun invalidate() {
         VestaAssistBridge.onOffer = null
+        speaker?.shutdown()
+        speaker = null
         reactApplicationContext.applicationContext.unregisterComponentCallbacks(this)
         super.invalidate()
+    }
+
+    // ── Speech ───────────────────────────────────────────────────────────
+    // The assistant reads its answers back through the SYSTEM engine. Created
+    // lazily: a device that never uses the assistant never starts a TTS engine,
+    // and the chat screen doesn't speak at all.
+
+    private var speaker: VestaSpeaker? = null
+
+    private fun speaker(): VestaSpeaker {
+        val existing = speaker
+        if (existing != null) return existing
+        val created = VestaSpeaker(reactApplicationContext)
+        speaker = created
+        return created
+    }
+
+    /**
+     * Speaks `text`, cutting off anything already playing. Resolves when the
+     * utterance finishes — "done", "stopped", "error" or "unavailable" — so the
+     * caller can wait for speech to end rather than guessing at a delay.
+     */
+    @ReactMethod
+    fun speak(text: String, language: String, promise: Promise) {
+        try {
+            var settled = false
+            speaker().speak(text, language) { reason ->
+                // The engine can, on some devices, deliver both a stop and a
+                // done for the same utterance; a Promise may only settle once.
+                if (!settled) {
+                    settled = true
+                    promise.resolve(reason)
+                }
+            }
+        } catch (e: Exception) {
+            promise.reject("TTS_ERROR", e.message, e)
+        }
+    }
+
+    /** Cuts off speech — assistant dismissed, or a new invocation arrived. */
+    @ReactMethod
+    fun stopSpeaking() {
+        speaker?.stop()
     }
 
     override fun onTrimMemory(level: Int) {

@@ -23,6 +23,7 @@ const mockClear = clearKvCache as jest.MockedFunction<typeof clearKvCache>;
 function result(promptMs: number, opts: { stoppedByUser?: boolean } = {}) {
   return {
     text: "ok",
+    content: "",
     reasoningContent: "",
     tokensPredicted: 8,
     tokensEvaluated: 100,

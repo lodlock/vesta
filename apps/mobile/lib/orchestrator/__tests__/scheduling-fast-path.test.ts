@@ -135,6 +135,7 @@ describe("fast path — everything else still goes to the model", () => {
   it("passes ordinary conversation through to generate", async () => {
     mockGenerate.mockResolvedValue({
       text: "Ciao!",
+      content: "",
       reasoningContent: "",
       tokensPredicted: 0,
       tokensEvaluated: 0,
