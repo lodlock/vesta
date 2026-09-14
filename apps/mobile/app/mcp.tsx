@@ -3,7 +3,8 @@ import {
   ScrollView, View, Text, TextInput, TouchableOpacity, Switch, Alert, StyleSheet,
 } from "react-native";
 import {
-  enableMcpServer, disableMcpServer, isMcpEnabled, MCP_PORT,
+  enableMcpServer, disableMcpServer, isMcpEnabled, isMcpLanBindEnabled,
+  setMcpLanBind, MCP_PORT, MCP_LOOPBACK,
 } from "../lib/mcp/mcp-lifecycle";
 import {
   createClient, listClients, revokeClient, type McpClient,
@@ -12,6 +13,7 @@ import { colors, spacing, typography, radii } from "../lib/theme";
 
 export default function McpScreen() {
   const [enabled, setEnabled] = useState(false);
+  const [lanBind, setLanBind] = useState(false);
   const [ip, setIp] = useState<string | null>(null);
   const [clients, setClients] = useState<McpClient[]>([]);
   const [busy, setBusy] = useState(false);
@@ -20,8 +22,9 @@ export default function McpScreen() {
   const refresh = useCallback(() => {
     (async () => {
       try {
-        const on = await isMcpEnabled();
+        const [on, lan] = await Promise.all([isMcpEnabled(), isMcpLanBindEnabled()]);
         setEnabled(on);
+        setLanBind(lan);
         if (on) {
           // Enabled in a previous session/visit: ensure the server is running
           // this session (enableMcpServer is idempotent) and capture the LAN IP
@@ -55,6 +58,39 @@ export default function McpScreen() {
     }
   };
 
+  // LAN exposure is a separate, explicit opt-in from the on/off switch: the
+  // transport is plaintext and the exposed tools read calendar/contacts/docs,
+  // so turning it on is confirmed, never a silent side effect of enabling MCP.
+  const applyLanBind = async (on: boolean) => {
+    setBusy(true);
+    try {
+      const res = await setMcpLanBind(on);
+      setLanBind(on);
+      if (res) setIp(res.ip);
+      else if (!on) setIp(MCP_LOOPBACK);
+    } catch (e) {
+      Alert.alert("MCP", e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleLan = (on: boolean) => {
+    if (!on) {
+      applyLanBind(false);
+      return;
+    }
+    Alert.alert(
+      "Expose on Wi-Fi?",
+      "Vesta will accept MCP requests from any device on this network. The connection is plain HTTP, so the client token travels unencrypted and the exposed tools return your calendar, contacts and document text." +
+        "\n\nLeave this off to keep the server on the phone only (127.0.0.1) and connect over adb.",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Expose", style: "destructive", onPress: () => applyLanBind(true) },
+      ],
+    );
+  };
+
   const addClient = async () => {
     const name = newName.trim();
     if (!name) return;
@@ -62,10 +98,16 @@ export default function McpScreen() {
       const c = await createClient(name);
       setNewName("");
       setClients(await listClients());
-      const url = ip ? `http://${ip}:${MCP_PORT}/mcp` : `http://<phone-ip>:${MCP_PORT}/mcp`;
+      const host = lanBind ? (ip ?? "<phone-ip>") : MCP_LOOPBACK;
+      const url = `http://${host}:${MCP_PORT}/mcp`;
+      // Loopback binding is unreachable from the laptop until the port is
+      // forwarded, so the pairing text leads with that step.
+      const prefix = lanBind
+        ? ""
+        : `First forward the port to the phone:\n\nadb reverse tcp:${MCP_PORT} tcp:${MCP_PORT}\n\n`;
       Alert.alert(
         c.name,
-        `Add to your MCP client:\n\nclaude mcp add --transport http vesta ${url} --header "Authorization: Bearer ${c.token}"`,
+        `${prefix}Add to your MCP client:\n\nclaude mcp add --transport http vesta ${url} --header "Authorization: Bearer ${c.token}"`,
       );
     } catch (e) {
       Alert.alert("MCP", e instanceof Error ? e.message : String(e));
@@ -100,10 +142,21 @@ export default function McpScreen() {
         </View>
         {enabled && (
           <Text style={styles.hint}>
-            {ip ? `http://${ip}:${MCP_PORT}/mcp` : "Getting LAN address…"}
-            {"\n"}Only reachable on this Wi-Fi. Data stays on the phone.
+            {`http://${lanBind ? (ip ?? "…") : MCP_LOOPBACK}:${MCP_PORT}/mcp`}
+            {"\n"}
+            {lanBind
+              ? "Reachable from any device on this Wi-Fi over plain HTTP. Data stays on the phone."
+              : `On-device only (loopback). Connect a laptop with: adb reverse tcp:${MCP_PORT} tcp:${MCP_PORT}`}
           </Text>
         )}
+        <View style={styles.row}>
+          <Text style={styles.label}>Allow access from Wi-Fi</Text>
+          <Switch value={lanBind} onValueChange={toggleLan} disabled={busy}
+            trackColor={{ false: colors.disabled, true: colors.accent }} />
+        </View>
+        <Text style={styles.hint}>
+          Off = the server binds 127.0.0.1 and nothing on the network can reach it.
+        </Text>
       </View>
 
       <Text style={styles.sectionTitle}>Clients</Text>

@@ -17,7 +17,9 @@ import { handleJsonRpc } from "../../mcp/mcp-server";
 // channel a real NativeEventEmitter subscribes to). addListener/removeListeners
 // are present because NativeEventEmitter's constructor calls them.
 const mockModule = {
-  startServer: jest.fn(async () => "192.168.1.5"),
+  startServer: jest.fn(async (_port: number, lan: boolean) =>
+    lan ? "192.168.1.5" : "127.0.0.1",
+  ),
   stopServer: jest.fn(async () => {}),
   setActiveTokens: jest.fn(),
   respondMcp: jest.fn(),
@@ -30,9 +32,22 @@ beforeEach(() => {
   (NativeModules as unknown as { McpServerModule: typeof mockModule }).McpServerModule = mockModule;
 });
 
-it("startMcpServer returns ip + port", async () => {
-  expect(await startMcpServer(8420)).toEqual({ ip: "192.168.1.5", port: 8420 });
-  expect(mockModule.startServer).toHaveBeenCalledWith(8420);
+it("startMcpServer binds loopback unless LAN is explicitly requested", async () => {
+  expect(await startMcpServer(8420)).toEqual({
+    ip: "127.0.0.1",
+    port: 8420,
+    lan: false,
+  });
+  expect(mockModule.startServer).toHaveBeenCalledWith(8420, false);
+});
+
+it("startMcpServer forwards an explicit LAN binding", async () => {
+  expect(await startMcpServer(8420, true)).toEqual({
+    ip: "192.168.1.5",
+    port: 8420,
+    lan: true,
+  });
+  expect(mockModule.startServer).toHaveBeenCalledWith(8420, true);
 });
 
 it("setActiveTokens forwards to native", () => {

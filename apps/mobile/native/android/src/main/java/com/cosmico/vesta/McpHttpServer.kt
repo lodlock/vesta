@@ -11,11 +11,17 @@ import java.util.concurrent.TimeUnit
 // raw JSON-RPC body to JS, and blocks the request thread on a future keyed by a
 // per-request id until JS calls back with the response. Single-client, low
 // concurrency by design.
+//
+// `hostname` is supplied by the caller and is 127.0.0.1 unless the user has
+// explicitly opted into LAN exposure (McpServerModule.startServer). This is a
+// PLAINTEXT service whose bearer token would cross the network in the clear, so
+// loopback is the default and LAN binding is a deliberate, revocable choice.
 class McpHttpServer(
+    hostname: String,
     port: Int,
     private val activeTokens: () -> Set<String>,
     private val onRequest: (id: String, token: String, body: String) -> Unit,
-) : NanoHTTPD("0.0.0.0", port) {
+) : NanoHTTPD(hostname, port) {
 
     private val pending = ConcurrentHashMap<String, CompletableFuture<Pair<Int, String>>>()
     private var counter = 0L

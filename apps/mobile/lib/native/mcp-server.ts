@@ -11,7 +11,7 @@ import { NativeModules, NativeEventEmitter } from "react-native";
 import { handleJsonRpc } from "../mcp/mcp-server";
 
 interface McpNativeModule {
-  startServer(port: number): Promise<string>;
+  startServer(port: number, bindLan: boolean): Promise<string>;
   stopServer(): Promise<void>;
   setActiveTokens(tokens: string[]): void;
   respondMcp(id: string, status: number, body: string): void;
@@ -21,9 +21,15 @@ function getMod(): McpNativeModule {
   return NativeModules.McpServerModule as McpNativeModule;
 }
 
-export async function startMcpServer(port: number): Promise<{ ip: string; port: number }> {
-  const ip = await getMod().startServer(port);
-  return { ip, port };
+// `bindLan` defaults to false: the native server binds 127.0.0.1 so the
+// plaintext bearer token never crosses the network. Callers pass true only
+// when the user has explicitly opted into LAN exposure (see mcp-lifecycle).
+export async function startMcpServer(
+  port: number,
+  bindLan = false,
+): Promise<{ ip: string; port: number; lan: boolean }> {
+  const ip = await getMod().startServer(port, bindLan);
+  return { ip, port, lan: bindLan };
 }
 
 export function stopMcpServer(): Promise<void> {
