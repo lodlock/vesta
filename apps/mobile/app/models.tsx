@@ -13,7 +13,7 @@ import * as DocumentPicker from "expo-document-picker";
 import { useModelStore } from "../lib/store/model-store";
 import { CATALOG } from "../lib/models/catalog";
 import { listGgufFiles, type HfFile } from "../lib/models/hf-client";
-import type { CatalogModel, InstalledModel } from "../lib/models/types";
+import type { CatalogModel, InstalledModel, ModelTrust } from "../lib/models/types";
 import { formatBytes, formatDuration, percent, fitLabel, type FitLabel } from "../lib/models/format";
 import { colors, spacing, radii, typography } from "../lib/theme";
 
@@ -31,7 +31,11 @@ export default function ModelsScreen() {
   const remove = useModelStore((s) => s.remove);
   const cancel = useModelStore((s) => s.cancel);
   const importLocalModel = useModelStore((s) => s.importLocalModel);
+  const verifyIntegrity = useModelStore((s) => s.verifyIntegrity);
   const clearError = useModelStore((s) => s.clearError);
+  // Optional: a SHA-256 the user has for the file they are about to import.
+  // Left empty, the import still works — see importLocalModel's policy.
+  const [importChecksum, setImportChecksum] = useState("");
 
   useEffect(() => {
     refresh();
@@ -62,7 +66,8 @@ export default function ModelsScreen() {
       Alert.alert("Invalid file", "Please select a .gguf model file.");
       return;
     }
-    await importLocalModel(asset.uri, name);
+    await importLocalModel(asset.uri, name, importChecksum.trim() || null);
+    setImportChecksum("");
   };
 
   return (
@@ -115,6 +120,7 @@ export default function ModelsScreen() {
                 onActivate={activate}
                 onCancel={cancel}
                 onRemove={confirmRemove}
+                onVerify={verifyIntegrity}
               />
             ))}
         </>
@@ -128,7 +134,22 @@ export default function ModelsScreen() {
       <Text style={styles.sectionTitle}>Import local file</Text>
       <View style={styles.card}>
         <Text style={styles.rowDesc}>
-          Already have a .gguf file on your device? Import it directly.
+          Already have a .gguf file on your device? Import it directly — any valid
+          GGUF works, including one you built or merged yourself.
+        </Text>
+        <TextInput
+          style={[styles.hfInput, { marginTop: spacing.md }]}
+          value={importChecksum}
+          onChangeText={setImportChecksum}
+          placeholder="Expected SHA-256 (optional)"
+          placeholderTextColor={colors.textPlaceholder}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        <Text style={styles.rowHint}>
+          Given one, the file must match it or nothing is imported. Left empty,
+          Vesta hashes the file at import and remembers it, so a later change is
+          detectable. A `.sha256` next to the file is picked up automatically.
         </Text>
         <TouchableOpacity
           style={[styles.btn, styles.btnOutline, { marginTop: spacing.md, alignSelf: "flex-start" }]}
@@ -215,6 +236,10 @@ function CatalogRow({
         </Text>
       </View>
 
+      {installed && !downloading && (
+        <Text style={styles.rowHint}>{TRUST_LABEL[installed.trust]}</Text>
+      )}
+
       {downloading && prog && (
         <ProgressBar written={prog.bytesWritten} total={prog.bytesTotal} etaSeconds={prog.etaSeconds} />
       )}
@@ -250,18 +275,31 @@ function CatalogRow({
   );
 }
 
+// What each trust level means, in one line, for the model card. Deliberately
+// four distinct statements: "verified" against an upstream digest, "verified"
+// against the user's own digest, and "this is the file you imported" are three
+// different claims, and flattening them would overstate the weakest one.
+const TRUST_LABEL: Record<ModelTrust, string> = {
+  verified_upstream: "✓ Verified against the repository's SHA-256",
+  verified_user_checksum: "✓ Verified against your SHA-256",
+  user_supplied_baseline: "• Imported by you — hashed at import, not verified against a source",
+  unverified: "• No checksum on record",
+};
+
 function InstalledRow({
   model,
   progress,
   onActivate,
   onCancel,
   onRemove,
+  onVerify,
 }: {
   model: InstalledModel;
   progress?: { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string };
   onActivate: (id: string) => void;
   onCancel: (id: string) => void;
   onRemove: (m: InstalledModel) => void;
+  onVerify: (id: string) => void;
 }) {
   const downloading = progress?.status === "downloading";
   return (
@@ -271,6 +309,7 @@ function InstalledRow({
         <Text style={styles.rowMeta}>{formatBytes(model.sizeBytes)}</Text>
       </View>
       {model.hfRepo && <Text style={styles.rowHint}>{model.hfRepo}</Text>}
+      {!downloading && <Text style={styles.rowHint}>{TRUST_LABEL[model.trust]}</Text>}
       {model.state === "error" && <Text style={styles.rowError}>Failed — re-download or delete.</Text>}
 
       {downloading && progress && (
@@ -292,6 +331,11 @@ function InstalledRow({
           <View style={[styles.btn, styles.btnActive]}>
             <Text style={styles.btnActiveText}>● Active</Text>
           </View>
+        )}
+        {!downloading && model.sha256 && (
+          <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={() => onVerify(model.id)} activeOpacity={0.7}>
+            <Text style={styles.btnGhostText}>Verify</Text>
+          </TouchableOpacity>
         )}
         {!downloading && (
           <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={() => onRemove(model)} activeOpacity={0.7}>

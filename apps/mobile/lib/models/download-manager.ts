@@ -15,8 +15,18 @@
 // corrupted resume, or a substituted file can all land at the right length. A
 // .gguf is mmap'ed and executed as model weights, so the finished temp file is
 // digested (natively, streaming) and compared to the expected sha256 BEFORE the
-// rename that promotes it to the usable model path. A mismatch quarantines the
-// file and fails the download; it is never renamed into place.
+// rename that promotes it to the usable model path.
+//
+// When an expected digest exists, verification FAILS CLOSED. All three of these
+// reject the download and quarantine the file:
+//   - the digest does not match,
+//   - hashing threw,
+//   - no native hashing is available on this build.
+// "Upstream published a digest and we could not confirm it" is not a warning;
+// it is indistinguishable, from here, from a substituted file. It is also not
+// the same thing as "no authoritative digest exists" — that case (a repo with
+// no LFS oid) commits and is reported as unverified, because there is nothing
+// to check against.
 
 import * as FileSystem from "expo-file-system/legacy";
 import { computeRate, etaSeconds, hasEnoughSpace } from "./format";
@@ -61,9 +71,10 @@ export interface DownloadParams {
   // size, which must not fail a genuinely complete download.
   verifySize?: boolean;
   // The expected SHA-256 (HuggingFace's LFS oid). When present, the completed
-  // file MUST match it or the download fails. Absent (a non-LFS file, or a repo
-  // listing that failed) means the content cannot be verified — the outcome
-  // reports that rather than implying a passed check.
+  // file MUST match it or the download fails — including when hashing itself is
+  // unavailable or fails. Absent (a non-LFS file, or a repo listing that failed)
+  // means there is nothing authoritative to check against: the file commits and
+  // the outcome says it is unverified.
   expectedSha256?: string | null;
   headers?: Record<string, string>;
   resumeToken?: string | null;
@@ -88,9 +99,11 @@ export interface DownloadOutcome {
   sha256?: string;
   // True when an expected hash was present and the file matched it.
   verified?: boolean;
-  // Set when verification could not run at all (no expected hash / no native
-  // support), so callers can surface "installed but unverified".
-  unverifiedReason?: "no-expected-hash" | "hashing-unavailable";
+  // Set only when there was no authoritative digest to check against, so the
+  // caller can surface "installed, but nothing vouched for these bytes". A
+  // failed or impossible check against an EXISTING digest is never reported
+  // here — it fails the download instead.
+  unverifiedReason?: "no-expected-hash";
   error?: string;
 }
 
@@ -246,13 +259,20 @@ export async function downloadModel(
           ok: false,
           error: `Could not verify the download: ${
             e instanceof Error ? e.message : String(e)
-          }`,
+          }. The file was discarded.`,
         };
       }
       if (actual === null) {
-        // No native hashing on this build — the file is intact as far as we can
-        // tell, but say so instead of claiming it was checked.
-        unverifiedReason = "hashing-unavailable";
+        // HuggingFace told us what these bytes should hash to and we cannot
+        // check. Fail closed: an unverifiable file with a published digest is
+        // not something to load as model weights.
+        await quarantine(tempPath, finalPath);
+        return {
+          ok: false,
+          error:
+            "Could not verify the download: file hashing is unavailable on " +
+            "this build. The file was discarded.",
+        };
       } else if (actual !== expected) {
         // Quarantine, never commit. The resume token is worthless too: resuming
         // would append to already-wrong bytes.

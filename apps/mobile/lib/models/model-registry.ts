@@ -5,7 +5,12 @@
 import * as FileSystem from "expo-file-system/legacy";
 import { v4 as uuid } from "uuid";
 import { getDatabase, getConfig, setConfig } from "../storage/database";
-import type { DownloadStatus, InstalledModel, ModelRole } from "./types";
+import type {
+  DownloadStatus,
+  InstalledModel,
+  ModelRole,
+  ModelTrust,
+} from "./types";
 
 interface ModelRow {
   id: string;
@@ -22,6 +27,7 @@ interface ModelRow {
   state: DownloadStatus;
   resume_token: string | null;
   sha256: string | null;
+  trust: ModelTrust | null;
   is_active: number;
   created_at: number;
 }
@@ -42,6 +48,9 @@ function mapRow(r: ModelRow): InstalledModel {
     state: r.state,
     resumeToken: r.resume_token,
     sha256: r.sha256,
+    // A row written before migration v4 has no trust value; "unverified" is the
+    // honest reading of it, never an optimistic default.
+    trust: r.trust ?? "unverified",
     isActive: r.is_active === 1,
     createdAt: r.created_at,
   };
@@ -50,7 +59,7 @@ function mapRow(r: ModelRow): InstalledModel {
 const SELECT =
   `SELECT id, display_name, hf_repo, hf_file, file_path, quant, size_bytes,
           min_ram_mb, chat_template, context_size, role, state, resume_token,
-          sha256, is_active, created_at FROM models`;
+          sha256, trust, is_active, created_at FROM models`;
 
 export interface NewModel {
   id?: string;
@@ -67,6 +76,7 @@ export interface NewModel {
   state?: DownloadStatus;
   resumeToken?: string | null;
   sha256?: string | null;
+  trust?: ModelTrust;
 }
 
 export async function insertModel(m: NewModel): Promise<InstalledModel> {
@@ -77,8 +87,8 @@ export async function insertModel(m: NewModel): Promise<InstalledModel> {
     `INSERT INTO models
        (id, display_name, hf_repo, hf_file, file_path, quant, size_bytes,
         min_ram_mb, chat_template, context_size, role, state, resume_token,
-        sha256, is_active, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+        sha256, trust, is_active, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
     id,
     m.displayName,
     m.hfRepo ?? null,
@@ -93,6 +103,7 @@ export async function insertModel(m: NewModel): Promise<InstalledModel> {
     m.state ?? "downloading",
     m.resumeToken ?? null,
     m.sha256 ?? null,
+    m.trust ?? "unverified",
     now,
   );
   const row = await d.getFirstAsync<ModelRow>(`${SELECT} WHERE id = ?`, id);
@@ -139,6 +150,12 @@ export async function setResumeToken(
 
 // Called when a download verifies & commits: record final size/hash/path and
 // mark it ready.
+//
+// `trust` is written unconditionally (not COALESCEd): it is a statement about
+// the bytes now on disk, so leaving a previous value in place would let a
+// re-download inherit a claim that no longer applies. `sha256` keeps its
+// COALESCE so a commit that carries no digest doesn't erase the expected one
+// the insert recorded — read it together with `trust`, never alone.
 export async function finalizeModel(
   id: string,
   fields: {
@@ -146,6 +163,7 @@ export async function finalizeModel(
     sizeBytes?: number;
     sha256?: string | null;
     chatTemplate?: string | null;
+    trust?: ModelTrust;
   },
 ): Promise<void> {
   const d = await getDatabase();
@@ -155,12 +173,28 @@ export async function finalizeModel(
            file_path = COALESCE(?, file_path),
            size_bytes = COALESCE(?, size_bytes),
            sha256 = COALESCE(?, sha256),
-           chat_template = COALESCE(?, chat_template)
+           chat_template = COALESCE(?, chat_template),
+           trust = ?
      WHERE id = ?`,
     fields.filePath ?? null,
     fields.sizeBytes ?? null,
     fields.sha256 ?? null,
     fields.chatTemplate ?? null,
+    fields.trust ?? "unverified",
+    id,
+  );
+}
+
+// Records the outcome of an on-demand integrity re-check (Models → Verify).
+export async function setModelIntegrity(
+  id: string,
+  fields: { sha256: string; trust: ModelTrust },
+): Promise<void> {
+  const d = await getDatabase();
+  await d.runAsync(
+    "UPDATE models SET sha256 = ?, trust = ? WHERE id = ?",
+    fields.sha256,
+    fields.trust,
     id,
   );
 }
@@ -201,6 +235,8 @@ export async function ensureLegacyMigration(): Promise<void> {
     contextSize: 4096,
     role: "primary",
     state: "ready",
+    // Adopted from a legacy config key: nothing ever hashed it.
+    trust: "unverified",
   });
   await setActiveModel(model.id);
 }

@@ -25,6 +25,30 @@ export interface CatalogModel {
   licenseUrl?: string;
 }
 
+// How much is actually known about the bytes on disk. Three different things
+// get called "verified" in a model manager, and conflating them is how an
+// unchecked file ends up looking trustworthy:
+//
+//   verified_upstream       the file hashes to the digest its source repo
+//                           published (HuggingFace's LFS oid). Provenance and
+//                           integrity.
+//   verified_user_checksum  the file hashes to a digest the USER supplied at
+//                           import. Integrity, with provenance vouched for by
+//                           the user.
+//   user_supplied_baseline  a local file the user explicitly chose, with no
+//                           external digest to check. We hash it at import and
+//                           keep that as a baseline, so a later unexpected
+//                           change is detectable. Integrity FROM import
+//                           onwards; it proves nothing about where it came
+//                           from.
+//   unverified              no digest at all — hashing was unavailable when it
+//                           was imported, or the row predates this field.
+export type ModelTrust =
+  | "verified_upstream"
+  | "verified_user_checksum"
+  | "user_supplied_baseline"
+  | "unverified";
+
 export type DownloadStatus =
   | "idle"
   | "checking"
@@ -52,7 +76,10 @@ export interface InstalledModel {
   role: ModelRole;
   state: DownloadStatus;
   resumeToken: string | null;
+  // The digest RECORDED for this file. While a download runs it is the expected
+  // one; afterwards it is whatever `trust` says it is. Null when unknown.
   sha256: string | null;
+  trust: ModelTrust;
   isActive: boolean;
   createdAt: number;
 }

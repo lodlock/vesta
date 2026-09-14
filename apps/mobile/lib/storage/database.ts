@@ -126,6 +126,26 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    // What the `sha256` column actually MEANS for a given row. The column alone
+    // is ambiguous: it holds the expected digest while a download runs and the
+    // confirmed one afterwards, and a locally imported file has neither until
+    // we compute one. `trust` says which:
+    //   verified_upstream      matched the digest the source repo published
+    //   verified_user_checksum matched a digest the user supplied at import
+    //   user_supplied_baseline no external digest existed; this is the hash of
+    //                          the file AS IMPORTED, so a later change is
+    //                          detectable. Says nothing about provenance.
+    //   unverified             no digest at all (hashing unavailable at import,
+    //                          or a row predating this column)
+    // Existing rows backfill to 'unverified' on purpose: their sha256, where
+    // present, was an EXPECTED value that nothing ever checked.
+    version: 4,
+    sql: `
+      ALTER TABLE models ADD COLUMN trust TEXT;
+      UPDATE models SET trust = 'unverified' WHERE trust IS NULL;
+    `,
+  },
 ];
 
 // Exported for testing. Applies every migration whose version exceeds the DB's

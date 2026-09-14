@@ -240,7 +240,10 @@ describe("downloadModel — SHA-256 integrity verification", () => {
     expect(outcome).toMatchObject({ ok: true, verified: true });
   });
 
-  it("fails the download when hashing throws", async () => {
+  // Fail-closed: when upstream published a digest, "could not check it" is
+  // treated exactly like "it did not match". The two are indistinguishable from
+  // here, and one of them is a substituted model file.
+  it("rejects (does not commit) when hashing throws and a digest was published", async () => {
     setupFS(1_000_000);
     mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
     mockSha.mockRejectedValue(new Error("No such file"));
@@ -249,20 +252,44 @@ describe("downloadModel — SHA-256 integrity verification", () => {
 
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toMatch(/could not verify/i);
+    expect(outcome.error).toMatch(/discarded/i);
     expect(mockFS.moveAsync).not.toHaveBeenCalledWith({ from: TEMP, to: FINAL });
+    expect(mockFS.moveAsync).toHaveBeenCalledWith({
+      from: TEMP,
+      to: quarantinePathFor(FINAL),
+    });
   });
 
-  it("commits but reports hashing-unavailable when the native hasher is absent", async () => {
+  it("rejects (does not commit) when hashing is unavailable and a digest was published", async () => {
     setupFS(1_000_000);
     mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
-    mockSha.mockResolvedValue(null); // no native module (iOS / Expo Go)
+    mockSha.mockResolvedValue(null); // no native hashing on this build
 
     const outcome = await downloadModel(params({ expectedSha256: GOOD_SHA }));
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toMatch(/hashing is unavailable/i);
+    expect(outcome.verified).toBeUndefined();
+    expect(mockFS.moveAsync).not.toHaveBeenCalledWith({ from: TEMP, to: FINAL });
+    expect(mockFS.moveAsync).toHaveBeenCalledWith({
+      from: TEMP,
+      to: quarantinePathFor(FINAL),
+    });
+  });
+
+  // ...but a missing digest is a different fact, and does NOT fail the download:
+  // there is nothing authoritative to check against.
+  it("still commits when hashing is unavailable AND no digest was published", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    mockSha.mockResolvedValue(null);
+
+    const outcome = await downloadModel(params({ expectedSha256: null }));
 
     expect(outcome).toMatchObject({
       ok: true,
       verified: false,
-      unverifiedReason: "hashing-unavailable",
+      unverifiedReason: "no-expected-hash",
     });
     expect(mockFS.moveAsync).toHaveBeenCalledWith({ from: TEMP, to: FINAL });
   });

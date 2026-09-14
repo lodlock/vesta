@@ -4,7 +4,12 @@
 
 import { create } from "zustand";
 import * as FileSystem from "expo-file-system/legacy";
-import type { CatalogModel, DownloadProgress, InstalledModel } from "../models/types";
+import type {
+  CatalogModel,
+  DownloadProgress,
+  InstalledModel,
+  ModelTrust,
+} from "../models/types";
 import {
   listInstalled,
   getModelById,
@@ -13,6 +18,7 @@ import {
   setModelState,
   setResumeToken,
   finalizeModel,
+  setModelIntegrity,
   setActiveModel,
   removeModel,
 } from "../models/model-registry";
@@ -24,6 +30,9 @@ import {
   modelPathFor,
 } from "../models/download-manager";
 import { listGgufFiles, resolveUrl, type HfFile } from "../models/hf-client";
+import { checkGgufFile } from "../models/gguf-header";
+import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
+import { sha256File, normalizeSha256 } from "../native/file-hash";
 import { getDeviceCaps, type DeviceCaps } from "../models/device-caps";
 import { loadModel, unloadModel, validateGguf, getModelInfo } from "../llm/llm-engine";
 import { warmSessionCache } from "../orchestrator/session-warmer";
@@ -73,7 +82,12 @@ interface ModelState {
     file: HfFile,
     displayName: string,
   ) => Promise<void>;
-  importLocalModel: (uri: string, name: string) => Promise<void>;
+  importLocalModel: (
+    uri: string,
+    name: string,
+    expectedSha256?: string | null,
+  ) => Promise<void>;
+  verifyIntegrity: (id: string) => Promise<void>;
   activate: (id: string) => Promise<void>;
   reloadActive: () => Promise<void>;
   remove: (id: string) => Promise<void>;
@@ -153,7 +167,24 @@ export const useModelStore = create<ModelState>((set, get) => ({
     });
   },
 
-  importLocalModel: async (uri: string, name: string) => {
+  // Import an arbitrary local .gguf — one the user downloaded elsewhere, merged
+  // themselves, or quantized by hand. No HuggingFace repo, no catalog entry and
+  // no filename convention is required; the file comes in through the system
+  // file picker (SAF) exactly as before.
+  //
+  // Checksum policy, in order:
+  //   1. a digest the user supplied (pasted, or an adjacent `.sha256`) → the
+  //      file MUST match it. Mismatch, or hashing that fails, rejects the
+  //      import — same fail-closed rule as a HuggingFace download.
+  //   2. no digest → the import proceeds, because explicitly picking a file IS
+  //      the trust decision. We hash it anyway and keep that as a baseline, so
+  //      an unexpected change to the file later is detectable. That is
+  //      integrity from import onwards; it says nothing about provenance.
+  importLocalModel: async (
+    uri: string,
+    name: string,
+    expectedSha256?: string | null,
+  ) => {
     set({ busy: true, error: null });
     try {
       await ensureModelsDir();
@@ -164,6 +195,65 @@ export const useModelStore = create<ModelState>((set, get) => ({
       if (!existing.exists) {
         await FileSystem.copyAsync({ from: uri, to: finalPath });
       }
+
+      // Cheap structural check before the native parser sees the path: catches a
+      // truncated copy or a mis-picked file with a clear message. Not a safety
+      // boundary — see gguf-header.ts.
+      const header = await checkGgufFile(finalPath);
+      if (!header.ok) {
+        await deleteModelFile(finalPath);
+        set({ error: header.error ?? "Not a valid GGUF file." });
+        return;
+      }
+
+      // A digest the user gave us wins; otherwise look for one next to the file.
+      const expected =
+        normalizeSha256(expectedSha256) ??
+        parseSha256File(expectedSha256) ??
+        (await readAdjacentChecksum(uri));
+
+      let digest: string | null = null;
+      try {
+        digest = await sha256File(finalPath);
+      } catch (err) {
+        if (expected) {
+          await deleteModelFile(finalPath);
+          set({
+            error: `Could not verify the file: ${
+              err instanceof Error ? err.message : String(err)
+            }. Nothing was imported.`,
+          });
+          return;
+        }
+        digest = null; // no digest to check against — carry on without one
+      }
+
+      if (expected) {
+        if (digest === null) {
+          await deleteModelFile(finalPath);
+          set({
+            error:
+              "Could not verify the file: hashing is unavailable on this build. " +
+              "Nothing was imported.",
+          });
+          return;
+        }
+        if (digest !== expected) {
+          await deleteModelFile(finalPath);
+          set({
+            error:
+              "That file does not match the SHA-256 you provided. Nothing was " +
+              "imported.",
+          });
+          return;
+        }
+      }
+
+      const trust: ModelTrust = expected
+        ? "verified_user_checksum"
+        : digest
+          ? "user_supplied_baseline"
+          : "unverified";
 
       const valid = await validateGguf(finalPath);
       if (!valid.ok) {
@@ -181,11 +271,59 @@ export const useModelStore = create<ModelState>((set, get) => ({
         contextSize: 4096,
         role: "primary",
         state: "ready",
+        sha256: digest,
+        trust,
       });
 
       await get().refresh();
       const active = await getActiveModel();
       if (!active) await get().activate(model.id);
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  // On-demand full re-check: re-hash the file and compare it to the digest on
+  // record. This is what turns the import baseline into something useful — it
+  // answers "is this still the file I imported?". Deliberately manual: hashing
+  // a multi-GB model takes seconds, so it does not belong on every app start
+  // (activate() does the cheap size check instead).
+  verifyIntegrity: async (id: string) => {
+    set({ busy: true, error: null });
+    try {
+      const model = await getModelById(id);
+      if (!model) return;
+      const info = await FileSystem.getInfoAsync(model.filePath);
+      if (!info.exists) {
+        await setModelState(id, "error");
+        set({ error: "Model file is missing — re-download or re-import it." });
+        return;
+      }
+      const digest = await sha256File(model.filePath);
+      if (digest === null) {
+        set({ error: "File hashing is unavailable on this build." });
+        return;
+      }
+      if (!model.sha256) {
+        // Nothing on record to compare against (an older row): adopt this as the
+        // baseline rather than claiming anything about where the file came from.
+        await setModelIntegrity(id, { sha256: digest, trust: "user_supplied_baseline" });
+        await get().refresh();
+        set({ error: `Recorded a new integrity baseline for ${model.displayName}.` });
+        return;
+      }
+      if (digest !== model.sha256) {
+        await setModelState(id, "error");
+        await get().refresh();
+        set({
+          error: `${model.displayName} has CHANGED since it was recorded — the file no longer matches its SHA-256. It has been marked unusable.`,
+        });
+        return;
+      }
+      await get().refresh();
+      set({ error: `${model.displayName} still matches its recorded SHA-256.` });
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -205,6 +343,18 @@ export const useModelStore = create<ModelState>((set, get) => ({
       await setModelState(id, "error");
       await get().refresh();
       set({ error: "Model file is missing — re-download it." });
+      return;
+    }
+    // Cheap integrity gate on every load: the size must still be the size we
+    // recorded. Re-hashing a multi-GB file here would add seconds to every cold
+    // start, so the full check lives in verifyIntegrity(); this catches the
+    // common case (a file replaced or truncated under us) for free.
+    if (model.sizeBytes > 0 && (info.size ?? 0) !== model.sizeBytes) {
+      await setModelState(id, "error");
+      await get().refresh();
+      set({
+        error: `${model.displayName} changed on disk (${info.size ?? 0} bytes, expected ${model.sizeBytes}). It was not loaded — verify or re-import it.`,
+      });
       return;
     }
     try {
@@ -418,19 +568,18 @@ async function runDownload(
   await finalizeModel(id, {
     filePath: outcome.filePath,
     sizeBytes: outcome.sizeBytes,
-    // Only a digest we computed AND matched is recorded; an unverified install
-    // keeps the expected hash from the insert rather than claiming a check.
+    // Only a digest we computed AND matched is recorded as such.
     sha256: outcome.sha256 ?? null,
+    trust: outcome.verified ? "verified_upstream" : "unverified",
   });
 
-  // Installed, but nothing proved the bytes are the ones HuggingFace published.
-  // Surface it instead of letting "ready" imply a passed integrity check.
+  // Reaching here unverified means one thing only: the repo published no
+  // SHA-256, so there was nothing authoritative to check (a failed or
+  // impossible check against an existing digest never commits). Say so rather
+  // than letting "ready" imply the bytes were vouched for.
   if (!outcome.verified) {
     set({
-      error:
-        outcome.unverifiedReason === "hashing-unavailable"
-          ? `${args.displayName} was installed but could not be verified on this build (no native hashing).`
-          : `${args.displayName} was installed without an integrity check — HuggingFace published no SHA-256 for this file.`,
+      error: `${args.displayName} was installed without an integrity check — its repository publishes no SHA-256 for this file.`,
     });
   }
   set((s) => {
