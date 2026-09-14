@@ -338,6 +338,11 @@ async function runDownload(
     fileName,
     expectedBytes: args.file.sizeBytes,
     verifySize: args.exactSize,
+    // HuggingFace's LFS oid for this file. When present the downloader refuses
+    // to promote a file that doesn't hash to it; when absent (non-LFS file, or
+    // the repo listing failed and we fell back to the catalog) the download is
+    // committed unverified and the user is told so below.
+    expectedSha256: args.file.sha256,
     onProgress: (p) =>
       set((s) => ({
         progress: {
@@ -413,7 +418,21 @@ async function runDownload(
   await finalizeModel(id, {
     filePath: outcome.filePath,
     sizeBytes: outcome.sizeBytes,
+    // Only a digest we computed AND matched is recorded; an unverified install
+    // keeps the expected hash from the insert rather than claiming a check.
+    sha256: outcome.sha256 ?? null,
   });
+
+  // Installed, but nothing proved the bytes are the ones HuggingFace published.
+  // Surface it instead of letting "ready" imply a passed integrity check.
+  if (!outcome.verified) {
+    set({
+      error:
+        outcome.unverifiedReason === "hashing-unavailable"
+          ? `${args.displayName} was installed but could not be verified on this build (no native hashing).`
+          : `${args.displayName} was installed without an integrity check — HuggingFace published no SHA-256 for this file.`,
+    });
+  }
   set((s) => {
     const progress = { ...s.progress };
     delete progress[id];

@@ -9,6 +9,9 @@ import android.os.Build
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import com.facebook.react.bridge.*
+import java.io.File
+import java.net.URLDecoder
+import java.security.MessageDigest
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -93,6 +96,44 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             promise.reject("DEVICE_INFO_ERROR", e.message, e)
         }
+    }
+
+    // ── File integrity ───────────────────────────────────────────────────
+    // Streaming SHA-256 of a local file. Used by the model downloader to verify
+    // a finished .gguf against HuggingFace's LFS oid BEFORE it is promoted to
+    // the usable model path. A model file is multi-GB, so this must never
+    // materialize the bytes in JS: we digest in 1 MB chunks on a worker thread
+    // (the native-modules thread must stay free — a 4 GB file takes seconds).
+    @ReactMethod
+    fun sha256File(path: String, promise: Promise) {
+        Thread {
+            try {
+                val file = File(toFilePath(path))
+                if (!file.isFile) {
+                    promise.reject("SHA256_ERROR", "No such file: $path")
+                    return@Thread
+                }
+                val digest = MessageDigest.getInstance("SHA-256")
+                file.inputStream().use { input ->
+                    val buffer = ByteArray(1 shl 20)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                promise.resolve(digest.digest().joinToString("") { "%02x".format(it) })
+            } catch (e: Exception) {
+                promise.reject("SHA256_ERROR", e.message, e)
+            }
+        }.start()
+    }
+
+    // expo-file-system hands JS `file:///...` URIs with percent-encoded
+    // segments; java.io.File wants a decoded filesystem path.
+    private fun toFilePath(path: String): String {
+        val raw = if (path.startsWith("file://")) path.removePrefix("file://") else path
+        return URLDecoder.decode(raw, "UTF-8")
     }
 
     private fun parseToMillis(dateStr: String): Long {

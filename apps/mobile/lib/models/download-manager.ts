@@ -8,10 +8,19 @@
 //  - free-space preflight before starting,
 //  - progress throttled to ~1/sec with a sliding bytes/sec + ETA,
 //  - pause/resume across app restarts via the saved resume token,
-//  - size verification against the authoritative HF byte size before commit.
+//  - size verification against the authoritative HF byte size before commit,
+//  - SHA-256 verification against HuggingFace's LFS oid before commit.
+//
+// INTEGRITY: size alone proves nothing about content — a truncating proxy, a
+// corrupted resume, or a substituted file can all land at the right length. A
+// .gguf is mmap'ed and executed as model weights, so the finished temp file is
+// digested (natively, streaming) and compared to the expected sha256 BEFORE the
+// rename that promotes it to the usable model path. A mismatch quarantines the
+// file and fails the download; it is never renamed into place.
 
 import * as FileSystem from "expo-file-system/legacy";
 import { computeRate, etaSeconds, hasEnoughSpace } from "./format";
+import { sha256File, normalizeSha256 } from "../native/file-hash";
 
 export const MODELS_DIR = FileSystem.documentDirectory + "models/";
 
@@ -21,6 +30,13 @@ export function modelPathFor(fileName: string): string {
 
 export function tempPathFor(finalPath: string): string {
   return finalPath + ".download";
+}
+
+// A file that failed verification is moved aside rather than silently dropped:
+// the bytes are evidence (truncated? substituted? corrupted resume?) and a
+// fixed name means a retry can't accumulate junk. Removed on the next attempt.
+export function quarantinePathFor(finalPath: string): string {
+  return finalPath + ".corrupt";
 }
 
 const PROGRESS_INTERVAL_MS = 800;
@@ -44,6 +60,11 @@ export interface DownloadParams {
   // used to reject a truncated download. False for the catalog's approximate
   // size, which must not fail a genuinely complete download.
   verifySize?: boolean;
+  // The expected SHA-256 (HuggingFace's LFS oid). When present, the completed
+  // file MUST match it or the download fails. Absent (a non-LFS file, or a repo
+  // listing that failed) means the content cannot be verified — the outcome
+  // reports that rather than implying a passed check.
+  expectedSha256?: string | null;
   headers?: Record<string, string>;
   resumeToken?: string | null;
   onProgress?: (p: {
@@ -62,6 +83,14 @@ export interface DownloadOutcome {
   resumeToken?: string;
   filePath?: string;
   sizeBytes?: number;
+  // The verified digest, set only when it was computed AND matched. Undefined
+  // means unverified (no expected hash, or no native hashing available).
+  sha256?: string;
+  // True when an expected hash was present and the file matched it.
+  verified?: boolean;
+  // Set when verification could not run at all (no expected hash / no native
+  // support), so callers can surface "installed but unverified".
+  unverifiedReason?: "no-expected-hash" | "hashing-unavailable";
   error?: string;
 }
 
@@ -93,6 +122,7 @@ export async function downloadModel(
     fileName,
     expectedBytes,
     verifySize = true,
+    expectedSha256,
     headers,
     resumeToken,
     onProgress,
@@ -115,6 +145,10 @@ export async function downloadModel(
 
   const finalPath = modelPathFor(fileName);
   const tempPath = tempPathFor(finalPath);
+
+  // Drop any quarantined file from a previous failed attempt (a resume keeps
+  // its own temp file; the quarantine is never resumed from).
+  await safeDelete(quarantinePathFor(finalPath));
 
   // Throttled progress + sliding-window rate/ETA.
   let lastEmit = 0;
@@ -196,9 +230,51 @@ export async function downloadModel(
       };
     }
 
+    // Content verification, before anything is promoted. Runs on the temp path
+    // so a mismatch can never reach the model directory.
+    const expected = normalizeSha256(expectedSha256);
+    let verified = false;
+    let sha: string | undefined;
+    let unverifiedReason: DownloadOutcome["unverifiedReason"];
+    if (expected) {
+      let actual: string | null;
+      try {
+        actual = await sha256File(tempPath);
+      } catch (e) {
+        await quarantine(tempPath, finalPath);
+        return {
+          ok: false,
+          error: `Could not verify the download: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        };
+      }
+      if (actual === null) {
+        // No native hashing on this build — the file is intact as far as we can
+        // tell, but say so instead of claiming it was checked.
+        unverifiedReason = "hashing-unavailable";
+      } else if (actual !== expected) {
+        // Quarantine, never commit. The resume token is worthless too: resuming
+        // would append to already-wrong bytes.
+        await quarantine(tempPath, finalPath);
+        return {
+          ok: false,
+          error:
+            "Downloaded file failed its integrity check (SHA-256 mismatch). " +
+            "The file was discarded — check your network and try again.",
+        };
+      } else {
+        verified = true;
+        sha = actual;
+      }
+    } else {
+      unverifiedReason = "no-expected-hash";
+    }
+
     // A cancel may have landed while the download was finishing (the awaits
-    // above are yield points). Do NOT commit, or we'd recreate a multi-GB file
-    // with no DB row pointing at it (orphan). Drop the partial and bail.
+    // above are yield points, and hashing a multi-GB file is a long one). Do
+    // NOT commit, or we'd recreate a multi-GB file with no DB row pointing at
+    // it (orphan). Drop the partial and bail.
     if (entry.canceled) {
       await safeDelete(tempPath);
       return { ok: false, canceled: true };
@@ -216,7 +292,14 @@ export async function downloadModel(
       etaSeconds: 0,
     });
 
-    return { ok: true, filePath: finalPath, sizeBytes: actualSize };
+    return {
+      ok: true,
+      filePath: finalPath,
+      sizeBytes: actualSize,
+      sha256: sha,
+      verified,
+      unverifiedReason,
+    };
   } catch (err) {
     if (entry.canceled) {
       await safeDelete(tempPath);
@@ -256,6 +339,20 @@ export async function pauseDownload(modelId: string): Promise<string | null> {
 export async function deleteModelFile(filePath: string): Promise<void> {
   await safeDelete(filePath);
   await safeDelete(tempPathFor(filePath));
+  await safeDelete(quarantinePathFor(filePath));
+}
+
+// Move a failed download aside. Best-effort: if the move fails the file is
+// deleted instead — a file that failed verification must not survive at the
+// temp path, where a later resume could append to it.
+async function quarantine(tempPath: string, finalPath: string): Promise<void> {
+  const target = quarantinePathFor(finalPath);
+  try {
+    await safeDelete(target);
+    await FileSystem.moveAsync({ from: tempPath, to: target });
+  } catch {
+    await safeDelete(tempPath);
+  }
 }
 
 async function safeDelete(path: string): Promise<void> {

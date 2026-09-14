@@ -1,7 +1,8 @@
 // Regression tests for the resumable downloader (Fase 5 bug class E:
 // resume/corruption). The commit path guards against truncated files, honors
-// pause/resume tokens, and must never commit a partial that a cancel raced —
-// none of which was covered. expo-file-system is mocked; ./format runs for real
+// pause/resume tokens, must never commit a partial that a cancel raced, and
+// must never promote a file whose SHA-256 doesn't match HuggingFace's LFS oid.
+// expo-file-system and the native hasher are mocked; ./format runs for real
 // (pure, already tested).
 
 import * as FileSystem from "expo-file-system/legacy";
@@ -10,7 +11,9 @@ import {
   cancelDownload,
   modelPathFor,
   tempPathFor,
+  quarantinePathFor,
 } from "../download-manager";
+import { sha256File } from "../../native/file-hash";
 
 jest.mock("expo-file-system/legacy", () => ({
   documentDirectory: "file:///docs/",
@@ -22,7 +25,19 @@ jest.mock("expo-file-system/legacy", () => ({
   deleteAsync: jest.fn(async () => {}),
 }));
 
+// normalizeSha256 is pure — let it run for real so the tests exercise the same
+// normalization the production path uses.
+jest.mock("../../native/file-hash", () => ({
+  ...jest.requireActual("../../native/file-hash"),
+  sha256File: jest.fn(async () => null),
+}));
+
 const mockFS = FileSystem as jest.Mocked<typeof FileSystem>;
+const mockSha = sha256File as jest.MockedFunction<typeof sha256File>;
+
+// A valid-shaped sha256 and a different one to fail against.
+const GOOD_SHA = "a".repeat(64);
+const BAD_SHA = "b".repeat(64);
 
 const FILE = "model.gguf";
 const FINAL = modelPathFor(FILE);
@@ -66,6 +81,7 @@ function params(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   jest.clearAllMocks();
   mockFS.getFreeDiskStorageAsync.mockResolvedValue(500 * 1e9);
+  mockSha.mockResolvedValue(null);
 });
 
 describe("downloadModel — corruption / size verification", () => {
@@ -166,5 +182,128 @@ describe("downloadModel — free-space preflight", () => {
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toMatch(/free space/i);
     expect(mockFS.createDownloadResumable).not.toHaveBeenCalled();
+  });
+});
+
+describe("downloadModel — SHA-256 integrity verification", () => {
+  it("commits and reports verified when the digest matches the expected oid", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    mockSha.mockResolvedValue(GOOD_SHA);
+
+    const outcome = await downloadModel(params({ expectedSha256: GOOD_SHA }));
+
+    expect(mockSha).toHaveBeenCalledWith(TEMP); // hashed BEFORE the rename
+    expect(outcome).toMatchObject({ ok: true, verified: true, sha256: GOOD_SHA });
+    expect(mockFS.moveAsync).toHaveBeenCalledWith({ from: TEMP, to: FINAL });
+  });
+
+  it("refuses to promote a file whose digest does not match, and quarantines it", async () => {
+    setupFS(1_000_000); // correct SIZE — only the content is wrong
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    mockSha.mockResolvedValue(BAD_SHA);
+
+    const outcome = await downloadModel(params({ expectedSha256: GOOD_SHA }));
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toMatch(/integrity check/i);
+    // Never renamed to the usable model path...
+    expect(mockFS.moveAsync).not.toHaveBeenCalledWith({ from: TEMP, to: FINAL });
+    // ...and moved off the temp path so a later resume can't append to it.
+    expect(mockFS.moveAsync).toHaveBeenCalledWith({
+      from: TEMP,
+      to: quarantinePathFor(FINAL),
+    });
+  });
+
+  it("deletes the partial when quarantining itself fails", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    mockSha.mockResolvedValue(BAD_SHA);
+    mockFS.moveAsync.mockRejectedValueOnce(new Error("read-only fs"));
+
+    const outcome = await downloadModel(params({ expectedSha256: GOOD_SHA }));
+
+    expect(outcome.ok).toBe(false);
+    expect(mockFS.deleteAsync).toHaveBeenCalledWith(TEMP, { idempotent: true });
+  });
+
+  it("accepts an oid in sha256:HEX form and mixed case", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    mockSha.mockResolvedValue(GOOD_SHA);
+
+    const outcome = await downloadModel(
+      params({ expectedSha256: `SHA256:${GOOD_SHA.toUpperCase()}` }),
+    );
+
+    expect(outcome).toMatchObject({ ok: true, verified: true });
+  });
+
+  it("fails the download when hashing throws", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    mockSha.mockRejectedValue(new Error("No such file"));
+
+    const outcome = await downloadModel(params({ expectedSha256: GOOD_SHA }));
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toMatch(/could not verify/i);
+    expect(mockFS.moveAsync).not.toHaveBeenCalledWith({ from: TEMP, to: FINAL });
+  });
+
+  it("commits but reports hashing-unavailable when the native hasher is absent", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    mockSha.mockResolvedValue(null); // no native module (iOS / Expo Go)
+
+    const outcome = await downloadModel(params({ expectedSha256: GOOD_SHA }));
+
+    expect(outcome).toMatchObject({
+      ok: true,
+      verified: false,
+      unverifiedReason: "hashing-unavailable",
+    });
+    expect(mockFS.moveAsync).toHaveBeenCalledWith({ from: TEMP, to: FINAL });
+  });
+
+  it("reports no-expected-hash (and does not hash) when the repo published no oid", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+
+    const outcome = await downloadModel(params({ expectedSha256: null }));
+
+    expect(mockSha).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({
+      ok: true,
+      verified: false,
+      unverifiedReason: "no-expected-hash",
+    });
+  });
+
+  it("ignores a malformed oid rather than comparing garbage", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+
+    const outcome = await downloadModel(params({ expectedSha256: "not-a-hash" }));
+
+    expect(mockSha).not.toHaveBeenCalled();
+    expect(outcome).toMatchObject({ ok: true, unverifiedReason: "no-expected-hash" });
+  });
+
+  it("a cancel landing during hashing still wins over the commit", async () => {
+    setupFS(1_000_000);
+    mockFS.createDownloadResumable.mockReturnValue(makeTask() as never);
+    // Hashing is the long await; cancel arrives while it runs.
+    mockSha.mockImplementation(async () => {
+      await cancelDownload("m1");
+      return GOOD_SHA;
+    });
+
+    const outcome = await downloadModel(params({ expectedSha256: GOOD_SHA }));
+
+    expect(outcome).toMatchObject({ ok: false, canceled: true });
+    expect(mockFS.moveAsync).not.toHaveBeenCalledWith({ from: TEMP, to: FINAL });
+    expect(mockFS.deleteAsync).toHaveBeenCalledWith(TEMP, { idempotent: true });
   });
 });
