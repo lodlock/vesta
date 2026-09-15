@@ -71,6 +71,61 @@ const GENIEX_VERSION = "0.4.0";
 const GENIEX_MIN_SDK = 27;
 const MIN_SDK_PROPERTY = "android.minSdkVersion";
 
+// The GenieX AAR ships arm64-v8a and nothing else -- 206 MB of it, with
+// libQnnHtpPrepare.so alone at 84 MB. An NPU build therefore targets arm64
+// only.
+//
+// `reactNativeArchitectures` is the lever the React Native template already
+// uses, so setting it moves the whole build (app and libraries) instead of a
+// per-module abiFilters block the rest of the build would ignore. Without it an
+// NPU build still produces armeabi-v7a and x86_64 outputs carrying every
+// library except the Qualcomm one -- installable APKs on which the backend can
+// only ever decline.
+//
+// The property is EDITED IN PLACE and restored, rather than added and deleted:
+// it is part of the template, and a default build that found it missing would
+// fall back to whatever react.gradle defaults to rather than to what the
+// template actually says. TEMPLATE_ABIS is that template value, verified
+// against the generated android/gradle.properties.
+const ABI_PROPERTY = "reactNativeArchitectures";
+const NPU_ABIS = "arm64-v8a";
+const TEMPLATE_ABIS = "armeabi-v7a,arm64-v8a,x86,x86_64";
+
+// Legacy packaging: REQUIRED, and this is not an inference.
+//
+// GenieXSdk.init locates its plugins as real files on disk. Decompiled, it does
+// exactly this for each of llama_cpp and qairt:
+//
+//   File(context.applicationInfo.nativeLibraryDir, "libgeniex_plugin_$id.so")
+//     .takeIf { it.exists() }
+//     ?.let { registerPlugin(it.absolutePath) }
+//
+// With AGP's modern default (useLegacyPackaging=false, extractNativeLibs=false)
+// the .so files stay inside the APK, uncompressed and page-aligned, and are
+// never unpacked into nativeLibraryDir. `exists()` is then false, registration
+// is skipped, and init reports "Cannot find libgeniex_plugin_qairt.so in
+// <dir>" -- a build that packages the entire Qualcomm runtime and cannot use a
+// byte of it. Qualcomm's own Android sample sets the flag for the same reason.
+//
+// Separately, the Hexagon skel libraries (libQnnHtpV81Skel.so and friends) are
+// loaded by fastRPC on the DSP side from a filesystem path the QAIRT plugin
+// puts in ADSP_LIBRARY_PATH -- its own log line is "Setting ADSP_LIBRARY_PATH
+// to {}". A path inside an APK is not something the DSP loader can open. That
+// is a second, independent reason to extract; unlike the first it is inferred
+// from how fastRPC works rather than read out of GenieX's code, so it is
+// recorded here as the weaker of the two claims. The first alone settles it.
+//
+// Expo's template already owns this switch: `expo.useLegacyPackaging` in
+// gradle.properties feeds `packagingOptions { jniLibs { useLegacyPackaging } }`
+// in app/build.gradle. So this flips a value the template put there rather than
+// injecting a second packagingOptions block -- nothing to parse back out, and
+// no chance of two blocks disagreeing.
+//
+// The cost is real and worth naming: extraction roughly doubles the installed
+// footprint of the native libraries (~206 MB extracted, on top of the APK) and
+// lengthens install. Only the NPU build pays it.
+const LEGACY_PACKAGING_PROPERTY = "expo.useLegacyPackaging";
+
 // Deliberately NOT `tools:overrideLibrary`. That suppresses the merge error
 // without changing what gets installed, so the APK would go on claiming API 24
 // and land on devices the Qualcomm runtime cannot load — trading a build
@@ -80,24 +135,52 @@ const MIN_SDK_PROPERTY = "android.minSdkVersion";
 // regenerated from scratch: a non-NPU prebuild over a tree that once had the
 // flag set has to take the raised floor back out, or a default build would
 // quietly keep it.
-function withNpuMinSdk(config) {
+function withNpuGradleProperties(config) {
   return withGradleProperties(config, (cfg) => {
+    const npu = npuEnabled();
+
+    // minSdk is ADDED for an NPU build and REMOVED otherwise: it is not part of
+    // the template, and its absence is what makes ExpoRootProjectPlugin's own
+    // default of 24 stand.
     cfg.modResults = cfg.modResults.filter(
       (item) => !(item.type === "property" && item.key === MIN_SDK_PROPERTY),
     );
-    if (npuEnabled()) {
+    if (npu) {
       cfg.modResults.push({
         type: "property",
         key: MIN_SDK_PROPERTY,
         value: String(GENIEX_MIN_SDK),
       });
     }
+
+    // These two ARE part of the template, so they are set back to the
+    // template's own value rather than deleted. Running in both directions
+    // matters: android/ is generated but not always regenerated from scratch,
+    // and a default build over a tree that once had VESTA_ENABLE_NPU=1 must not
+    // inherit a single-ABI, library-extracting configuration.
+    setProperty(cfg.modResults, ABI_PROPERTY, npu ? NPU_ABIS : TEMPLATE_ABIS);
+    setProperty(cfg.modResults, LEGACY_PACKAGING_PROPERTY, npu ? "true" : "false");
+
     return cfg;
   });
 }
 
+/**
+ * Sets a gradle property in place, preserving its position in the file.
+ *
+ * In place, not remove-and-append, so the property stays under the comment the
+ * template wrote above it — a `reactNativeArchitectures` that has drifted to the
+ * bottom of the file, away from the paragraph explaining it, is how the next
+ * person ends up with two of them.
+ */
+function setProperty(properties, key, value) {
+  const existing = properties.find((p) => p.type === "property" && p.key === key);
+  if (existing) existing.value = value;
+  else properties.push({ type: "property", key, value });
+}
+
 function withGenieX(config) {
-  config = withNpuMinSdk(config);
+  config = withNpuGradleProperties(config);
 
   // The dependency is symmetrical for the same reason: a stale geniex line left
   // by an earlier NPU prebuild would pull the proprietary AAR into a build that

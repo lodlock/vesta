@@ -61,6 +61,15 @@ dependencies {
 const TEMPLATE_PROPERTIES = (): GradleProperty[] => [
   { type: "property", key: "android.useAndroidX", value: "true" },
   { type: "property", key: "newArchEnabled", value: "true" },
+  // Both of these ARE in the Expo template, with these exact values. That is
+  // why the plugin edits them in place and restores them, rather than adding
+  // and deleting them the way it does with android.minSdkVersion.
+  {
+    type: "property",
+    key: "reactNativeArchitectures",
+    value: "armeabi-v7a,arm64-v8a,x86,x86_64",
+  },
+  { type: "property", key: "expo.useLegacyPackaging", value: "false" },
 ];
 
 interface PrebuildResult {
@@ -215,5 +224,102 @@ describe("the merge error is fixed, not silenced", () => {
     const text = built.buildGradle + JSON.stringify(built.properties);
     expect(text).not.toMatch(/overrideLibrary|disableResourceValidation/);
     expect(text).not.toMatch(/android\.injected\.build\.abi|manifestmerger.*false/i);
+  });
+});
+
+/**
+ * The other two things an NPU build has to change, and a default build must not
+ * inherit: the ABI list and native-library extraction.
+ *
+ * Both are here because each was a silent failure the first time. A build
+ * without the ABI restriction produces armeabi-v7a and x86_64 outputs carrying
+ * every library except the Qualcomm one. A build without legacy packaging
+ * produces an APK that ships all 206 MB of the Qualcomm runtime and then cannot
+ * register a single plugin, because GenieXSdk.init looks its plugins up as
+ * FILES in ApplicationInfo.nativeLibraryDir and unextracted libraries are not
+ * files.
+ */
+function property(result: PrebuildResult, key: string): string | undefined {
+  return result.properties.find((p) => p.type === "property" && p.key === key)?.value;
+}
+
+/** How many times a key appears. Two of anything here is a silent bug. */
+function occurrences(result: PrebuildResult, key: string): number {
+  return result.properties.filter((p) => p.type === "property" && p.key === key).length;
+}
+
+describe("an NPU build is arm64-only", () => {
+  it("restricts the architectures", () => {
+    expect(property(prebuild({ VESTA_ENABLE_NPU: "1" }), "reactNativeArchitectures")).toBe(
+      "arm64-v8a",
+    );
+  });
+
+  it("restores the template's list for a default build", () => {
+    // Restored, not deleted. The property is part of the template, and a build
+    // that found it missing would fall back to react.gradle's own default
+    // rather than to what the template says.
+    expect(
+      property(prebuild({ VESTA_ENABLE_NPU: undefined }), "reactNativeArchitectures"),
+    ).toBe("armeabi-v7a,arm64-v8a,x86,x86_64");
+  });
+
+  it("takes the restriction back out after an NPU prebuild", () => {
+    const stale = prebuild(
+      { VESTA_ENABLE_NPU: undefined },
+      {
+        properties: TEMPLATE_PROPERTIES().map((p) =>
+          p.key === "reactNativeArchitectures" ? { ...p, value: "arm64-v8a" } : p,
+        ),
+      },
+    );
+    expect(property(stale, "reactNativeArchitectures")).toBe(
+      "armeabi-v7a,arm64-v8a,x86,x86_64",
+    );
+  });
+
+  it("edits the property in place rather than appending a second one", () => {
+    // Two assignments of the same key is the failure mode the minSdk fix
+    // already ran into once, in a different file.
+    expect(occurrences(prebuild({ VESTA_ENABLE_NPU: "1" }), "reactNativeArchitectures")).toBe(1);
+    expect(
+      occurrences(prebuild({ VESTA_ENABLE_NPU: undefined }), "reactNativeArchitectures"),
+    ).toBe(1);
+  });
+});
+
+describe("an NPU build extracts its native libraries", () => {
+  it("turns legacy packaging on", () => {
+    expect(
+      property(prebuild({ VESTA_ENABLE_NPU: "1" }), "expo.useLegacyPackaging"),
+    ).toBe("true");
+  });
+
+  it("uses the template's own switch rather than a second packaging block", () => {
+    // app/build.gradle already contains
+    //   packagingOptions { jniLibs { useLegacyPackaging <this property> } }
+    // Injecting another one would leave two blocks that can disagree, and a
+    // nested block is not something a regex can reliably take back out.
+    const gradle = prebuild({ VESTA_ENABLE_NPU: "1" }).buildGradle;
+    expect(gradle).not.toContain("packagingOptions");
+    expect(gradle).not.toContain("useLegacyPackaging");
+  });
+
+  it("turns it back off for a default build", () => {
+    expect(
+      property(prebuild({ VESTA_ENABLE_NPU: undefined }), "expo.useLegacyPackaging"),
+    ).toBe("false");
+  });
+
+  it("turns it back off over a tree that had it on", () => {
+    const stale = prebuild(
+      { VESTA_ENABLE_NPU: undefined },
+      {
+        properties: TEMPLATE_PROPERTIES().map((p) =>
+          p.key === "expo.useLegacyPackaging" ? { ...p, value: "true" } : p,
+        ),
+      },
+    );
+    expect(property(stale, "expo.useLegacyPackaging")).toBe("false");
   });
 });
