@@ -18,6 +18,7 @@ import {
   getModelInfo,
   getLastCompletion,
 } from "../llm-engine";
+import { recordRun } from "../run-record";
 import type {
   BackendDiagnostics,
   BackendGenerateOptions,
@@ -35,22 +36,49 @@ export class LlamaCppBackend implements ModelBackend {
     return model.artifact === "gguf";
   }
 
+  private lastLoadMs: number | null = null;
+  private lastModelName = "";
+  private lastQuant = "";
+
   async load(model: BackendModelRef): Promise<void> {
+    const started = Date.now();
     await loadModel(model.filePath, {
       contextSize: model.contextSize,
       gpuLayers: 0,
       chatTemplate: model.chatTemplate ?? undefined,
     });
+    this.lastLoadMs = Date.now() - started;
+    this.lastModelName = model.displayName;
+    this.lastQuant = model.quant ?? "";
   }
 
   async generate(
     messages: BackendMessage[],
     options?: BackendGenerateOptions,
   ): Promise<BackendGenerateResult> {
+    const started = Date.now();
     const result = await generate(messages, {
       maxTokens: options?.maxTokens,
       temperature: options?.temperature,
       ...(options?.enableThinking === false ? { enableThinking: false } : {}),
+    });
+    // Written here, at the point of execution: the only place that can honestly
+    // say CPU produced this. See run-record.
+    recordRun({
+      backend: "llama_cpp",
+      backendLabel: "llama.cpp",
+      computeLabel: "CPU",
+      modelName: this.lastModelName,
+      artifactLabel: this.lastQuant ? `GGUF ${this.lastQuant}` : "GGUF",
+      coldLoadMs: this.lastLoadMs ?? undefined,
+      reusedSession: this.lastLoadMs === null,
+      promptTokens: result.tokensEvaluated,
+      generatedTokens: result.tokensPredicted,
+      decodeTokensPerSecond: result.timings.predictedPerSecond,
+      // llama.rn reports prompt time, which is the prefill cost; TTFT as such
+      // is not separately measured, so it is left unreported rather than
+      // approximated from it.
+      totalMs: Date.now() - started,
     });
     return {
       text: result.text,

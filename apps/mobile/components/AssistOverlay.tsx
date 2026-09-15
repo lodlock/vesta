@@ -17,11 +17,13 @@ export function AssistOverlay({ onOpenChat }: { onOpenChat: () => void }) {
   const confirm = useAssistStore((s) => s.confirm);
   const listenAgain = useAssistStore((s) => s.listenAgain);
   const askModel = useAssistStore((s) => s.askModel);
-  const dismiss = useAssistStore((s) => s.dismiss);
+  const closeAssist = useAssistStore((s) => s.close);
+  const takeOver = useAssistStore((s) => s.openChat);
 
-  const close = () => dismiss();
+  // Done leaves entirely; Open Chat keeps Vesta up and stops the auto-finish.
+  const close = () => closeAssist();
   const openChat = () => {
-    dismiss();
+    takeOver();
     onOpenChat();
   };
 

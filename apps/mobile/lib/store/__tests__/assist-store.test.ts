@@ -9,7 +9,7 @@
 
 import { useAssistStore } from "../assist-store";
 import { processMessage, executeToolCall } from "../../orchestrator/orchestrator";
-import { startAssistCapture } from "../../native/assist";
+import { startAssistCapture, finishAssistantActivity } from "../../native/assist";
 import { speak, stopSpeaking } from "../../native/speech";
 import { getConfig } from "../../storage/database";
 
@@ -19,6 +19,7 @@ jest.mock("../../orchestrator/orchestrator", () => ({
 }));
 jest.mock("../../native/assist", () => ({
   startAssistCapture: jest.fn(async () => {}),
+  finishAssistantActivity: jest.fn(),
 }));
 jest.mock("../../native/speech", () => ({
   speak: jest.fn(async () => "done"),
@@ -39,6 +40,9 @@ jest.mock("../chat-store", () => ({
 const mockProcess = processMessage as jest.MockedFunction<typeof processMessage>;
 const mockExecute = executeToolCall as jest.MockedFunction<typeof executeToolCall>;
 const mockCapture = startAssistCapture as jest.MockedFunction<typeof startAssistCapture>;
+const mockFinish = finishAssistantActivity as jest.MockedFunction<
+  typeof finishAssistantActivity
+>;
 const mockSpeak = speak as jest.MockedFunction<typeof speak>;
 const mockStop = stopSpeaking as jest.MockedFunction<typeof stopSpeaking>;
 const mockConfig = getConfig as jest.MockedFunction<typeof getConfig>;
@@ -73,14 +77,25 @@ describe("scheduling stays local", () => {
     expect(spokenWords()).toEqual(["Timer set for 5 minutes"]);
   });
 
-  it("dismisses itself once the confirmation has been spoken", async () => {
+  it("dismisses AND leaves the screen once the confirmation is spoken", async () => {
     mockProcess.mockResolvedValue(toolCall("Timer set for 5 minutes"));
 
     await state().handle("set a five minute timer");
 
-    // Speech is awaited before the overlay goes, so the tail isn't clipped.
+    // Speech is awaited before the overlay goes, so the tail isn't clipped...
     expect(mockSpeak).toHaveBeenCalled();
     expect(state().active).toBe(false);
+    // ...and the user is returned to whatever they were in, rather than left
+    // looking at Vesta.
+    expect(mockFinish).toHaveBeenCalled();
+  });
+
+  it("stays put when the action FAILED — nothing to return from yet", async () => {
+    mockProcess.mockResolvedValue(toolCall("No clock app installed", false));
+
+    await state().handle("set a five minute timer");
+
+    expect(mockFinish).not.toHaveBeenCalled();
   });
 
   it("stays open when the action FAILED", async () => {

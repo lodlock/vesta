@@ -165,6 +165,40 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    /**
+     * When this process started, as a wall-clock millisecond, or null below
+     * API 24. Lets JS measure the part of launch that happened before any of
+     * its code ran — Zygote, native libraries, the JS bundle — which is the
+     * half it cannot fix and should not be blamed for.
+     */
+    @ReactMethod
+    fun getProcessStartMillis(promise: Promise) {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+                promise.resolve(null)
+                return
+            }
+            val elapsedSinceStart =
+                android.os.SystemClock.elapsedRealtime() - android.os.Process.getStartElapsedRealtime()
+            promise.resolve((System.currentTimeMillis() - elapsedSinceStart).toDouble())
+        } catch (e: Exception) {
+            promise.resolve(null)
+        }
+    }
+
+    /**
+     * Finishes Vesta's activity, returning to whatever the user was in.
+     *
+     * The assistant is a visitor: once a timer is set there is nothing to look
+     * at, and leaving the app in the foreground makes the user dismiss it
+     * themselves. Only finishes the current activity — it does not clear the
+     * task or kill the process, so re-invoking is still warm.
+     */
+    @ReactMethod
+    fun finishAssistantActivity() {
+        reactApplicationContext.currentActivity?.finish()
+    }
+
     // ── Assistant role ───────────────────────────────────────────────────
     // Vesta qualifies for ROLE_ASSISTANT by handling ACTION_ASSIST (see
     // VestaVoiceActivity and the manifest). These methods only report and

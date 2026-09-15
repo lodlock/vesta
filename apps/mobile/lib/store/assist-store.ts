@@ -15,7 +15,7 @@
 import { create } from "zustand";
 import { processMessage, executeToolCall } from "../orchestrator/orchestrator";
 import type { Language, ToolCallResult } from "../orchestrator/types";
-import { startAssistCapture } from "../native/assist";
+import { startAssistCapture, finishAssistantActivity } from "../native/assist";
 import { speak, stopSpeaking } from "../native/speech";
 import { visibleAnswer, spokenAnswer } from "../assist/response-text";
 import { getConfig } from "../storage/database";
@@ -44,6 +44,10 @@ const DISMISS_GRACE_MS = 400;
 // Speech should never hold the overlay open: if an engine goes quiet without
 // reporting, dismiss anyway.
 const SPEECH_TIMEOUT_MS = 8000;
+// A model answer stays up longer than a confirmation: it is worth reading, and
+// the user may want Open Chat. Long enough to act, short enough that a spoken
+// answer doesn't leave Vesta sitting in front of whatever they were doing.
+const ANSWER_LINGER_MS = 6000;
 
 interface AssistState {
   active: boolean;
@@ -61,6 +65,10 @@ interface AssistState {
   confirm: (approved: boolean) => Promise<void>;
   listenAgain: () => Promise<void>;
   askModel: () => Promise<void>;
+  /** Hand over to the full app; cancels the auto-finish. */
+  openChat: () => void;
+  /** Leave the assistant and return to the previous app. */
+  close: () => void;
   dismiss: () => void;
 }
 
@@ -78,6 +86,39 @@ async function settingEnabled(key: string): Promise<boolean> {
 }
 
 export const useAssistStore = create<AssistState>((set, get) => {
+  // The pending auto-finish. Cancelled the moment the user does anything —
+  // tapping Open Chat, answering a question, starting another turn — because
+  // closing the screen under someone who is using it is worse than lingering.
+  let autoFinish: ReturnType<typeof setTimeout> | null = null;
+
+  const cancelAutoFinish = () => {
+    if (autoFinish !== null) {
+      clearTimeout(autoFinish);
+      autoFinish = null;
+    }
+  };
+
+  // Leaves the screen entirely, returning the user to the app they came from.
+  // The assistant is a visitor: once it has said its piece there is nothing to
+  // look at, and making someone dismiss it by hand is the behaviour this
+  // replaces.
+  const leave = () => {
+    cancelAutoFinish();
+    get().dismiss();
+    finishAssistantActivity();
+  };
+
+  const scheduleLeave = (afterMs: number) => {
+    cancelAutoFinish();
+    autoFinish = setTimeout(() => {
+      autoFinish = null;
+      // Only if the turn is still where it was left — a new invocation or an
+      // opened chat has taken over otherwise.
+      const phase = get().phase;
+      if (phase === "answer" || phase === "done") leave();
+    }, afterMs);
+  };
+
   // Speaks `text` and resolves when it has actually been heard (or the engine
   // gave up). Callers that dismiss afterwards get the tail of the sentence.
   const say = async (text: string): Promise<void> => {
@@ -97,7 +138,7 @@ export const useAssistStore = create<AssistState>((set, get) => {
     await new Promise((resolve) => setTimeout(resolve, DISMISS_GRACE_MS));
     // Unless something arrived in the meantime (a new invocation, or the user
     // opened chat), in which case that turn owns the screen now.
-    if (get().phase === "done" && !get().failed) get().dismiss();
+    if (get().phase === "done" && !get().failed) leave();
   };
 
   // Hand the utterance to the model. Loads it if needed — this is the only
@@ -119,6 +160,9 @@ export const useAssistStore = create<AssistState>((set, get) => {
         }
         set({ phase: "answer", failed: false, message: answer });
         await say(answer);
+        // Spoken and on screen. Give the user a window to read it or tap Open
+        // Chat, then get out of the way on their behalf.
+        scheduleLeave(ANSWER_LINGER_MS);
       } else if (res.type === "error") {
         set({ phase: "answer", failed: true, message: res.error });
       } else if (res.type === "pending_tool_call") {
@@ -153,8 +197,10 @@ export const useAssistStore = create<AssistState>((set, get) => {
     clarifying: null,
 
     handle: async (transcript: string) => {
-      // A new invocation silences the previous answer rather than talking over it.
+      // A new invocation silences the previous answer rather than talking over
+      // it, and takes ownership of the screen from any pending auto-finish.
       stopSpeaking();
+      cancelAutoFinish();
 
       const previous = get().clarifying;
       // A follow-up completes the earlier utterance rather than replacing it.
@@ -244,16 +290,29 @@ export const useAssistStore = create<AssistState>((set, get) => {
     // first — including staying off the model while the parser can still cope.
     listenAgain: async () => {
       stopSpeaking();
+      cancelAutoFinish();
       set({ phase: "listening" });
       await startAssistCapture();
     },
 
     // Manual fallback, for when the automatic one is switched off.
     askModel: async () => {
+      cancelAutoFinish();
       await runModel(get().message);
     },
 
+    /** The user is taking over: keep Vesta open and stop the auto-finish. */
+    openChat: () => {
+      cancelAutoFinish();
+      stopSpeaking();
+      set({ active: false, phase: "idle" });
+    },
+
+    /** Done — leave and hand the screen back to whatever came before. */
+    close: () => leave(),
+
     dismiss: () => {
+      cancelAutoFinish();
       stopSpeaking();
       set({
         active: false,

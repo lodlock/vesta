@@ -23,6 +23,10 @@ import {
   getSessionCacheInfo,
   type SessionCacheInfo,
 } from "../lib/llm/session-cache";
+import { getLastRun, reportedOr, type RunRecord } from "../lib/llm/run-record";
+import { backendDiagnostics } from "../lib/llm/backends/registry";
+import type { BackendDiagnostics } from "../lib/llm/backends/types";
+import { getStartupTrace, type StartupTrace } from "../lib/dev/startup-trace";
 import { getDatabaseSizeBytes } from "../lib/storage/database";
 import { getActiveModel } from "../lib/models/model-registry";
 import { formatBytes } from "../lib/models/format";
@@ -37,6 +41,9 @@ interface Diag {
   last: LastCompletionStats | null;
   dbBytes: number;
   cache: SessionCacheInfo;
+  run: RunRecord | null;
+  backends: BackendDiagnostics[];
+  startup: StartupTrace;
 }
 
 async function gather(): Promise<Diag> {
@@ -55,6 +62,9 @@ async function gather(): Promise<Diag> {
     last: getLastCompletion(),
     dbBytes,
     cache,
+    run: getLastRun(),
+    backends: backendDiagnostics(),
+    startup: getStartupTrace(),
   };
 }
 
@@ -85,6 +95,109 @@ export default function DiagnosticsScreen() {
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      {diag && (
+        <>
+        {/* Which backend produced the last answer. Written by the backend that
+            actually ran it, so "Hexagon NPU" cannot appear over CPU work. */}
+        <Text style={styles.sectionTitle}>Last run</Text>
+        <View style={styles.card}>
+          {diag.run ? (
+            <>
+              <Row label="Backend" value={diag.run.backendLabel} />
+              <Row label="Compute" value={diag.run.computeLabel} />
+              <Row label="Model" value={diag.run.modelName || "—"} />
+              <Row label="Artifact" value={diag.run.artifactLabel} />
+              {diag.run.soc && <Row label="SoC" value={diag.run.soc} />}
+              {diag.run.runtimeVersion && (
+                <Row label="Runtime" value={diag.run.runtimeVersion} />
+              )}
+              <Row
+                label="Cold load"
+                value={
+                  diag.run.reusedSession
+                    ? "reused session"
+                    : reportedOr(diag.run.coldLoadMs, "ms")
+                }
+              />
+              <Row label="Prompt tokens" value={reportedOr(diag.run.promptTokens)} />
+              <Row label="TTFT" value={reportedOr(diag.run.ttftMs, "ms")} />
+              <Row
+                label="Prefill"
+                value={reportedOr(diag.run.prefillTokensPerSecond, "tok/s")}
+              />
+              <Row label="Generated" value={reportedOr(diag.run.generatedTokens)} />
+              <Row
+                label="Decode"
+                value={reportedOr(diag.run.decodeTokensPerSecond, "tok/s")}
+              />
+              <Row label="Total" value={reportedOr(diag.run.totalMs, "ms")} />
+            </>
+          ) : (
+            <Text style={styles.hint}>
+              No generation yet this session. Deterministic timers and alarms never
+              reach a model, so they leave nothing here.
+            </Text>
+          )}
+        </View>
+
+        {/* Every backend, whether or not it is in use — so a device with an NPU
+            is told WHY it isn't being used rather than left guessing. */}
+        <Text style={styles.sectionTitle}>Backends</Text>
+        <View style={styles.card}>
+          {diag.backends.map((backend) => (
+            <View key={backend.id} style={styles.backendBlock}>
+              <Row
+                label={backend.displayName}
+                value={
+                  backend.loaded
+                    ? "loaded"
+                    : backend.available
+                      ? "available"
+                      : "unavailable"
+                }
+              />
+              {backend.unavailableReason && (
+                <Text style={styles.hint}>{backend.unavailableReason}</Text>
+              )}
+              {backend.id === "qualcomm_npu" && (
+                <Text style={styles.hint}>
+                  SoC {String(backend.details.soc)} · runtime{" "}
+                  {String(backend.details.runtimeVersion)} · compute{" "}
+                  {String(backend.details.computeUnit)}
+                </Text>
+              )}
+            </View>
+          ))}
+        </View>
+
+        {/* Where the launch wait went. Measured, so the unavoidable part is
+            separated from the part that is ours. */}
+        <Text style={styles.sectionTitle}>Startup</Text>
+        <View style={styles.card}>
+          <Row
+            label="Android → JS"
+            value={reportedOr(diag.startup.phases.nativeToJs, "ms")}
+          />
+          <Row label="Database" value={reportedOr(diag.startup.phases.database, "ms")} />
+          <Row label="Restore chat" value={reportedOr(diag.startup.phases.restore, "ms")} />
+          <Row label="Service" value={reportedOr(diag.startup.phases.service, "ms")} />
+          <Row
+            label="Model load"
+            value={
+              diag.startup.skippedModel
+                ? "skipped (assistant launch)"
+                : reportedOr(diag.startup.phases.model, "ms")
+            }
+          />
+          <Row label="Total to ready" value={reportedOr(diag.startup.phases.total, "ms")} />
+          <Text style={styles.hint}>
+            &ldquo;Android → JS&rdquo; is process start to the first line of JavaScript —
+            Zygote, native libraries and the bundle. Vesta cannot shorten it.
+          </Text>
+        </View>
+        </>
+      )}
+
       <Text style={styles.sectionTitle}>Model</Text>
       <View style={styles.card}>
         <Row label="Status" value={diag?.modelLoaded ? "Loaded" : "Not loaded"} />
@@ -155,6 +268,7 @@ export default function DiagnosticsScreen() {
 }
 
 const styles = StyleSheet.create({
+  backendBlock: { paddingVertical: 4 },
   container: { flex: 1, backgroundColor: colors.bg },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
   sectionTitle: {

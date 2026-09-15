@@ -28,6 +28,8 @@ export interface BackendModelRef {
   chatTemplate?: string | null;
   // Where the tokenizer is, for bundles that don't keep it beside the weights.
   tokenizerPath?: string | null;
+  /** Quantization, for the artifact label in diagnostics ("Q4_K_M", "w4a16"). */
+  quant?: string | null;
 }
 
 export interface BackendGenerateOptions {

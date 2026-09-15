@@ -36,6 +36,7 @@ import { clearPrefixSessionCache } from "../llm/session-cache";
 import { persistFailureNotice, modelLoadFailureNotice } from "./notices";
 import { startVestaService } from "../native/vesta-service";
 import { probeNpuRuntime } from "../native/npu";
+import { timePhase, markSkippedModel } from "../dev/startup-trace";
 import * as FileSystem from "expo-file-system/legacy";
 import {
   ensureLegacyMigration,
@@ -111,21 +112,30 @@ export const useChatStore = create<ChatState>((set, get) => {
   // The model is loaded later, on demand, by ensureModelLoaded().
   init: async (opts?: { loadModel?: boolean }) => {
     const wantModel = opts?.loadModel !== false;
-    const lang = await getConfig("language");
+    markSkippedModel(!wantModel);
+
+    // The first DB call is also the one that opens SQLite and runs migrations,
+    // so it is timed separately from the reads that follow it.
+    const lang = await timePhase("database", () => getConfig("language"));
     if (lang === "it" || lang === "en") set({ language: lang });
 
     // Try to restore the latest conversation
-    const latest = await getLatestConversation();
+    const latest = await timePhase("restore", async () => {
+      const found = await getLatestConversation();
+      if (found) {
+        const messages = await getMessages(found.id);
+        set({
+          conversationId: found.id,
+          conversationTitle: found.title,
+          messages,
+        });
+      }
+      return found;
+    });
     let conversationId: string;
 
     if (latest) {
       conversationId = latest.id;
-      const messages = await getMessages(conversationId);
-      set({
-        conversationId,
-        conversationTitle: latest.title,
-        messages,
-      });
     } else {
       // First launch — lazy: just set ID, don't persist until first message
       conversationId = uuid();
@@ -135,8 +145,10 @@ export const useChatStore = create<ChatState>((set, get) => {
     // Keep-alive service and model go together: both exist to hold weights in
     // memory, so an assist-only boot starts neither.
     if (wantModel) {
-      startVestaService().catch(() => {});
-      await get().ensureModelLoaded();
+      await timePhase("service", async () => {
+        startVestaService().catch(() => {});
+      });
+      await timePhase("model", () => get().ensureModelLoaded());
     }
 
     // Ask once whether a Qualcomm runtime exists in this build. Cheap, and it

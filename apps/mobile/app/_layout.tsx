@@ -12,7 +12,12 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { useChatStore } from "../lib/store/chat-store";
 import { useAssistStore } from "../lib/store/assist-store";
 import { AssistOverlay } from "../components/AssistOverlay";
-import { consumeAssistRequest, onAssistRequest } from "../lib/native/assist";
+import {
+  consumeAssistRequest,
+  onAssistRequest,
+  getProcessStartMillis,
+} from "../lib/native/assist";
+import { finishTrace, recordNativeToJs } from "../lib/dev/startup-trace";
 import { unloadEmbeddingModel, isEmbeddingLoaded } from "../lib/llm/embed-engine";
 import { colors } from "../lib/theme";
 
@@ -27,12 +32,18 @@ export default function RootLayout() {
       // Reading it BEFORE init decides whether this launch loads the model at
       // all: a spoken timer is handled by the parser, so an assistant boot
       // skips the GGUF (and the keep-alive service) entirely.
+      const startedAt = Date.now();
+      // The part of the wait that happened before any JS ran. Recorded, not
+      // guessed: it is the half Vesta cannot shorten.
+      getProcessStartMillis().then(recordNativeToJs).catch(() => {});
+
       const assist = await consumeAssistRequest();
       try {
         await init({ loadModel: assist === null });
       } catch (err) {
         console.error("Init failed:", err);
       }
+      finishTrace(Date.now() - startedAt);
       setReady(true);
       if (assist) useAssistStore.getState().handle(assist);
     })();

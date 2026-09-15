@@ -59,6 +59,35 @@ export async function isDefaultAssistant(): Promise<boolean> {
   }
 }
 
+/**
+ * Finishes Vesta's activity so the user lands back where they were.
+ *
+ * Called after the assistant has said its piece. It is not a dismissal of the
+ * overlay state — the store does that — it is leaving the screen entirely.
+ */
+export function finishAssistantActivity(): void {
+  if (!available() || typeof SystemActionsModule.finishAssistantActivity !== "function") {
+    return;
+  }
+  try {
+    SystemActionsModule.finishAssistantActivity();
+  } catch {
+    // No activity to finish; the user has already moved on.
+  }
+}
+
+/** When this process started, for the startup breakdown. Null when unknown. */
+export async function getProcessStartMillis(): Promise<number | null> {
+  if (!available() || typeof SystemActionsModule.getProcessStartMillis !== "function") {
+    return null;
+  }
+  try {
+    return (await SystemActionsModule.getProcessStartMillis()) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export type AssistantRoleOutcome =
   | "held" // Vesta already holds the role
   | "requested" // the system role dialog is up

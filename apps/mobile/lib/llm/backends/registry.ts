@@ -56,6 +56,8 @@ export function backendModelRef(model: {
   chatTemplate?: string | null;
   targetSoc?: string | null;
   runtimeVersion?: string | null;
+  quant?: string | null;
+  tokenizerPath?: string | null;
 }): BackendModelRef {
   return {
     filePath: model.filePath,
@@ -67,6 +69,8 @@ export function backendModelRef(model: {
     chatTemplate: model.chatTemplate ?? null,
     targetSoc: model.targetSoc ?? null,
     runtimeVersion: model.runtimeVersion ?? null,
+    quant: model.quant ?? null,
+    tokenizerPath: model.tokenizerPath ?? null,
   };
 }
 

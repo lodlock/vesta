@@ -16,6 +16,7 @@
 // See docs/NPU-BACKEND.md for the licensing position and the build setup.
 
 import { checkNpuCompatibility } from "../../models/npu-compat";
+import { recordRun } from "../run-record";
 import {
   isNpuRuntimeAvailable,
   npuRuntimeInfo,
@@ -42,6 +43,8 @@ export class QualcommNpuBackend implements ModelBackend {
   private loadedPath: string | null = null;
   private lastError: string | null = null;
   private lastProfile: NpuRawResult | null = null;
+  private lastLoadMs: number | null = null;
+  private lastModel: BackendModelRef | null = null;
 
   /** The chipset this device reports, needed to match an artifact's target. */
   private soc: string | null = null;
@@ -102,12 +105,15 @@ export class QualcommNpuBackend implements ModelBackend {
       throw new Error(reason);
     }
     try {
+      const started = Date.now();
       this.runtime = await npuLoad({
         modelPath: model.filePath,
         tokenizerPath: model.tokenizerPath ?? null,
         contextSize: model.contextSize,
       });
+      this.lastLoadMs = Date.now() - started;
       this.loadedPath = model.filePath;
+      this.lastModel = model;
       this.lastError = null;
     } catch (err) {
       this.loadedPath = null;
@@ -121,6 +127,7 @@ export class QualcommNpuBackend implements ModelBackend {
     options?: BackendGenerateOptions,
   ): Promise<BackendGenerateResult> {
     if (!this.loadedPath) throw new Error("No NPU model loaded.");
+    const started = Date.now();
     try {
       const result = await npuGenerate(messages, {
         maxTokens: options?.maxTokens,
@@ -131,6 +138,28 @@ export class QualcommNpuBackend implements ModelBackend {
       });
       this.lastError = null;
       this.lastProfile = result;
+      // Only reached because THIS backend created the session and produced the
+      // tokens — which is the entire basis on which anything may say "NPU".
+      recordRun({
+        backend: "qualcomm_npu",
+        backendLabel: "Qualcomm GenieX / QAIRT",
+        computeLabel: "Hexagon HTP / NPU",
+        modelName: this.lastModel?.displayName ?? "",
+        artifactLabel: this.lastModel?.quant
+          ? `${this.lastModel.quant} context bundle`
+          : "context bundle",
+        soc: this.soc ?? undefined,
+        runtimeVersion: this.runtime?.version ?? undefined,
+        coldLoadMs: this.lastLoadMs ?? undefined,
+        reusedSession: this.lastLoadMs === null,
+        // The runtime's own measurements; absent stays absent.
+        promptTokens: result.promptTokens,
+        ttftMs: result.ttftMs,
+        prefillTokensPerSecond: result.prefillSpeed,
+        generatedTokens: result.generatedTokens,
+        decodeTokensPerSecond: result.decodeSpeed,
+        totalMs: Date.now() - started,
+      });
       return {
         text: result.text,
         content: result.text,
@@ -151,6 +180,7 @@ export class QualcommNpuBackend implements ModelBackend {
     } finally {
       this.loadedPath = null;
       this.runtime = null;
+      this.lastLoadMs = null;
     }
   }
 
