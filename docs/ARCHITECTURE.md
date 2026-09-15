@@ -552,6 +552,20 @@ La verifica **fallisce chiusa**: quando un digest atteso esiste, il commit avvie
 
 **Conseguenze**: il percorso NPU è per forza *curato*, non "porta il tuo GGUF": artefatti per-SoC (context binary + tokenizer + `genie_config.json`), esportati off-device via AI Hub. Perciò i due backend convivono invece di sostituirsi — llama.cpp resta l'unico che accetta un file arbitrario dell'utente. Da verificare prima di scrivere codice: i termini di ridistribuzione delle librerie runtime QAIRT/GenieX in un'app di terze parti, che la documentazione pubblica consultata non dichiara.
 
+### ADR-022: Backend NPU Qualcomm via GenieX — gate di licenza superato, binari fuori dal repo
+
+**Contesto**: ADR-021 aveva indicato Genie/GenieX come strada consigliata lasciando aperta *la* domanda che conta davvero: si può ridistribuire il runtime Qualcomm dentro un'app di terze parti, per giunta open source? Senza quella risposta il codice non si scrive.
+
+**Verifica (fonti primarie, non memoria)**: `com.qualcomm.qti:qnn-runtime` su Maven Central dichiara la *Qualcomm AI Hub Model License*. Il §1(iv) concede di **"distribute and sublicense the Software solely in object code format and as incorporated in Your software application"**, e aggiunge che nulla autorizza a distribuirlo **"on a standalone basis"**. Il §9 precisa che il Software **"is NOT A CONTRIBUTION to any open source project"**. Gli asset generati da AI Hub seguono la licenza del modello di partenza (Qwen3 è Apache-2.0); serve un account gratuito Qualcomm. `com.qualcomm.qti:geniex-android` dichiara BSD-3-Clause più i Terms of Use Qualcomm.
+
+**Decisione**: si procede, con un confine netto. Vesta resta MIT; i binari Qualcomm non entrano MAI nel repository — li risolve Gradle da Maven in fase di build, così finiscono nell'APK (permesso) e non nella storia git (non permesso, e incompatibile con una licenza MIT). Le note proprietarie dell'AAR vanno preservate (§2b). Il backend è **opt-in di build** (`VESTA_ENABLE_NPU=1`), nella stessa forma del profilo scheduling-only e della firma release: senza il flag non esiste né la dipendenza né il bridge nativo, quindi una build normale non può rompersi su un SDK che non ha scaricato.
+
+**Runtime scelto: GenieX** (`com.qualcomm.qti:geniex-android`). Ha un SDK Kotlin su Maven pensato per app di terze parti, elenca esplicitamente Snapdragon 8 Elite Gen 5 (SM8850), e la sua API espone esattamente ciò che serve qui: generazione in streaming, `stopStream` per la cancellazione, e `applyChatTemplate(..., enableThinking)` che mappa uno-a-uno sulla soppressione del reasoning della modalità assistente. ExecuTorch QNN non elenca SM8850 e vuole export AOT su host Linux; il backend Hexagon di llama.cpp resta sperimentale con una issue aperta di output corrotto proprio su SM8850/v81.
+
+**Formato artefatto**: bundle AI Hub precompilato, quantizzazione **w4a16** (pesi int4, attivazioni int16), compilato per UNA famiglia di SoC. Non è portabile: su un chip diverso non è più lento, è inservibile — perciò un modello NPU porta il SoC di destinazione nei metadati e viene rifiutato altrove. GenieX accetta anche GGUF (con `Q4_0` per finire sull'NPU), ma il "porta il tuo GGUF qualunque" resta lavoro di llama.cpp, su qualsiasi dispositivo.
+
+**Conseguenza**: i due backend convivono per costruzione. Il dettaglio operativo sta in `docs/NPU-BACKEND.md`.
+
 ---
 
 ## 8. Sicurezza

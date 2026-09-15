@@ -34,6 +34,25 @@ ios/build/
 # Model files (too large for git)
 *.gguf
 
+# NPU model artifacts and the Qualcomm SDK.
+#
+# Two reasons, not one. Size — a context bundle is gigabytes. And licence: the
+# Qualcomm runtime's grant covers redistribution "as incorporated in Your
+# software application" and explicitly NOT "on a standalone basis", so a
+# checked-in .aar/.so would be standalone redistribution — and would fold
+# proprietary code into an MIT repository. Gradle resolves it from Maven at
+# build time instead. See docs/NPU-BACKEND.md.
+*.bin
+*.pte
+*.serialized
+qairt/
+qnn-sdk/
+geniex-sdk/
+**/npu-artifacts/
+.qai-hub/
+qai_hub_token*
+*.aihub-token
+
 # IDE
 .idea/
 .vscode/
