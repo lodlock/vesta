@@ -68,6 +68,19 @@ export function getStartupTrace(): StartupTrace {
  * Android-only and API 24+; absent elsewhere, which is honest rather than
  * zero — this is the part of the wait that is not Vesta's to fix.
  */
+/**
+ * How old the PROCESS was when JavaScript first ran.
+ *
+ * On a cold start that is the launch cost Vesta cannot shorten — Zygote,
+ * native libraries, the bundle. On a WARM start it is not a launch metric at
+ * all: the process outlived the previous Activity, so this is simply its age,
+ * and it reads in the hundreds of thousands of milliseconds while the launch
+ * itself took a few. Read beside "total", where a large value here and a tiny
+ * one there is the signature of nothing having been reloaded.
+ *
+ * A true Activity-launch latency would have to come from the Activity's own
+ * onCreate timestamp, not from Process.getStartElapsedRealtime().
+ */
 export function recordNativeToJs(processStartMs: number | null): void {
   if (processStartMs === null || processStartMs <= 0) return;
   trace.phases.nativeToJs = Math.max(0, Date.now() - processStartMs);

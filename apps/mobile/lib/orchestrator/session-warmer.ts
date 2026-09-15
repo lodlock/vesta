@@ -36,7 +36,18 @@ const PERSIST_SAFETY_MARGIN = 256;
  * after the model loads and BEFORE the first completion. Failures are
  * non-fatal: the first turn just prefills cold, as it does today.
  */
+// Wall-clock of the most recent warm, so the assistant's turn trace can say
+// whether a slow invocation went on loading weights or on restoring the KV
+// prefix. -1 until one has run in this process.
+let lastWarmMs = -1;
+
+/** Milliseconds the last prefix restore took, or -1 if none has run. */
+export function getLastWarmMs(): number {
+  return lastWarmMs;
+}
+
 export async function warmSessionCache(): Promise<void> {
+  const startedAt = Date.now();
   try {
     const [lang, memoriesBlock, knowledgeBlock] = await Promise.all([
       getConfig("language"),
@@ -48,6 +59,8 @@ export async function warmSessionCache(): Promise<void> {
     await restorePrefixSession(stablePrefix);
   } catch (err) {
     console.warn("[SessionWarmer] warm failed (starting cold):", err);
+  } finally {
+    lastWarmMs = Date.now() - startedAt;
   }
 }
 

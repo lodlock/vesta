@@ -27,6 +27,11 @@ import { getLastRun, reportedOr, type RunRecord } from "../lib/llm/run-record";
 import { backendDiagnostics } from "../lib/llm/backends/registry";
 import type { BackendDiagnostics } from "../lib/llm/backends/types";
 import { getStartupTrace, type StartupTrace } from "../lib/dev/startup-trace";
+import {
+  getLastAssistTurn,
+  getAssistModelTurns,
+  type AssistTurnTrace,
+} from "../lib/assist/assist-trace";
 import { getDatabaseSizeBytes } from "../lib/storage/database";
 import { getActiveModel } from "../lib/models/model-registry";
 import { formatBytes } from "../lib/models/format";
@@ -44,6 +49,8 @@ interface Diag {
   run: RunRecord | null;
   backends: BackendDiagnostics[];
   startup: StartupTrace;
+  assist: AssistTurnTrace | null;
+  assistTurns: number;
 }
 
 async function gather(): Promise<Diag> {
@@ -65,6 +72,8 @@ async function gather(): Promise<Diag> {
     run: getLastRun(),
     backends: backendDiagnostics(),
     startup: getStartupTrace(),
+    assist: getLastAssistTurn(),
+    assistTurns: getAssistModelTurns(),
   };
 }
 
@@ -242,7 +251,7 @@ export default function DiagnosticsScreen() {
         <Text style={styles.sectionTitle}>Startup</Text>
         <View style={styles.card}>
           <Row
-            label="Android → JS"
+            label="Process age at boot"
             value={reportedOr(diag.startup.phases.nativeToJs, "ms")}
           />
           <Row label="Database" value={reportedOr(diag.startup.phases.database, "ms")} />
@@ -258,8 +267,13 @@ export default function DiagnosticsScreen() {
           />
           <Row label="Total to ready" value={reportedOr(diag.startup.phases.total, "ms")} />
           <Text style={styles.hint}>
-            &ldquo;Android → JS&rdquo; is process start to the first line of JavaScript —
-            Zygote, native libraries and the bundle. Vesta cannot shorten it.
+            &ldquo;Process age at boot&rdquo; is measured from PROCESS start
+            (Process.getStartElapsedRealtime), so it only means &ldquo;Zygote, native
+            libraries and bundle load&rdquo; on a genuinely cold start. On a warm
+            launch — the process outlived the last Activity — it is the age of
+            the process, not this launch&rsquo;s latency, and will read far larger
+            than &ldquo;Total to ready&rdquo;. Compare the two: a huge value here beside a
+            few ms there means nothing was reloaded.
           </Text>
         </View>
         </>
@@ -292,6 +306,56 @@ export default function DiagnosticsScreen() {
           </>
         ) : (
           <Text style={styles.hint}>No completion yet this session.</Text>
+        )}
+      </View>
+
+      {/* Where a model-backed assistant turn's wait went. "It reloads every
+          time" has three possible meanings and they need different fixes —
+          these numbers say which one it is rather than leaving it to a
+          stopwatch. See lib/assist/assist-trace. */}
+      <Text style={styles.sectionTitle}>Last assistant turn</Text>
+      <View style={styles.card}>
+        {diag?.assist ? (
+          <>
+            <Row
+              label="Model resident"
+              value={diag.assist.loadedAtStart ? "yes" : "no — loaded for this turn"}
+            />
+            <Row label="Model load" value={`${diag.assist.loadMs} ms`} />
+            <Row
+              label="Prefix restore"
+              value={diag.assist.restoreMs > 0 ? `${diag.assist.restoreMs} ms` : "—"}
+            />
+            <Row label="Generate" value={`${diag.assist.generateMs} ms`} />
+            <Row
+              label="Prompt evaluated"
+              value={
+                diag.assist.promptTokens === null
+                  ? "—"
+                  : `${diag.assist.promptTokens} tokens`
+              }
+            />
+            <Row
+              label="Prompt cached"
+              value={
+                diag.assist.cachedTokens === null
+                  ? "—"
+                  : `${diag.assist.cachedTokens} tokens`
+              }
+            />
+            <Row label="Total" value={`${diag.assist.totalMs} ms`} />
+            <Row label="Model turns this process" value={`${diag.assistTurns}`} />
+            <Text style={styles.hint}>
+              &ldquo;Model resident: no&rdquo; on a repeat question means the process was
+              killed between invocations, not that Vesta unloaded anything. A
+              resident model with a large &ldquo;prompt evaluated&rdquo; means the weights
+              stayed but the prompt prefix changed and had to be re-evaluated.
+            </Text>
+          </>
+        ) : (
+          <Text style={styles.hint}>
+            No model-backed assistant turn yet this session.
+          </Text>
         )}
       </View>
 
