@@ -36,6 +36,7 @@ import {
   type HfFile,
 } from "../models/hf-client";
 import { canActivate } from "../models/activation";
+import { setDeviceSoc } from "../llm/backends/registry";
 import { checkGgufFile } from "../models/gguf-header";
 import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
 import { sha256File, normalizeSha256 } from "../native/file-hash";
@@ -111,6 +112,9 @@ export const useModelStore = create<ModelState>((set, get) => ({
 
   refresh: async () => {
     const [installed, caps] = await Promise.all([listInstalled(), getDeviceCaps()]);
+    // The NPU backend can only match an artifact's target against a chipset it
+    // knows. Until this runs it knows none, and therefore claims nothing.
+    setDeviceSoc(caps.soc);
     set({
       installed,
       caps,

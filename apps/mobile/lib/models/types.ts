@@ -49,6 +49,22 @@ export type ModelTrust =
   | "user_supplied_baseline"
   | "unverified";
 
+// Which runtime a model belongs to. Not a preference — a fact about the file.
+export type ModelBackendId = "llama_cpp" | "qualcomm_npu";
+
+// The on-disk shape. `gguf` is one portable file; the Qualcomm formats are
+// compiled for a specific SoC and usually arrive as a directory of files.
+export type ModelArtifact = "gguf" | "qairt_context" | "geniex_bundle";
+
+// One file of a multi-file model bundle. A bundle is verified as a single
+// integrity unit: every listed file must match, or the model is not loadable.
+export interface BundleFile {
+  // Path relative to the model directory — "weights.bin", "tokenizer.json".
+  path: string;
+  sha256: string | null;
+  sizeBytes?: number;
+}
+
 export type DownloadStatus =
   | "idle"
   | "checking"
@@ -80,6 +96,17 @@ export interface InstalledModel {
   // one; afterwards it is whatever `trust` says it is. Null when unknown.
   sha256: string | null;
   trust: ModelTrust;
+  // Runtime and compatibility. Rows written before these existed read as a
+  // GGUF on llama.cpp, which is what they are.
+  backend: ModelBackendId;
+  artifact: ModelArtifact;
+  // The chipset this artifact was compiled for ("SM8850"). Null means portable
+  // — true of every GGUF, and never true of a Qualcomm bundle.
+  targetSoc: string | null;
+  // The runtime version the artifact expects, when it declares one.
+  runtimeVersion: string | null;
+  // Files that make up a bundle, verified together. Empty for single-file models.
+  bundleFiles: BundleFile[];
   isActive: boolean;
   createdAt: number;
 }

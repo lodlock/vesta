@@ -150,6 +150,15 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
             map.putBoolean("lowRam", am.isLowRamDevice)
             map.putString("model", Build.MODEL)
             map.putString("manufacturer", Build.MANUFACTURER)
+            // The chipset, e.g. "SM8850" for Snapdragon 8 Elite Gen 5. An NPU
+            // artifact is compiled for one of these and is unusable on another,
+            // so this is what a compatibility check compares against. API 31+;
+            // older devices report null, which reads as "unknown" — and an
+            // unknown chip is never assumed to match.
+            map.putString(
+                "soc",
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else null,
+            )
             promise.resolve(map)
         } catch (e: Exception) {
             promise.reject("DEVICE_INFO_ERROR", e.message, e)

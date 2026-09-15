@@ -6,8 +6,11 @@ import * as FileSystem from "expo-file-system/legacy";
 import { v4 as uuid } from "uuid";
 import { getDatabase, getConfig, setConfig } from "../storage/database";
 import type {
+  BundleFile,
   DownloadStatus,
   InstalledModel,
+  ModelArtifact,
+  ModelBackendId,
   ModelRole,
   ModelTrust,
 } from "./types";
@@ -28,6 +31,11 @@ interface ModelRow {
   resume_token: string | null;
   sha256: string | null;
   trust: ModelTrust | null;
+  backend: ModelBackendId | null;
+  artifact: ModelArtifact | null;
+  target_soc: string | null;
+  runtime_version: string | null;
+  bundle_files: string | null;
   is_active: number;
   created_at: number;
 }
@@ -51,6 +59,12 @@ function mapRow(r: ModelRow): InstalledModel {
     // A row written before migration v4 has no trust value; "unverified" is the
     // honest reading of it, never an optimistic default.
     trust: r.trust ?? "unverified",
+    // Likewise pre-v5: everything that existed then was a GGUF on llama.cpp.
+    backend: r.backend ?? "llama_cpp",
+    artifact: r.artifact ?? "gguf",
+    targetSoc: r.target_soc,
+    runtimeVersion: r.runtime_version,
+    bundleFiles: parseBundleFiles(r.bundle_files),
     isActive: r.is_active === 1,
     createdAt: r.created_at,
   };
@@ -59,7 +73,24 @@ function mapRow(r: ModelRow): InstalledModel {
 const SELECT =
   `SELECT id, display_name, hf_repo, hf_file, file_path, quant, size_bytes,
           min_ram_mb, chat_template, context_size, role, state, resume_token,
-          sha256, trust, is_active, created_at FROM models`;
+          sha256, trust, backend, artifact, target_soc, runtime_version,
+          bundle_files, is_active, created_at FROM models`;
+
+// Bundle manifests are stored as JSON. A corrupt value must not take the whole
+// model list down with it — an unreadable manifest reads as "no bundle", which
+// the integrity check then treats as nothing to verify rather than as a pass.
+function parseBundleFiles(raw: string | null): BundleFile[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (f): f is BundleFile => !!f && typeof f.path === "string",
+    );
+  } catch {
+    return [];
+  }
+}
 
 export interface NewModel {
   id?: string;
@@ -77,6 +108,11 @@ export interface NewModel {
   resumeToken?: string | null;
   sha256?: string | null;
   trust?: ModelTrust;
+  backend?: ModelBackendId;
+  artifact?: ModelArtifact;
+  targetSoc?: string | null;
+  runtimeVersion?: string | null;
+  bundleFiles?: BundleFile[];
 }
 
 export async function insertModel(m: NewModel): Promise<InstalledModel> {
@@ -87,8 +123,9 @@ export async function insertModel(m: NewModel): Promise<InstalledModel> {
     `INSERT INTO models
        (id, display_name, hf_repo, hf_file, file_path, quant, size_bytes,
         min_ram_mb, chat_template, context_size, role, state, resume_token,
-        sha256, trust, is_active, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+        sha256, trust, backend, artifact, target_soc, runtime_version,
+        bundle_files, is_active, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
     id,
     m.displayName,
     m.hfRepo ?? null,
@@ -104,6 +141,13 @@ export async function insertModel(m: NewModel): Promise<InstalledModel> {
     m.resumeToken ?? null,
     m.sha256 ?? null,
     m.trust ?? "unverified",
+    m.backend ?? "llama_cpp",
+    m.artifact ?? "gguf",
+    m.targetSoc ?? null,
+    m.runtimeVersion ?? null,
+    m.bundleFiles && m.bundleFiles.length > 0
+      ? JSON.stringify(m.bundleFiles)
+      : null,
     now,
   );
   const row = await d.getFirstAsync<ModelRow>(`${SELECT} WHERE id = ?`, id);

@@ -163,6 +163,9 @@ export interface NativeDeviceInfo {
   lowRam: boolean;
   model: string | null;
   manufacturer: string | null;
+  // Chipset id ("SM8850"), or null below API 31. An NPU artifact is compiled
+  // for a specific one of these.
+  soc?: string | null;
 }
 
 // Returns device RAM + model, or null when the native module isn't available

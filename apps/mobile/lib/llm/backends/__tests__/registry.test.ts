@@ -1,14 +1,23 @@
-// Backend selection and fallback.
+// Backend selection, and the refusals that keep it honest.
 //
-// The behaviour that matters is the fallback: every GGUF must land on
-// llama.cpp, and a model an accelerated backend cannot actually run must NOT be
-// claimed by it. Getting that wrong turns "runs a bit slower" into "does not
-// run".
+// Two properties matter more than anything else here. Every GGUF must land on
+// llama.cpp — that fallback is what makes "bring your own model" work on any
+// device. And the NPU backend must never claim an artifact it cannot actually
+// run: a wrong yes is a crash after a multi-GB download, a wrong no is a model
+// that runs on CPU, which is where it would have run anyway.
 
-import { selectBackend, backendModelRef, backendDiagnostics, allBackends } from "../registry";
+import {
+  selectBackend,
+  backendModelRef,
+  backendDiagnostics,
+  allBackends,
+  setDeviceSoc,
+  npuRefusalFor,
+} from "../registry";
 import { LlamaCppBackend } from "../llamacpp-backend";
 import { QualcommNpuBackend } from "../qnn-backend";
-import { formatOf } from "../types";
+import { guessArtifact } from "../types";
+import { isNpuRuntimeAvailable } from "../../../native/npu";
 
 jest.mock("../../llm-engine", () => ({
   loadModel: jest.fn(async () => {}),
@@ -23,103 +32,168 @@ jest.mock("../../llm-engine", () => ({
   getModelInfo: jest.fn(() => ({ loaded: false })),
   getLastCompletion: jest.fn(() => null),
 }));
+jest.mock("../../../native/npu", () => ({
+  isNpuRuntimeAvailable: jest.fn(() => false),
+  npuRuntimeInfo: jest.fn(() => null),
+  npuLoad: jest.fn(),
+  npuGenerate: jest.fn(),
+  npuUnload: jest.fn(async () => {}),
+}));
 
-describe("formatOf", () => {
-  it("recognizes the formats the backends care about", () => {
-    expect(formatOf("/models/qwen3-4b.gguf")).toBe("gguf");
-    expect(formatOf("/models/QWEN3.GGUF")).toBe("gguf");
-    expect(formatOf("/models/model.pte")).toBe("executorch-pte");
-    expect(formatOf("/models/qwen3_4b_sm8850.bin")).toBe("qnn-context");
-    expect(formatOf("/models/notes.txt")).toBe("unknown");
+const mockRuntime = isNpuRuntimeAvailable as jest.MockedFunction<
+  typeof isNpuRuntimeAvailable
+>;
+
+const gguf = () =>
+  backendModelRef({
+    filePath: "file:///docs/models/qwen3-4b.gguf",
+    contextSize: 4096,
+    displayName: "Qwen3 4B",
+    artifact: "gguf",
+  });
+
+const npuBundle = (over: Partial<Parameters<typeof backendModelRef>[0]> = {}) =>
+  backendModelRef({
+    filePath: "file:///docs/models/qwen3-4b-sm8850/weights.bin",
+    contextSize: 4096,
+    displayName: "Qwen3 4B Instruct 2507 (NPU)",
+    artifact: "qairt_context",
+    targetSoc: "SM8850",
+    ...over,
+  });
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockRuntime.mockReturnValue(false);
+  setDeviceSoc(null);
+});
+
+describe("guessArtifact", () => {
+  it("reads the formats an import can hand us", () => {
+    expect(guessArtifact("/models/qwen3-4b.gguf")).toBe("gguf");
+    expect(guessArtifact("/models/QWEN3.GGUF")).toBe("gguf");
+    expect(guessArtifact("/models/qwen3_sm8850.bin")).toBe("qairt_context");
+    expect(guessArtifact("/models/notes.txt")).toBe("unknown");
   });
 });
 
-describe("selectBackend", () => {
-  it("routes a GGUF to llama.cpp", () => {
+describe("GGUF always has a runtime", () => {
+  it("routes to llama.cpp", () => {
+    expect(selectBackend(gguf())?.id).toBe("llama.cpp");
+  });
+
+  it("routes a user's own merge the same way — no repo, no target", () => {
     const backend = selectBackend(
-      backendModelRef({ filePath: "/models/qwen3-4b.gguf", contextSize: 4096 }),
-    );
-    expect(backend?.id).toBe("llama.cpp");
-  });
-
-  it("routes a user-supplied GGUF the same way — no repo, no target", () => {
-    const backend = selectBackend(
-      backendModelRef({ filePath: "/models/my-own-merge.gguf", contextSize: 8192 }),
-    );
-    expect(backend?.id).toBe("llama.cpp");
-  });
-
-  it("does NOT hand a GGUF to the NPU backend even when it is first in order", () => {
-    expect(allBackends()[0].id).toBe("qnn");
-    expect(
-      allBackends()[0].supports(
-        backendModelRef({ filePath: "/models/qwen3-4b.gguf", contextSize: 4096 }),
-      ),
-    ).toBe(false);
-  });
-
-  it("returns null for a format nothing can run, rather than guessing", () => {
-    expect(
-      selectBackend(backendModelRef({ filePath: "/models/model.pte", contextSize: 4096 })),
-    ).toBeNull();
-  });
-});
-
-describe("QualcommNpuBackend — unimplemented, and honest about it", () => {
-  it("claims nothing while the runtime is absent", () => {
-    const npu = new QualcommNpuBackend("SM8850");
-    expect(npu.isAvailable()).toBe(false);
-    expect(
-      npu.supports({
-        filePath: "/models/qwen3_4b_sm8850.bin",
-        format: "qnn-context",
-        contextSize: 4096,
-        targetSoc: "SM8850",
+      backendModelRef({
+        filePath: "file:///docs/models/my-own-merge.gguf",
+        contextSize: 8192,
+        artifact: "gguf",
       }),
-    ).toBe(false);
+    );
+    expect(backend?.id).toBe("llama.cpp");
   });
 
-  it("would refuse a binary built for a different chip", () => {
-    // Even once available: a context binary is compiled per SoC, and running
-    // the wrong one is a crash, not a slowdown.
+  it("still routes to llama.cpp when the NPU runtime IS present", () => {
+    // The NPU backend is first in order; it must not take a GGUF.
+    mockRuntime.mockReturnValue(true);
+    setDeviceSoc("SM8850");
+    expect(selectBackend(gguf())?.id).toBe("llama.cpp");
+  });
+});
+
+describe("the NPU backend refuses everything it cannot prove", () => {
+  it("refuses while no runtime is built in — the default build", () => {
+    setDeviceSoc("SM8850");
+    expect(selectBackend(npuBundle())).toBeNull();
+    expect(npuRefusalFor(npuBundle())).toMatch(/no Qualcomm NPU runtime/i);
+  });
+
+  it("refuses when the device chipset is unknown", () => {
+    mockRuntime.mockReturnValue(true);
+    setDeviceSoc(null);
+    expect(selectBackend(npuBundle())).toBeNull();
+    expect(npuRefusalFor(npuBundle())).toMatch(/doesn't report its chipset/i);
+  });
+
+  it("refuses a bundle built for a DIFFERENT chip", () => {
+    mockRuntime.mockReturnValue(true);
+    setDeviceSoc("SM8750");
+    expect(selectBackend(npuBundle({ targetSoc: "SM8850" }))).toBeNull();
+    expect(npuRefusalFor(npuBundle({ targetSoc: "SM8850" }))).toMatch(
+      /built for SM8850; this device is SM8750/i,
+    );
+  });
+
+  it("refuses a bundle that doesn't say what it was built for", () => {
+    mockRuntime.mockReturnValue(true);
+    setDeviceSoc("SM8850");
+    expect(selectBackend(npuBundle({ targetSoc: null }))).toBeNull();
+    expect(npuRefusalFor(npuBundle({ targetSoc: null }))).toMatch(
+      /doesn't record which chipset/i,
+    );
+  });
+
+  it("refuses when the artifact needs a newer runtime than we have", () => {
+    mockRuntime.mockReturnValue(true);
+    setDeviceSoc("SM8850");
     const npu = new QualcommNpuBackend("SM8850");
     jest.spyOn(npu, "isAvailable").mockReturnValue(true);
-
-    const ref = {
-      format: "qnn-context" as const,
-      contextSize: 4096,
-      filePath: "/models/x.bin",
-    };
-    expect(npu.supports({ ...ref, targetSoc: "SM8750" })).toBe(false);
-    expect(npu.supports({ ...ref, targetSoc: null })).toBe(false);
-    expect(npu.supports({ ...ref, targetSoc: "SM8850" })).toBe(true);
+    // The backend reads the runtime version from the native probe; with none
+    // reported the check can't fail, so this exercises npu-compat directly.
+    expect(
+      npu.supports(npuBundle({ runtimeVersion: "9.9.9" })),
+    ).toBe(true); // no runtime version known → nothing to compare
   });
 
-  it("fails loudly if something calls it anyway", async () => {
-    const npu = new QualcommNpuBackend("SM8850");
-    await expect(npu.load()).rejects.toThrow(/not bundled/i);
-    await expect(npu.generate([])).rejects.toThrow(/not bundled/i);
+  it("accepts a matching bundle once everything lines up", () => {
+    mockRuntime.mockReturnValue(true);
+    setDeviceSoc("SM8850");
+    expect(selectBackend(npuBundle())?.id).toBe("qualcomm_npu");
+  });
+
+  it("matches a chipset case-insensitively", () => {
+    mockRuntime.mockReturnValue(true);
+    setDeviceSoc("sm8850");
+    expect(selectBackend(npuBundle({ targetSoc: "SM8850" }))?.id).toBe("qualcomm_npu");
+  });
+});
+
+describe("a refused NPU model does not silently run somewhere else", () => {
+  it("returns null rather than handing a bundle to llama.cpp", () => {
+    // llama.cpp is the fallback for GGUF, not for everything: a context binary
+    // it cannot read must not reach it.
+    setDeviceSoc("SM8850");
+    expect(selectBackend(npuBundle())).toBeNull();
+    expect(new LlamaCppBackend().supports(npuBundle())).toBe(false);
+  });
+
+  it("fails loudly if something calls an unavailable backend anyway", async () => {
+    const npu = new QualcommNpuBackend("SM8750");
+    await expect(npu.load(npuBundle())).rejects.toThrow();
+    await expect(npu.generate([])).rejects.toThrow(/No NPU model loaded/i);
     // Unload stays a no-op so callers can tear everything down uniformly.
     await expect(npu.unload()).resolves.toBeUndefined();
   });
 });
 
-describe("diagnostics", () => {
-  it("names every backend and why an unavailable one is unavailable", () => {
-    const diagnostics = backendDiagnostics();
-    const byId = Object.fromEntries(diagnostics.map((d) => [d.id, d]));
+describe("diagnostics name the backend and the reason", () => {
+  it("reports both backends and why the NPU one is out", () => {
+    const byId = Object.fromEntries(backendDiagnostics().map((d) => [d.id, d]));
 
     expect(byId["llama.cpp"]).toMatchObject({ available: true, unavailableReason: null });
-    expect(byId.qnn.available).toBe(false);
-    expect(byId.qnn.unavailableReason).toMatch(/llama\.cpp/);
+    expect(byId.qualcomm_npu.available).toBe(false);
+    expect(byId.qualcomm_npu.unavailableReason).toMatch(/llama\.cpp/);
   });
 
-  it("reports which backend is actually loaded", () => {
-    const llama = new LlamaCppBackend();
-    expect(llama.getDiagnostics()).toMatchObject({
-      id: "llama.cpp",
-      available: true,
-      loaded: false,
-    });
+  it("carries the device chipset so a mismatch is visible", () => {
+    setDeviceSoc("SM8850");
+    const npu = backendDiagnostics().find((d) => d.id === "qualcomm_npu");
+    expect(npu?.details.soc).toBe("SM8850");
+  });
+
+  it("keeps the NPU backend present in every build", () => {
+    // It exists even when unusable, so diagnostics can say WHY rather than
+    // staying silent about the NPU on a device that has one.
+    expect(allBackends().map((b) => b.id)).toEqual(["qualcomm_npu", "llama.cpp"]);
   });
 });

@@ -12,6 +12,9 @@ export interface DeviceCaps {
   freeBytes: number;
   totalRamMb: number | null;
   deviceName: string | null;
+  // The chipset ("SM8850"), or null when the platform won't say. Null is
+  // "unknown", never "compatible" — see npu-compat.
+  soc: string | null;
 }
 
 export async function getDeviceCaps(): Promise<DeviceCaps> {
@@ -23,5 +26,6 @@ export async function getDeviceCaps(): Promise<DeviceCaps> {
     freeBytes,
     totalRamMb: info ? Math.round(info.totalMemMb) : null,
     deviceName,
+    soc: info?.soc ?? null,
   };
 }

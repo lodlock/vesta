@@ -12,16 +12,19 @@
 // can. A model no accelerated backend claims falls back to llama.cpp, which is
 // the one that can always run — that fallback is a requirement, not a nicety.
 
-export type ModelFormat = "gguf" | "qnn-context" | "executorch-pte" | "unknown";
+import type { ModelArtifact } from "../../models/types";
 
 /** What a backend needs to know about a model to answer `supports()`. */
 export interface BackendModelRef {
   filePath: string;
-  format: ModelFormat;
+  artifact: ModelArtifact;
   contextSize: number;
-  // The SoC the artifact was compiled for, when the format is target-specific
-  // ("SM8850"). Null for portable formats like GGUF.
+  displayName: string;
+  // The SoC the artifact was compiled for ("SM8850"). Null for portable
+  // formats like GGUF — and a Qualcomm artifact without one is refused, not
+  // guessed at.
   targetSoc?: string | null;
+  runtimeVersion?: string | null;
   chatTemplate?: string | null;
 }
 
@@ -77,14 +80,16 @@ export interface ModelBackend {
   getDiagnostics(): BackendDiagnostics;
 }
 
-/** The format of a model file, from its name. */
-export function formatOf(filePath: string): ModelFormat {
+/**
+ * A guess at the artifact type from a file name, for IMPORT — where the user
+ * hands us a path and nothing else. The registry's stored `artifact` column is
+ * authoritative everywhere else; a `.bin` could be anything, which is why an
+ * imported Qualcomm artifact still has to declare its target SoC before any
+ * backend will touch it.
+ */
+export function guessArtifact(filePath: string): ModelArtifact | "unknown" {
   const lower = filePath.toLowerCase();
   if (lower.endsWith(".gguf")) return "gguf";
-  if (lower.endsWith(".pte")) return "executorch-pte";
-  // Qualcomm context binaries ship as .bin next to a genie_config.json; the
-  // extension alone is ambiguous, so this is a hint the registry double-checks
-  // with the backend's own supports().
-  if (lower.endsWith(".bin")) return "qnn-context";
+  if (lower.endsWith(".bin") || lower.endsWith(".serialized")) return "qairt_context";
   return "unknown";
 }

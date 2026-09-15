@@ -32,7 +32,7 @@ export class LlamaCppBackend implements ModelBackend {
   readonly displayName = "llama.cpp (CPU)";
 
   supports(model: BackendModelRef): boolean {
-    return model.format === "gguf";
+    return model.artifact === "gguf";
   }
 
   async load(model: BackendModelRef): Promise<void> {

@@ -35,6 +35,7 @@ import { warmSessionCache } from "../orchestrator/session-warmer";
 import { clearPrefixSessionCache } from "../llm/session-cache";
 import { persistFailureNotice, modelLoadFailureNotice } from "./notices";
 import { startVestaService } from "../native/vesta-service";
+import { probeNpuRuntime } from "../native/npu";
 import * as FileSystem from "expo-file-system/legacy";
 import {
   ensureLegacyMigration,
@@ -137,6 +138,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       startVestaService().catch(() => {});
       await get().ensureModelLoaded();
     }
+
+    // Ask once whether a Qualcomm runtime exists in this build. Cheap, and it
+    // has to happen before any backend answers supports() — an unprobed
+    // runtime reports unavailable, which is the safe direction but hides a
+    // working NPU.
+    probeNpuRuntime().catch(() => {});
 
     // Run memory decay on startup (lightweight)
     runMemoryDecay().catch(() => {});

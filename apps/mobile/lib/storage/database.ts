@@ -146,6 +146,31 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       UPDATE models SET trust = 'unverified' WHERE trust IS NULL;
     `,
   },
+  {
+    // Which RUNTIME a model is for, and what it would take to run it here.
+    //
+    // A GGUF is portable: if it loads, it runs, on any device. An NPU artifact
+    // is the opposite — compiled for one SoC family, quantized for that
+    // hardware, tied to a runtime version. Running one on the wrong chip is not
+    // slower, it fails. None of that fits in a file path, so it is recorded:
+    //   backend          which ModelBackend claims it ('llama_cpp'|'qualcomm_npu')
+    //   artifact         the file format ('gguf'|'qairt_context'|'geniex_bundle')
+    //   target_soc       the chipset it was compiled for ('SM8850'), null if portable
+    //   runtime_version  the runtime it needs, when the artifact declares one
+    //   bundle_files     JSON [{path, sha256}] when a model is several files that
+    //                    must be verified as ONE unit
+    // Existing rows are GGUF on llama.cpp, which is exactly what they are.
+    version: 5,
+    sql: `
+      ALTER TABLE models ADD COLUMN backend TEXT;
+      ALTER TABLE models ADD COLUMN artifact TEXT;
+      ALTER TABLE models ADD COLUMN target_soc TEXT;
+      ALTER TABLE models ADD COLUMN runtime_version TEXT;
+      ALTER TABLE models ADD COLUMN bundle_files TEXT;
+      UPDATE models SET backend = 'llama_cpp' WHERE backend IS NULL;
+      UPDATE models SET artifact = 'gguf' WHERE artifact IS NULL;
+    `,
+  },
 ];
 
 // Exported for testing. Applies every migration whose version exceeds the DB's
