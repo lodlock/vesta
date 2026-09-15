@@ -181,9 +181,9 @@ Getting the model, two ways:
   storage. No Qualcomm account needed. The list is never hard-coded — Qualcomm
   publishes and unpublishes, so the hub is the source of truth and the button
   becomes **Refresh hub** afterwards.
-  Vesta's preferred model is Qwen3 4B Instruct (2507); at the time of writing
-  Qualcomm does not list it (19 models returned, that one absent), so its card
-  says so with the time of the check and offers Import bundle instead.
+  Vesta's preferred model is Qwen3 4B Instruct (2507). If the hub stops listing
+  it, its card says so with the time of the check and offers Import bundle
+  instead — an absence is always shown with its age, never as permanent.
 - **Models → Qualcomm NPU → Import bundle** registers a `.zip` you exported
   yourself with `qai-hub-models` (a free Qualcomm MyAccount, on a Linux/macOS
   host). Same chipset guard, same layout validation, same hashing as a

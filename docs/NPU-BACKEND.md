@@ -437,18 +437,74 @@ So the dry run is assembled from what is public. What is lost is the
 per-precision size. What is kept is the part that mattered: knowing whether an
 asset exists for this chip before spending gigabytes finding out.
 
-### Is the SM8850 asset published? — answered: no
+### Is the SM8850 asset published? — yes, and two of our strings were wrong
 
-**No, as of the on-device check.** `listHubModels()` returned **19 models** on a
-OnePlus 15, and `ai-hub-models/Qwen3-4B-Instruct-2507` was not among them. That
-closes the `-100010`: the model is genuinely not in the public catalogue, and no
-client-side change can conjure it. It is consistent with everything seen from
-outside — the `release-assets.yaml` entry exists, its `s3_key` still points under
-`pre_release_assets/`, and every URL shape returns S3 `403`.
+An earlier revision of this document recorded "answered: no". **That was wrong,
+and it was wrong because of a bug on this side.** `listHubModels()` does return
+Qwen3-4B-Instruct-2507 — as **`qualcomm/Qwen3-4B-Instruct-2507`**. Vesta was
+asking for `ai-hub-models/Qwen3-4B-Instruct-2507`, the identifier in Qualcomm's
+Android sample `model_list.json`, so the exact-match lookup missed and the card
+reported the model unavailable while the hub was listing it.
 
-It is **not** permanent, and nothing in the UI says it is. Qualcomm publishes on
-its own schedule, so the answer carries a timestamp everywhere it is shown and
-a refresh is always one tap away.
+Qualcomm publicly lists exactly the asset we want: Qwen3-4B-Instruct-2507,
+`GENIEX_QAIRT`, `w4a16`, Snapdragon 8 Elite Gen 5 Mobile, QAIRT 2.45.
+
+Two independent string bugs produced three indistinguishable `-100010`s:
+
+| Attempt | `model_name` | `chipset` | Verdict |
+| --- | --- | --- | --- |
+| 1 | `ai-hub-models/…` | `SM8850` | name wrong |
+| 2 | `ai-hub-models/…` | `Snapdragon 8 Elite Gen 5 QRD` (`ChipsetInfo.name`) | both wrong |
+| 3 | `qualcomm/…` | `qualcomm-snapdragon-8-elite-gen5` (`HubModel.chipsets`) | name right, chipset wrong |
+
+Note what that table shows: **the correct name and the SoC identifier have never
+been sent together.** Attempt 3 fixed one bug and introduced another.
+
+#### The two chipset vocabularies
+
+This is the mistake worth remembering, because the types invite it:
+
+| | Field | Example | Use |
+| --- | --- | --- | --- |
+| Catalog metadata | `HubModel.chipsets` | `qualcomm-snapdragon-8-elite-gen5` | the release manifest's `supported_chipsets` asset key. Display, and deciding compatibility. |
+| Pull parameter | `ModelPullInput.chipset` | `SM8850` | the **SoC identifier**. Qualcomm's Android API documents this field with exactly this example — SM8750 = Snapdragon 8 Elite, SM8850 = Snapdragon 8 Elite Gen 5. |
+| Runtime device name | `ChipsetInfo.name` | `Snapdragon 8 Elite Gen 5 QRD` | what `listChipsets()` calls the entry; its `aliases` carry both of the above. |
+
+Three spellings of one chip, on three different beans. The reasoning that went
+wrong was "the hub's own spelling must be what the hub wants back" — plausible,
+never verified, and false. `HubModel.chipsets` and `ModelPullInput.chipset` are
+different fields on different types and the SDK never claimed they matched.
+
+`CompatibleHubModel` now names them apart — `hubChipsetKey` versus
+`canonicalSoc` — so the two cannot be swapped by accident again, and the Models
+screen shows both, labelled.
+
+#### What is unchanged
+
+- **Compatibility still runs on the canonical equivalence machinery.** The SoC
+  identifier is *derived* from the runtime's own `listChipsets()` table, not
+  pattern-matched out of the asset key: with no table, nothing resolves, which
+  is the same refusal the load-time guard makes. No fuzzy matching was added.
+- **Precision stays null.** `HubModel` publishes none, QAIRT bundles are
+  pre-quantized, and nothing in the 0.4.0 API establishes that the field is
+  required. Changing it at the same time as the chipset would also have
+  destroyed the diagnostic value of the next attempt — one variable at a time.
+
+#### Diagnosing the next one
+
+The full request is logged before the pull and **again at the moment it fails**,
+beside the rc and `Build.SOC_MODEL`:
+
+```
+adb logcat -s VestaNpu
+VestaNpu  I  pull: model=qualcomm/Qwen3-4B-Instruct-2507 chipset=SM8850 …
+VestaNpu  W  pull FAILED rc=-100010 for model=… chipset=… (Build.SOC_MODEL=SM8850) :: …
+```
+
+The request also rides in the on-screen error now, because an rc with no subject
+cannot be acted on — twice a `-100010` has turned out to be one of these three
+strings rather than a missing asset. No credential appears in either:
+`hf_token` is pinned null in `pullInputFrom()` and never read from config.
 
 ### The hub is the catalogue
 
