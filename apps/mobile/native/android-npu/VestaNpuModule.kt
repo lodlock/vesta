@@ -61,12 +61,19 @@ import java.security.MessageDigest
  *   ModelManagerWrapper.getPaths(name): ModelPaths?           suspend
  *   ModelManagerWrapper.detectChipset(offline): String?       suspend
  *   ModelManagerWrapper.listChipsets(): List<ChipsetInfo>     suspend
+ *   ModelManagerWrapper.listHubModels(domain): List<HubModel> suspend
+ *   ModelManagerWrapper.resolveAlias(name): String?           suspend
  *   ModelManagerWrapper.remove(name): Int                     suspend
  *   LlmWrapper.builder().llmCreateInput(input).build()        suspend, Result<LlmWrapper>
  *   LlmCreateInput(model_path, tokenizer_path, ModelConfig, runtime_id, compute_unit)
  *   applyChatTemplate(messages, tools, enableThinking, addGenerationPrompt)
  *   generateStreamFlow(prompt, GenerationConfig): Flow<LlmStreamResult>
  *   stopStream() / destroy()
+ *
+ * Everything in `com.geniex.sdk.jni` is INTERNAL to the SDK and unusable from
+ * here, however public it looks in `javap` — Kotlin `internal` compiles to JVM
+ * `public`, and only the Kotlin metadata carries the distinction. See the note
+ * above the hub interrogation block.
  *
  * GenieX is Kotlin, so everything the bytecode exposes as `getX()` is a
  * PROPERTY, not a callable getter: `profile.ttftMs`, never
@@ -403,14 +410,42 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
     // the whole reason these exist: an `rc=-100010` (hub model not found) is
     // unactionable without knowing what the hub DOES have, and a hand-written
     // answer to that question is stale the moment Qualcomm publishes anything.
+    //
+    // ## What is and is not callable
+    //
+    // `ModelManagerWrapper` is the public surface, and it is the whole of it:
+    //
+    //     listHubModels(domain) : List<HubModel>   ← used
+    //     resolveAlias(name)    : String?          ← used
+    //     listChipsets()        : List<ChipsetInfo>← used (chipset identity)
+    //     pullFlow(input)       : Flow<PullEvent>  ← used
+    //     getPaths / getType / list / remove / clean / detectChipset / init
+    //
+    // `com.geniex.sdk.jni.ModelManager` carries two more that would be useful
+    // here — `query(ModelPullInput)`, a dry run returning per-precision
+    // candidates and sizes, and `lastErrorMessage()`, the native text behind a
+    // code. Neither is reachable: the class is **internal** in the SDK's Kotlin
+    // metadata, and `javap` does not show that, because Kotlin `internal`
+    // compiles to JVM `public`. An earlier version of this file constructed one
+    // directly on exactly that misreading and did not compile. The only
+    // reference to the type anywhere in the wrapper's signatures is a synthetic
+    // `access$getNative$p()` whose RETURN type is equally inaccessible, so there
+    // is no supported path and reflection would be breaking an encapsulation
+    // the vendor declared deliberately.
+    //
+    // So the dry run is assembled from what IS public: `listHubModels()` gives
+    // the model names and the chipsets each is offered for, `resolveAlias()`
+    // resolves a name the catalogue may list differently, and the resolution
+    // itself happens in TypeScript (lib/models/npu-hub.ts) where it is
+    // testable. What is lost is the per-precision size, which nothing depended
+    // on. What is kept is the thing that mattered: knowing whether an asset
+    // exists for this chip before spending gigabytes finding out.
 
     /**
-     * One ModelPullInput, built once, used by pull(), queryModel() and
-     * importBundle().
+     * One ModelPullInput, built once, used by both pull() and importBundle().
      *
-     * Shared on purpose. A dry run that resolves a DIFFERENT request from the
-     * one the download will make is worse than no dry run at all — it would
-     * report success for something we never asked for.
+     * Shared on purpose: a download and an import that resolved differently
+     * would be two definitions of the same request.
      *
      * `hf_token` is left null here and is never read from the config: nothing
      * in Vesta's NPU path uses a credential, and this keeps it impossible for
@@ -435,20 +470,21 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         )
     }
 
-    /** What a request looks like, for the log and for the error report. */
-    private fun describeRequest(input: ModelPullInput): WritableMap {
-        val out = Arguments.createMap()
-        out.putString("modelName", input.model_name)
-        out.putString("precision", input.precision)
-        out.putString("chipset", input.chipset)
-        out.putString("hub", input.hub.name)
-        out.putString("modelType", input.model_type.name)
-        out.putString("localPath", input.local_path)
-        // Pinned for every session this module creates; stated here so one log
-        // line carries the whole request rather than half of it.
-        out.putString("runtimeId", RuntimeIdValue.QAIRT.value)
-        out.putString("computeUnit", ComputeUnitValue.NPU.value)
-        return out
+    /**
+     * The whole request on one line, for the log.
+     *
+     * `model_type` is `ModelType?` in the SDK, so it is read with `?.` and
+     * reported as "unspecified" when absent. `pullInputFrom` always passes
+     * ModelType.LLM, so in practice it is never null — but the declared
+     * contract is what this has to be written against, and `!!` on a value
+     * that is merely expected is how a crash gets shipped. `hub` is NOT
+     * nullable (the compiler accepts `input.hub.name`) and is read directly.
+     */
+    private fun describeRequest(input: ModelPullInput): String {
+        val type = input.model_type?.name ?: "unspecified"
+        return "model=${input.model_name} chipset=${input.chipset} " +
+            "precision=${input.precision} hub=${input.hub.name} type=$type " +
+            "runtime=${RuntimeIdValue.QAIRT.value} compute=${ComputeUnitValue.NPU.value}"
     }
 
     /**
@@ -500,42 +536,17 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * `rc=<n>` first and always, because that is the only token that can be
      * looked up against Qualcomm's error definitions, and the TypeScript side
      * parses it back out to choose a readable sentence. The runtime's own
-     * message and its `lastErrorMessage()` follow when they say something the
-     * code does not — `-100010` alone does not tell you WHICH model the hub
-     * could not find.
-     */
-    private fun formatPullFailure(rc: Int, message: String): String {
-        val native = lastNativeError()
-        val parts = mutableListOf("rc=$rc")
-        if (message.isNotBlank()) parts.add(message)
-        if (native != null && native != message) parts.add(native)
-        return parts.joinToString(": ")
-    }
-
-    /**
-     * The native model manager, for the two calls the Kotlin wrapper does not
-     * re-export: `query()` and `lastErrorMessage()`.
+     * message follows, because `-100010` alone does not tell you WHICH model
+     * the hub could not find.
      *
-     * Instantiating a second one is safe, and that is not an assumption: the
-     * class has NO instance fields (verified with javap), and
-     * `ModelManagerWrapper`'s own static initializer does nothing but
-     * `ModelManager()`. Every method is a proxy onto process-global native
-     * state that `ensureSdk()` has already initialized.
-     *
-     * Used only inside try/catch, so an SDK release that drops or renames
-     * either method degrades to "not reported" instead of taking a screen down.
+     * `PullEvent.Error(code, message)` is the whole public error surface here.
+     * `ModelManager.lastErrorMessage()` would sometimes say more, but it lives
+     * on an internal class — see the note on hub interrogation above — so the
+     * flow's own message is what there is, and it is enough to identify the
+     * request when read beside the `pull:` log line.
      */
-    private val nativeManager: com.geniex.sdk.jni.ModelManager by lazy {
-        com.geniex.sdk.jni.ModelManager()
-    }
-
-    /** The runtime's own last error text, or null. Never carries a credential. */
-    private fun lastNativeError(): String? =
-        try {
-            nativeManager.lastErrorMessage()?.takeIf { it.isNotBlank() }
-        } catch (e: Throwable) {
-            null
-        }
+    private fun formatPullFailure(rc: Int, message: String): String =
+        if (message.isBlank()) "rc=$rc" else "rc=$rc: $message"
 
     /**
      * Every model the hub offers, with the chipsets it offers each one FOR.
@@ -577,64 +588,6 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                 android.util.Log.w(TAG, "listHubModels failed", e)
                 val out = Arguments.createMap()
                 out.putString("error", e.message ?: e.toString())
-                out.putString("nativeMessage", lastNativeError())
-                promise.resolve(out)
-            }
-        }
-    }
-
-    /**
-     * Resolves a pull WITHOUT downloading it.
-     *
-     * `ModelManager.query` takes the same ModelPullInput the download takes and
-     * returns what the hub would actually serve: the resolved model name, the
-     * runtime the asset was built for, and one candidate per available
-     * precision with its size. That size is the only published figure for these
-     * bundles — the release manifest carries none and the object cannot be
-     * HEADed — so it is also the one way to know the download size before
-     * starting it rather than after.
-     *
-     * A failure here costs nothing, which is exactly what should precede a
-     * multi-gigabyte download.
-     */
-    @ReactMethod
-    fun queryModel(configJson: String, promise: Promise) {
-        scope.launch {
-            val out = Arguments.createMap()
-            try {
-                if (!ensureSdk()) {
-                    promise.reject("NPU_UNAVAILABLE", initError ?: "No usable Qualcomm NPU runtime")
-                    return@launch
-                }
-                val input = pullInputFrom(JSONObject(configJson))
-                out.putMap("request", describeRequest(input))
-                android.util.Log.i(TAG, "query: model=${input.model_name} chipset=${input.chipset} precision=${input.precision} hub=${input.hub.name}")
-
-                val result = nativeManager.query(input)
-                if (result == null) {
-                    // The native side answers null for "nothing resolved" and
-                    // leaves the reason in lastErrorMessage.
-                    out.putString("error", lastNativeError() ?: "The hub did not resolve this model.")
-                    promise.resolve(out)
-                    return@launch
-                }
-                out.putString("resolvedName", result.model_name)
-                out.putString("runtimeId", result.runtime_id)
-                out.putString("modelType", result.model_type.name)
-                val candidates = Arguments.createArray()
-                for (c in result.candidates) {
-                    val entry = Arguments.createMap()
-                    entry.putString("precision", c.precision)
-                    entry.putDouble("sizeBytes", c.size.toDouble())
-                    candidates.pushMap(entry)
-                }
-                out.putArray("candidates", candidates)
-                promise.resolve(out)
-            } catch (e: Throwable) {
-                android.util.Log.w(TAG, "query failed", e)
-                out.putString("error", e.message ?: e.toString())
-                out.putString("nativeMessage", lastNativeError())
-                (e as? ModelManagerWrapper.GenieXModelError)?.let { out.putInt("rc", it.code) }
                 promise.resolve(out)
             }
         }
@@ -689,12 +642,7 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     // which name, which chipset or which precision was asked
                     // for, and those are exactly the three things that decide
                     // whether an asset resolves.
-                    android.util.Log.i(
-                        TAG,
-                        "pull: model=${input.model_name} chipset=${input.chipset} " +
-                            "precision=${input.precision} hub=${input.hub.name} " +
-                            "runtime=${RuntimeIdValue.QAIRT.value} compute=${ComputeUnitValue.NPU.value}",
-                    )
+                    android.util.Log.i(TAG, "pull: ${describeRequest(input)}")
 
                     val failure = collectPull(input, modelName)
 
@@ -776,7 +724,10 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     val input = pullInputFrom(
                         JSONObject(configJson).put("hub", HubSource.LOCALFS.name),
                     )
-                    android.util.Log.i(TAG, "import: model=${input.model_name} from=${source.absolutePath}")
+                    android.util.Log.i(
+                        TAG,
+                        "import: ${describeRequest(input)} from=${source.absolutePath}",
+                    )
 
                     val failure = collectPull(input, input.model_name)
                     if (failure != null) {

@@ -51,7 +51,7 @@ import {
   npuPull,
   npuImportBundle,
   npuHubModels,
-  npuQueryModel,
+  npuResolveAlias,
   npuCancelPull,
   npuBundleInfo,
   npuRemoveBundle,
@@ -271,11 +271,19 @@ export const useModelStore = create<ModelState>((set, get) => ({
     // before anything is downloaded. A "not offered for this chipset" answer
     // here is worth far more than the same answer as an rc after a failed
     // pull: it can name what IS offered.
+    // resolveAlias is asked in parallel: the catalogue may list this model
+    // under a name the manager resolves ours to, and it is one of the few
+    // genuinely public ways to ask the runtime anything about a name.
+    const [hub, alias] = await Promise.all([
+      get().loadNpuHub(),
+      npuResolveAlias(model.modelName),
+    ]);
     const resolution = resolveAgainstHub(
-      await get().loadNpuHub(),
+      hub,
       model.modelName,
       npu.soc,
       npu.chipsets,
+      alias,
     );
     const unavailable = explainResolution(resolution, model.displayName, npu.soc);
     if (unavailable) {
@@ -323,47 +331,19 @@ export const useModelStore = create<ModelState>((set, get) => ({
     });
 
     try {
-      // The chipset string comes from the HUB'S OWN list for this model, not
-      // from our catalog and not from Build.SOC_MODEL. Three vocabularies name
-      // this silicon and only one of them resolves an asset; asking removes the
-      // guess. `unreachable` keeps the catalog's target, because the runtime's
-      // verdict is the authority anyway and a phone that cannot reach the hub
-      // should still be allowed to try.
+      // Both strings come from the HUB'S OWN catalogue where it could be
+      // reached, not from our catalog and not from Build.SOC_MODEL. Three
+      // vocabularies name this silicon and only one of them resolves an asset;
+      // asking removes the guess. `unreachable` keeps the catalog's own values,
+      // because the runtime's verdict is the authority anyway and a phone that
+      // cannot reach the hub should still be allowed to try.
       const chipset =
         resolution.status === "available" ? resolution.chipset : model.targetSoc;
-
-      // A dry run first. It costs one request, it cannot leave anything on
-      // disk, and it answers the question a failed download answers far more
-      // expensively: does this model, at this precision, for this chipset,
-      // resolve to an asset at all?
-      const probe = await npuQueryModel({
-        modelName: model.modelName,
-        chipset,
-        precision: model.precision,
-        hub: model.hub,
-        displayName: model.displayName,
-      });
-      if (probe?.error) {
-        // Reported with the request beside it. An rc with no subject — no
-        // model name, no chipset, no precision — cannot be acted on.
-        const asked = probe.request;
-        const detail = asked
-          ? ` (asked for ${asked.modelName} · ${asked.chipset} · ${asked.precision ?? "default precision"} · ${asked.hub})`
-          : "";
-        await removeModel(row.id);
-        await get().refresh();
-        set({
-          error:
-            `${model.displayName}: ${describeGenieXFailure(probe.error)}${detail}` +
-            (probe.nativeMessage && probe.nativeMessage !== probe.error
-              ? ` — ${probe.nativeMessage}`
-              : ""),
-        });
-        return;
-      }
+      const modelName =
+        resolution.status === "available" ? resolution.modelName : model.modelName;
 
       const bundle = await npuPull({
-        modelName: model.modelName,
+        modelName,
         chipset,
         precision: model.precision,
         hub: model.hub,

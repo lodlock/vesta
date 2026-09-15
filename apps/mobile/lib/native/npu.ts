@@ -21,7 +21,6 @@ interface NpuNativeModule {
   pull(configJson: string): Promise<NpuBundleInfo>;
   importBundle(configJson: string): Promise<NpuBundleInfo>;
   hubModels(domain: string | null): Promise<NpuHubModelsResult>;
-  queryModel(configJson: string): Promise<NpuModelQuery>;
   resolveModelAlias(modelName: string): Promise<string | null>;
   cancelPull(): void;
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
@@ -147,40 +146,6 @@ export interface NpuHubModelsResult {
   models?: NpuHubModel[];
   error?: string | null;
   nativeMessage?: string | null;
-}
-
-/** A precision the hub can serve, with the size it would download. */
-export interface NpuPrecisionCandidate {
-  precision: string | null;
-  sizeBytes: number;
-}
-
-/**
- * What `ModelManager.query()` says a pull WOULD resolve to — no download.
- *
- * `request` echoes exactly what was asked, so a failure report carries its own
- * subject: an rc with no model name, chipset and precision beside it cannot be
- * acted on.
- */
-export interface NpuModelQuery {
-  request?: {
-    modelName: string | null;
-    precision: string | null;
-    chipset: string | null;
-    hub: string | null;
-    modelType: string | null;
-    localPath: string | null;
-    runtimeId: string | null;
-    computeUnit: string | null;
-  };
-  resolvedName?: string | null;
-  runtimeId?: string | null;
-  modelType?: string | null;
-  candidates?: NpuPrecisionCandidate[];
-  /** Set when nothing resolved. The runtime's own words where it gave any. */
-  error?: string | null;
-  nativeMessage?: string | null;
-  rc?: number;
 }
 
 export interface NpuImportConfig {
@@ -361,18 +326,6 @@ export async function npuHubModels(
   if (!moduleAvailable()) return null;
   try {
     return await Npu!.hubModels(domain);
-  } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-/** Dry-runs a pull. Cheap, and exactly what should precede a multi-GB download. */
-export async function npuQueryModel(
-  config: NpuPullConfig,
-): Promise<NpuModelQuery | null> {
-  if (!moduleAvailable()) return null;
-  try {
-    return await Npu!.queryModel(JSON.stringify(config));
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }

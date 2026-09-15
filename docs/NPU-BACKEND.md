@@ -350,7 +350,7 @@ Against the acquisition questions:
 | Exact chipset selection | `SM8850`. Documented by Qualcomm as the GenieX id for Snapdragon 8 Elite Gen 5, and the same string Android's `Build.SOC_MODEL` reports on this device. |
 | Quantization | `w4a16` — int4 weights, int16 activations, what AI Hub compiles LLM bundles at. |
 | Expected files | `metadata.json`, one or more `*.bin`, `tokenizer.json`, `tokenizer_config.json`. Exact names and sizes are recorded from disk at install; nothing is assumed. |
-| Bundle size | Obtainable up front since `query()` was wired in: `PrecisionCandidate.size`, per precision. Previously not published anywhere reachable — the manifest carries no size and the object cannot be HEADed. The catalog carries ~3 GB as an order of magnitude and the UI marks it "approx." until the real total is measured from disk. |
+| Bundle size | Not published anywhere reachable — the manifest carries no size and the object cannot be HEADed. The catalog carries ~3 GB as an order of magnitude and the UI marks it "approx." until the real total is measured from disk. |
 | Companion files | None beyond the bundle. No `genie_config.json`, no HTP backend-extensions JSON, no separate QAIRT SDK install — the AAR carries `libQnnHtp*`, the V79/V81 skels and the stubs. |
 | Where the files go | `filesDir/geniex/…` — app-private, and nowhere near the `.gguf` directory. |
 | Credentials in git? | None involved. `.gitignore` already covers `.qai-hub/`, `qai_hub_token*` and the artifact extensions. |
@@ -379,41 +379,63 @@ precision — all three supplied from Vesta's own catalog. A hand-maintained cop
 of someone else's catalogue is wrong the moment they change it, and cannot say
 which of the three is wrong when it is.
 
-GenieX carries the answer, and `javap` on `com.geniex.sdk.jni.ModelManager`
-shows rather more of it than the Kotlin wrapper re-exports:
+GenieX answers the question itself. The **entire public model-management
+surface** is `ModelManagerWrapper`:
 
-| Native call | Re-exported by `ModelManagerWrapper`? | What it answers |
-| --- | --- | --- |
-| `listHubModels(domain)` → `HubModel[]` | yes | every model the hub offers, and **the chipsets it offers each one for** |
-| `query(ModelPullInput)` → `ModelQuery` | **no** | what a pull WOULD resolve to — resolved name, runtime, and one `PrecisionCandidate{precision, size}` per available precision. No download. |
-| `lastErrorMessage()` | **no** | the runtime's own text behind a code — e.g. `AI Hub model <name> not found on hub` |
-| `resolveAlias(name)` | yes | what a model name resolves to |
-| `listChipsets()` → `ChipsetInfo[]` | yes | the chipset equivalence table (see §5's chipset identity note) |
+| Public call | Used for |
+| --- | --- |
+| `listHubModels(domain)` → `HubModel{name, model_type, chipsets}` | every model the hub offers, and **the chipsets it offers each one for** |
+| `resolveAlias(name)` → `String?` | a name the catalogue may list in resolved form |
+| `listChipsets()` → `ChipsetInfo[]` | the chipset equivalence table (§5, chipset identity) |
+| `pullFlow(input)` → `Flow<PullEvent>` | the download itself, and `PullEvent.Error(code, message)` |
+| `getPaths` / `getType` / `list` / `remove` / `clean` / `detectChipset` / `init` | bundle bookkeeping |
 
-Vesta now uses all five. The consequences:
+The consequences:
 
-- **The chipset string comes from `HubModel.chipsets`**, matched to this device
-  through the runtime's own chipset table, not from `Build.SOC_MODEL` and not
-  from the catalog's `targetSoc`. Three vocabularies name this silicon —
-  Android's `SM8850`, GenieX's device name, AI Hub's
-  `qualcomm-snapdragon-8-elite-gen5` — and only one of them resolves an asset.
-  Asking removes the guess.
-- **`query()` runs before every pull.** It costs one request, leaves nothing on
-  disk, and answers the question a failed download answers far more expensively.
-  Its `PrecisionCandidate.size` is also the only published size figure for these
-  bundles. Not yet shown in the UI — the install card still carries the
-  catalog approximation until the real total is measured from disk — but it is
-  now obtainable before a download rather than only after one.
+- **Both the model name and the chipset come from the hub's own catalogue.**
+  Three vocabularies name this silicon — Android's `SM8850`, GenieX's device
+  name, AI Hub's `qualcomm-snapdragon-8-elite-gen5` — and only one resolves an
+  asset. The chipset is matched to this device through the runtime's own
+  chipset table, so the same canonical equivalence the compatibility guard uses
+  decides it, with the same refusal to guess.
+- **`resolveAlias()` is tried after the literal name**, so a model the
+  catalogue lists in resolved form is still found.
 - **"Not offered for this chipset" and "no such model" are told apart**, because
   they have different next steps and `-100010` flattens them into one number.
+- **The resolution runs before the placeholder row exists**, so a hub that says
+  no costs nothing.
 
-`query()` and `lastErrorMessage()` are reached through a separately constructed
-`com.geniex.sdk.jni.ModelManager`. That is safe rather than lucky: the class has
-**no instance fields** (verified with `javap`), and `ModelManagerWrapper`'s own
-static initializer does nothing but `ModelManager()` — every method is a proxy
-onto process-global native state that `ensureSdk()` has already initialized.
-Both calls are wrapped in `try/catch`, so an SDK release that drops or renames
-either degrades to "not reported" rather than taking a screen down.
+#### What is NOT callable, and why this document said otherwise
+
+`com.geniex.sdk.jni.ModelManager` carries two calls that would be better still —
+`query(ModelPullInput)`, a dry run returning per-precision candidates and their
+sizes, and `lastErrorMessage()`, the native text behind a code. An earlier
+revision of this file described them as usable. **They are not.**
+
+The class is `internal` in the SDK's Kotlin metadata. `javap` reports it as
+`public final class`, because Kotlin `internal` compiles to JVM `public` and the
+distinction lives only in the `@Metadata` annotation that the Kotlin compiler
+reads. Reading the JVM signature and concluding "public API" was the error; the
+compiler is the authority and it says:
+
+```
+Cannot access 'class ModelManager : Any': it is internal in file
+```
+
+The corroborating evidence was there to be read: no public wrapper method
+anywhere takes or returns a `com.geniex.sdk.jni` type. Every reference is a
+private field plus a synthetic `access$…$p` accessor — `ModelManagerWrapper`
+holds a `ModelManager`, `LlmWrapper` an `Llm`, `VlmWrapper` a `Vlm`, all three
+the same shape. That is an implementation package, not an API.
+
+There is no public companion, no re-export and no supported alternative route.
+Reflection would reach it, and is deliberately not used: it would break an
+encapsulation the vendor declared on purpose, and would bind Vesta to a private
+signature that can change in any patch release.
+
+So the dry run is assembled from what is public. What is lost is the
+per-precision size. What is kept is the part that mattered: knowing whether an
+asset exists for this chip before spending gigabytes finding out.
 
 ### Is the SM8850 asset published?
 
@@ -508,7 +530,8 @@ Zip that directory and import it. `genie_bundle/` and `*.bin` are in
 ### Error codes
 
 `rc` is never obscured. The native side formats every failure as
-`rc=<n>: <message>[: <lastErrorMessage>]` — code first and always, because it is
+`rc=<n>: <message>`, where `<message>` is `PullEvent.Error.message` — code
+first and always, because it is
 the only token that can be looked up against Qualcomm's definitions — and
 `lib/models/npu-errors.ts` turns it into a sentence while keeping the number in
 the text the user sees.

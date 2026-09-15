@@ -146,6 +146,61 @@ describe("resolving a catalog entry against the hub", () => {
     expect(resolution.status).toBe("unknown-model");
   });
 
+  it("returns the HUB'S spelling of the model name, not ours", () => {
+    // Same principle as the chipset: the pull is given the catalogue's own
+    // string, because that is the one that resolves an asset.
+    const entry = { ...offering(["SM8850"]), name: "ai-hub-models/Qwen3-4B-Instruct-2507" };
+    const resolution = resolveAgainstHub(
+      catalog([entry]),
+      "AI-HUB-MODELS/qwen3-4b-instruct-2507",
+      "SM8850",
+      TABLE,
+    );
+    expect(resolution.status).toBe("available");
+    if (resolution.status === "available") {
+      expect(resolution.modelName).toBe("ai-hub-models/Qwen3-4B-Instruct-2507");
+    }
+  });
+
+  it("falls back to the alias the manager resolved, when the literal name misses", () => {
+    // resolveAlias() is public where query() is not, so it is what stands in
+    // for a name the catalogue lists differently.
+    const resolution = resolveAgainstHub(
+      catalog([offering(["SM8850"])]),
+      "ai-hub-models/Qwen3-4B",
+      "SM8850",
+      TABLE,
+      MODEL,
+    );
+    expect(resolution.status).toBe("available");
+    if (resolution.status === "available") {
+      expect(resolution.modelName).toBe(MODEL);
+    }
+  });
+
+  it("prefers the literal name over the alias when both match", () => {
+    const resolution = resolveAgainstHub(
+      catalog([offering(["SM8850"]), { ...offering(["SM8850"]), name: "other/name" }]),
+      MODEL,
+      "SM8850",
+      TABLE,
+      "other/name",
+    );
+    expect(resolution.status).toBe("available");
+    if (resolution.status === "available") expect(resolution.modelName).toBe(MODEL);
+  });
+
+  it("still refuses when neither the name nor its alias is listed", () => {
+    const resolution = resolveAgainstHub(
+      catalog([offering(["SM8850"])]),
+      "ai-hub-models/Nope",
+      "SM8850",
+      TABLE,
+      "ai-hub-models/Also-Nope",
+    );
+    expect(resolution.status).toBe("unknown-model");
+  });
+
   it("treats an unreachable hub as 'unknown', never as 'refused'", () => {
     // A phone with no connectivity must still be allowed to attempt the pull
     // with the catalog's own target — the runtime's verdict is the authority.

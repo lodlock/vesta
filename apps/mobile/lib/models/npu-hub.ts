@@ -41,8 +41,11 @@ export type HubCatalog =
   | { ok: false; error: string };
 
 export type HubResolution =
-  /** The hub has it for this device; `chipset` is the exact string to pull with. */
-  | { status: "available"; chipset: string; entry: HubModel }
+  /**
+   * The hub has it for this device. Both `modelName` and `chipset` are the
+   * HUB'S OWN spellings and are what the pull must be given.
+   */
+  | { status: "available"; modelName: string; chipset: string; entry: HubModel }
   /** The hub knows the model but not for this chipset. */
   | { status: "wrong-chipset"; entry: HubModel; offered: string[] }
   /** The hub has no such model name at all. */
@@ -58,9 +61,17 @@ export type HubResolution =
  * name: '…' must be 'org/repo'"); matching it fuzzily would install a different
  * model than the one the catalog entry promised.
  */
-function entryFor(models: HubModel[], modelName: string): HubModel | undefined {
-  const wanted = modelName.trim().toLowerCase();
-  return models.find((m) => m.name.trim().toLowerCase() === wanted);
+function entryFor(
+  models: HubModel[],
+  names: (string | null | undefined)[],
+): HubModel | undefined {
+  for (const name of names) {
+    if (!name) continue;
+    const wanted = name.trim().toLowerCase();
+    const hit = models.find((m) => m.name.trim().toLowerCase() === wanted);
+    if (hit) return hit;
+  }
+  return undefined;
 }
 
 /**
@@ -101,10 +112,17 @@ export function resolveAgainstHub(
   modelName: string,
   deviceSoc: string | null,
   table: RuntimeChipset[] | undefined,
+  /**
+   * What `ModelManagerWrapper.resolveAlias()` made of the name, when it was
+   * asked. Tried after the literal name, because the catalogue may list a
+   * model under its resolved form — and because that call is one of the few
+   * genuinely public ways to ask the runtime about a name at all.
+   */
+  aliasName?: string | null,
 ): HubResolution {
   if (!catalog.ok) return { status: "unreachable", reason: catalog.error };
 
-  const entry = entryFor(catalog.models, modelName);
+  const entry = entryFor(catalog.models, [modelName, aliasName]);
   if (!entry) {
     return {
       status: "unknown-model",
@@ -116,7 +134,7 @@ export function resolveAgainstHub(
   if (!chipset) {
     return { status: "wrong-chipset", entry, offered: entry.chipsets };
   }
-  return { status: "available", chipset, entry };
+  return { status: "available", modelName: entry.name, chipset, entry };
 }
 
 /** The sentence a non-`available` resolution should reach the user as. */
