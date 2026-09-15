@@ -33,11 +33,17 @@ jest.mock("../../llm-engine", () => ({
   getLastCompletion: jest.fn(() => null),
 }));
 jest.mock("../../../native/npu", () => ({
+  // The default build's answers: the bridge is not compiled in, so nothing is
+  // available and there is no failure reason to report either.
+  isNpuBuild: jest.fn(() => false),
   isNpuRuntimeAvailable: jest.fn(() => false),
+  npuUnavailableReason: jest.fn(() => null),
   npuRuntimeInfo: jest.fn(() => null),
   npuLoad: jest.fn(),
   npuGenerate: jest.fn(),
   npuUnload: jest.fn(async () => {}),
+  npuCancel: jest.fn(),
+  onNpuToken: jest.fn(() => () => {}),
 }));
 
 const mockRuntime = isNpuRuntimeAvailable as jest.MockedFunction<

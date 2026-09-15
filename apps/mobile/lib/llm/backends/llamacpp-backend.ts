@@ -85,6 +85,8 @@ export class LlamaCppBackend implements ModelBackend {
       content: result.content,
       tokensPredicted: result.tokensPredicted,
       tokensPerSecond: result.timings.predictedPerSecond,
+      tokensEvaluated: result.tokensEvaluated,
+      stoppedByUser: result.stoppedByUser,
     };
   }
 

@@ -11,11 +11,10 @@
 // artifact's target against and therefore claims nothing.
 
 import { LlamaCppBackend } from "./llamacpp-backend";
-import { QualcommNpuBackend } from "./qnn-backend";
+import { npuBackend } from "./npu-instance";
 import type { BackendDiagnostics, BackendModelRef, ModelBackend } from "./types";
 import type { InstalledModel } from "../../models/types";
-
-const npuBackend = new QualcommNpuBackend();
+import type { RuntimeChipset } from "../../models/chipset-identity";
 
 // Accelerated first, general-purpose last.
 const backends: ModelBackend[] = [npuBackend, new LlamaCppBackend()];
@@ -23,6 +22,22 @@ const backends: ModelBackend[] = [npuBackend, new LlamaCppBackend()];
 /** Tells the NPU backend what chipset it is running on. */
 export function setDeviceSoc(soc: string | null): void {
   npuBackend.setSoc(soc);
+}
+
+/**
+ * Hands the NPU backend the runtime's own chipset table, so the chipset Android
+ * reports and the chipset the runtime recognises can be cross-checked instead
+ * of one being taken on faith. Called once, after the probe.
+ */
+export function setRuntimeChipsets(
+  known: RuntimeChipset[] | undefined,
+): void {
+  npuBackend.setRuntimeChipsets(known);
+}
+
+/** The NPU backend itself, for the paths that must address it by name. */
+export function qualcommNpuBackend() {
+  return npuBackend;
 }
 
 /** Exposed for tests and the diagnostics screen. */
@@ -58,6 +73,7 @@ export function backendModelRef(model: {
   runtimeVersion?: string | null;
   quant?: string | null;
   tokenizerPath?: string | null;
+  runtimeModelName?: string | null;
 }): BackendModelRef {
   return {
     filePath: model.filePath,
@@ -71,6 +87,7 @@ export function backendModelRef(model: {
     runtimeVersion: model.runtimeVersion ?? null,
     quant: model.quant ?? null,
     tokenizerPath: model.tokenizerPath ?? null,
+    runtimeModelName: model.runtimeModelName ?? null,
   };
 }
 

@@ -28,6 +28,12 @@ export interface BackendModelRef {
   chatTemplate?: string | null;
   // Where the tokenizer is, for bundles that don't keep it beside the weights.
   tokenizerPath?: string | null;
+  // How the RUNTIME addresses this model, when it owns the files itself.
+  // GenieX's model manager keys its cache by name ("ai-hub-models/Qwen3-4B-
+  // Instruct-2507") and resolves the paths; handing it a path instead would
+  // bypass the manifest that says which runtime the bundle is for. Null for
+  // everything Vesta stores itself, which is every GGUF.
+  runtimeModelName?: string | null;
   /** Quantization, for the artifact label in diagnostics ("Q4_K_M", "w4a16"). */
   quant?: string | null;
 }
@@ -49,6 +55,14 @@ export interface BackendGenerateResult {
   content: string;
   tokensPredicted: number;
   tokensPerSecond: number;
+  // Prompt tokens the runtime actually evaluated, when it says. Undefined is
+  // "not reported" and must be displayed as such, never as 0 — on the KV-reuse
+  // screens a zero here reads as a perfect cache hit.
+  tokensEvaluated?: number;
+  // True when the turn ended because the user stopped it. A stopped turn still
+  // returns the text produced so far, so callers need this to tell "finished"
+  // from "interrupted" rather than inferring it from a short answer.
+  stoppedByUser?: boolean;
 }
 
 export interface BackendDiagnostics {
@@ -78,8 +92,16 @@ export interface ModelBackend {
   generate(
     messages: BackendMessage[],
     options?: BackendGenerateOptions,
+    // Called per token when the caller is showing the reply as it arrives.
+    // Optional on both sides: a backend that cannot stream simply ignores it,
+    // and a caller that is not watching lets the backend skip the per-token
+    // work entirely.
+    onToken?: (token: string) => void,
   ): Promise<BackendGenerateResult>;
   unload(): Promise<void>;
+
+  /** Stops an in-flight generation, where the runtime supports it. */
+  stop?(): void;
 
   getDiagnostics(): BackendDiagnostics;
 }
