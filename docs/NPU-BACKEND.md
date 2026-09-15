@@ -350,7 +350,7 @@ Against the acquisition questions:
 | Exact chipset selection | `SM8850`. Documented by Qualcomm as the GenieX id for Snapdragon 8 Elite Gen 5, and the same string Android's `Build.SOC_MODEL` reports on this device. |
 | Quantization | `w4a16` — int4 weights, int16 activations, what AI Hub compiles LLM bundles at. |
 | Expected files | `metadata.json`, one or more `*.bin`, `tokenizer.json`, `tokenizer_config.json`. Exact names and sizes are recorded from disk at install; nothing is assumed. |
-| Bundle size | Not published anywhere reachable — the manifest carries no size and the object cannot be HEADed. The catalog carries ~3 GB as an order of magnitude and the UI marks it "approx." until the real total is measured from disk. |
+| Bundle size | Obtainable up front since `query()` was wired in: `PrecisionCandidate.size`, per precision. Previously not published anywhere reachable — the manifest carries no size and the object cannot be HEADed. The catalog carries ~3 GB as an order of magnitude and the UI marks it "approx." until the real total is measured from disk. |
 | Companion files | None beyond the bundle. No `genie_config.json`, no HTP backend-extensions JSON, no separate QAIRT SDK install — the AAR carries `libQnnHtp*`, the V79/V81 skels and the stubs. |
 | Where the files go | `filesDir/geniex/…` — app-private, and nowhere near the `.gguf` directory. |
 | Credentials in git? | None involved. `.gitignore` already covers `.qai-hub/`, `qai_hub_token*` and the artifact extensions. |
@@ -401,7 +401,9 @@ Vesta now uses all five. The consequences:
 - **`query()` runs before every pull.** It costs one request, leaves nothing on
   disk, and answers the question a failed download answers far more expensively.
   Its `PrecisionCandidate.size` is also the only published size figure for these
-  bundles, which is what lets the UI stop saying "approx. 3 GB".
+  bundles. Not yet shown in the UI — the install card still carries the
+  catalog approximation until the real total is measured from disk — but it is
+  now obtainable before a download rather than only after one.
 - **"Not offered for this chipset" and "no such model" are told apart**, because
   they have different next steps and `-100010` flattens them into one number.
 

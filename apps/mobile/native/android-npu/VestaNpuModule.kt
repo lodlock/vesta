@@ -591,7 +591,8 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * runtime the asset was built for, and one candidate per available
      * precision with its size. That size is the only published figure for these
      * bundles — the release manifest carries none and the object cannot be
-     * HEADed — so it is also what lets the UI stop saying "approx 3 GB".
+     * HEADed — so it is also the one way to know the download size before
+     * starting it rather than after.
      *
      * A failure here costs nothing, which is exactly what should precede a
      * multi-gigabyte download.
