@@ -129,6 +129,48 @@ With the flag set, the config plugin adds the Maven dependency and copies the
 native bridge. Without it, neither exists, so a default build cannot break on a
 Qualcomm SDK it never fetched.
 
+### Minimum Android version
+
+| Build | `minSdkVersion` | Installs on |
+| --- | --- | --- |
+| Default | 24 | Android 7.0 and later |
+| `VESTA_ENABLE_NPU=1` | **27** | Android 8.1 and later |
+
+The GenieX AAR declares `<uses-sdk android:minSdkVersion="27" />` in its own
+manifest, and the Android manifest merger treats a lower app-level floor as an
+error, not a warning:
+
+```
+uses-sdk:minSdkVersion 24 cannot be smaller than version 27
+declared in library [com.qualcomm.qti:geniex-android:0.4.0]
+```
+
+The NPU-enabled prebuild therefore writes `android.minSdkVersion=27` into
+`android/gradle.properties`. That property feeds the `expoLibs` version
+catalog, which `ExpoRootProjectPlugin` turns into `rootProject.ext.minSdkVersion`
+— the value the app module and every Expo/React Native library module resolve
+from. One lever, whole build. A prebuild without the flag removes the property
+again, so a default APK goes back to 24 even in a tree that was previously
+built with the NPU on.
+
+**This is not suppressed with `tools:overrideLibrary`.** That would silence the
+merge error while leaving the APK declaring API 24, so it would still install on
+devices the Qualcomm runtime cannot load — a build failure traded for a crash in
+someone's hand.
+
+**API 27 is a linking floor, not a capability claim.** It is the lowest level at
+which the AAR may be merged at all; it says nothing about whether the NPU works.
+Actual Hexagon inference needs far more — Android 15+, Hexagon v73 or later,
+QAIRT 2.29+, ~12 GB of RAM for a 3B+ model, and a bundle compiled for that exact
+SoC. On anything short of that the backend declines during its probe and the
+request goes to llama.cpp, which is the point of having two backends.
+
+**arm64-v8a only.** The AAR ships native libraries for `arm64-v8a` and no other
+ABI (206 MB of them, `libQnnHtpPrepare.so` alone being 84 MB). On an armeabi-v7a,
+x86 or x86_64 build there is nothing to load, so the backend must decline rather
+than throw. There is no `.so` filename collision with llama.rn, which statically
+links llama/ggml into its own `librnllama*.so`.
+
 Then, on the device side:
 
 1. Create a free **Qualcomm MyAccount** and sign in to AI Hub.

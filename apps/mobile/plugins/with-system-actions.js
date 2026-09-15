@@ -7,6 +7,7 @@ const {
   withDangerousMod,
   withAndroidManifest,
   withAppBuildGradle,
+  withGradleProperties,
 } = require("expo/config-plugins");
 const fs = require("fs");
 const path = require("path");
@@ -45,31 +46,81 @@ function npuEnabled() {
 // of the AAR, not inferred), so a floating version could silently break it.
 const GENIEX_VERSION = "0.4.0";
 
-// The AAR declares minSdkVersion 27; the Expo template is lower, and the
-// manifest merger fails rather than warns on that.
+// The AAR declares minSdkVersion 27, and the manifest merger fails rather than
+// warns when the app declares less. So an NPU build raises the floor — but only
+// an NPU build: a default APK keeps installing on API 24 devices.
+//
+// It is raised through `android.minSdkVersion` in gradle.properties, NOT by
+// writing into app/build.gradle's defaultConfig. Two reasons, the first of
+// which already bit us:
+//
+//   1. The template's own defaultConfig contains `minSdkVersion
+//      rootProject.ext.minSdkVersion`. An injected line lands above it, Groovy
+//      takes the LAST assignment, and the override silently evaporates — which
+//      is how a build that looked configured still failed the merge at 24.
+//   2. This property feeds the `expoLibs` version catalog, which
+//      ExpoRootProjectPlugin reads into `rootProject.ext.minSdkVersion`. Every
+//      Expo and React Native library module resolves its own minSdk from that
+//      same extra, so one lever moves the entire build. A per-module override
+//      would leave the libraries at 24 and merge them straight back in.
+//
+// Raising minSdk is NOT a claim that the NPU works on API 27 — see
+// docs/NPU-BACKEND.md. It is the floor at which the AAR can be linked at all;
+// the backend still probes at runtime and hands back to llama.cpp on a device
+// that cannot actually serve it.
 const GENIEX_MIN_SDK = 27;
+const MIN_SDK_PROPERTY = "android.minSdkVersion";
+
+// Deliberately NOT `tools:overrideLibrary`. That suppresses the merge error
+// without changing what gets installed, so the APK would go on claiming API 24
+// and land on devices the Qualcomm runtime cannot load — trading a build
+// failure for a crash in someone's hand.
+//
+// Runs in BOTH directions, because android/ is generated but not always
+// regenerated from scratch: a non-NPU prebuild over a tree that once had the
+// flag set has to take the raised floor back out, or a default build would
+// quietly keep it.
+function withNpuMinSdk(config) {
+  return withGradleProperties(config, (cfg) => {
+    cfg.modResults = cfg.modResults.filter(
+      (item) => !(item.type === "property" && item.key === MIN_SDK_PROPERTY),
+    );
+    if (npuEnabled()) {
+      cfg.modResults.push({
+        type: "property",
+        key: MIN_SDK_PROPERTY,
+        value: String(GENIEX_MIN_SDK),
+      });
+    }
+    return cfg;
+  });
+}
 
 function withGenieX(config) {
-  if (!npuEnabled()) return config;
+  config = withNpuMinSdk(config);
 
+  // The dependency is symmetrical for the same reason: a stale geniex line left
+  // by an earlier NPU prebuild would pull the proprietary AAR into a build that
+  // never asked for it, and bring the merge failure along with it. The old
+  // defaultConfig override is stripped too, wherever it was left behind.
   config = withAppBuildGradle(config, (cfg) => {
-    const dep = `    implementation("com.qualcomm.qti:geniex-android:${GENIEX_VERSION}")`;
-    if (!cfg.modResults.contents.includes("geniex-android")) {
+    cfg.modResults.contents = cfg.modResults.contents
+      .split("\n")
+      .filter(
+        (line) => !line.includes("geniex-android") && !line.includes("vesta-npu-minsdk"),
+      )
+      .join("\n");
+    if (npuEnabled()) {
       cfg.modResults.contents = cfg.modResults.contents.replace(
         /dependencies\s*\{/,
-        (m) => `${m}\n${dep}`,
-      );
-    }
-    // Raise minSdk for this build only. Written as an override inside
-    // defaultConfig so it wins over the template's value.
-    if (!cfg.modResults.contents.includes("// vesta-npu-minsdk")) {
-      cfg.modResults.contents = cfg.modResults.contents.replace(
-        /defaultConfig\s*\{/,
-        (m) => `${m}\n        minSdkVersion ${GENIEX_MIN_SDK} // vesta-npu-minsdk`,
+        (m) =>
+          `${m}\n    implementation("com.qualcomm.qti:geniex-android:${GENIEX_VERSION}")`,
       );
     }
     return cfg;
   });
+
+  if (!npuEnabled()) return config;
 
   // Copy the bridge next to the other Kotlin sources. It lives in
   // native/android-npu/ precisely so the unconditional copy below never

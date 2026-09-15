@@ -34,6 +34,7 @@ jest.mock("expo/config-plugins", () => ({
   withMainApplication: (config: unknown) => config,
   withDangerousMod: (config: unknown) => config,
   withAppBuildGradle: (config: unknown) => config,
+  withGradleProperties: (config: unknown) => config,
   withAndroidManifest: (config: unknown, mod: Mod) => {
     manifestMods.push(mod);
     return config;

@@ -68,6 +68,16 @@ loopback-only MCP server, and a smaller permission set.
   alarms and reminders speak their confirmation and then dismiss the overlay,
   returning you to whatever you were doing; failures, questions and model
   answers stay on screen.
+- **An NPU build raises minSdk to 27; a default build stays at 24** — the
+  GenieX AAR declares `minSdkVersion 27`, and the manifest merger errors rather
+  than warns on a lower app floor. `VESTA_ENABLE_NPU=1` now writes
+  `android.minSdkVersion=27` into `android/gradle.properties`, which is the
+  value the app module *and* every library module resolve from; a prebuild
+  without the flag removes it again. Not `tools:overrideLibrary`: that would
+  hide the error and ship an APK still claiming API 24 to devices the Qualcomm
+  runtime cannot load. API 27 is the linking floor only — real NPU inference
+  needs Android 15+, Hexagon v73+ and an SoC-matched bundle, and the backend
+  still declines to llama.cpp otherwise. See docs/NPU-BACKEND.md.
 - **Assistant turns are kept only when they are worth reopening** — a
   deterministic action (timer, alarm, reminder) writes no conversation: the
   timer is the outcome, and Done or the auto-dismiss leave nothing behind.
