@@ -51,7 +51,14 @@ describe("fast path — resolved commands never reach the model", () => {
     expect(mockGenerate).not.toHaveBeenCalled();
     expect(res.type).toBe("tool_call");
     // set_timer is not confirm-gated, so it dispatches directly.
-    expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 5 }, "en");
+    expect(mockDispatch).toHaveBeenCalledWith(
+      "set_timer",
+      { minutes: 5 },
+      "en",
+      // The parser resolved these from the user's own words, and says so:
+      // the dispatch guard refuses a temporal value with no provenance.
+      expect.objectContaining({ source: "parser" }),
+    );
   });
 
   it("runs the exact device transcript that regressed, with no model", async () => {
@@ -61,7 +68,14 @@ describe("fast path — resolved commands never reach the model", () => {
     const res = await send("Set a 30 second timer");
 
     expect(mockGenerate).not.toHaveBeenCalled();
-    expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 0.5 }, "en");
+    expect(mockDispatch).toHaveBeenCalledWith(
+      "set_timer",
+      { minutes: 0.5 },
+      "en",
+      // The parser resolved these from the user's own words, and says so:
+      // the dispatch guard refuses a temporal value with no provenance.
+      expect.objectContaining({ source: "parser" }),
+    );
     expect(res.type).toBe("tool_call");
   });
 
@@ -73,7 +87,14 @@ describe("fast path — resolved commands never reach the model", () => {
     const res = await send("Set a timer 30 seconds.");
 
     expect(mockGenerate).not.toHaveBeenCalled();
-    expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 0.5 }, "en");
+    expect(mockDispatch).toHaveBeenCalledWith(
+      "set_timer",
+      { minutes: 0.5 },
+      "en",
+      // The parser resolved these from the user's own words, and says so:
+      // the dispatch guard refuses a temporal value with no provenance.
+      expect.objectContaining({ source: "parser" }),
+    );
     expect(res.type).toBe("tool_call");
   });
 
@@ -110,8 +131,15 @@ describe("fast path — resolved commands never reach the model", () => {
       "set_timer",
       { minutes: 40, label: "Warning" },
       "en",
+      expect.objectContaining({ source: "parser" }),
     );
-    expect(mockDispatch).toHaveBeenNthCalledWith(2, "set_timer", { minutes: 45 }, "en");
+    expect(mockDispatch).toHaveBeenNthCalledWith(
+      2,
+      "set_timer",
+      { minutes: 45 },
+      "en",
+      expect.objectContaining({ source: "parser" }),
+    );
     expect(res.type).toBe("tool_call");
     if (res.type === "tool_call") {
       // The bubble describes the whole request, not just the last call.
@@ -150,7 +178,14 @@ describe("fast path — resolved commands never reach the model", () => {
     const res = await send("set a timer for thirty seconds");
 
     expect(res.type).toBe("tool_call");
-    expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 0.5 }, "en");
+    expect(mockDispatch).toHaveBeenCalledWith(
+      "set_timer",
+      { minutes: 0.5 },
+      "en",
+      // The parser resolved these from the user's own words, and says so:
+      // the dispatch guard refuses a temporal value with no provenance.
+      expect.objectContaining({ source: "parser" }),
+    );
   });
 });
 

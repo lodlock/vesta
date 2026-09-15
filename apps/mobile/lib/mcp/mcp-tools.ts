@@ -5,6 +5,7 @@
 
 import { MVP_TOOLS, toolReturnsData } from "../tools/tool-registry";
 import { dispatchToolCall } from "../orchestrator/tool-dispatcher";
+import { apiGrounding } from "../scheduling/grounding";
 
 export interface McpTool {
   name: string;
@@ -36,7 +37,10 @@ export async function callReadTool(
   if (!isReadOnlyDataSource(name)) {
     return { ok: false, error: `Unknown or non-exposed tool: ${name}` };
   }
-  const result = await dispatchToolCall(name, args, "en");
+  // An explicit programmatic call: the arguments ARE the input, so the
+  // temporal-grounding guard has nothing to check them against and nothing
+  // to be suspicious of. See scheduling/grounding.
+  const result = await dispatchToolCall(name, args, "en", apiGrounding);
   if (!result.success) {
     return { ok: false, error: result.error ?? result.message };
   }

@@ -232,6 +232,39 @@ export const MVP_TOOLS: ToolDefinition[] = [
     },
   },
   {
+    // Deterministic, offline, and exposed to the model on purpose. Without it
+    // the model answers world-clock questions from memory — or, worse, says it
+    // has no live access, which is what it did on device. The device has the
+    // current instant and the IANA tz database; this hands both over.
+    name: "get_time",
+    description_it:
+      "Leggi l'ora o la data corrente, qui o in un altro luogo/fuso orario",
+    description_en:
+      "Read the current time or date, here or in another place/time zone",
+    category: "utility",
+    confirmRequired: false,
+    returnsData: true,
+    parameters: {
+      type: "object",
+      properties: {
+        place: {
+          type: "string",
+          description:
+            "City, country or IANA zone to read the time in; omit for the device's own time zone",
+        },
+        kind: {
+          type: "string",
+          description: '"time" (default), "date", "zone", or "difference"',
+        },
+        other: {
+          type: "string",
+          description: 'Second place, for kind "difference"',
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "general_chat",
     description_it:
       "Rispondi a una domanda generica, una conversazione, o una richiesta creativa",

@@ -81,7 +81,14 @@ describe("processMessage — malformed-JSON retry-once-with-correction", () => {
       expect(res.tool).toBe("set_timer");
       expect(res.parameters).toEqual({ minutes: 5 });
     }
-    expect(mockDispatch).toHaveBeenCalledWith("set_timer", { minutes: 5 }, "it");
+    expect(mockDispatch).toHaveBeenCalledWith(
+      "set_timer",
+      { minutes: 5 },
+      "it",
+      // Model-produced, and labelled as such: the dispatch guard checks the
+      // temporal value against what the user actually said.
+      expect.objectContaining({ source: "model" }),
+    );
   });
 
   it("gates a corrected destructive tool for confirmation", async () => {

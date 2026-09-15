@@ -3,12 +3,18 @@
 
 import type { ToolCallResult, Language } from "./types";
 import { MVP_TOOLS } from "../tools/tool-registry";
+import {
+  ungroundedTemporalValue,
+  groundingRefusal,
+  type Grounding,
+} from "../scheduling/grounding";
 import { setAlarm, createEvent, setTimer, navigateTo } from "../native/system-actions";
 import { scheduleReminder } from "../native/reminders";
 import { searchContacts } from "../native/contacts";
 import { makeCall, sendSms } from "../native/communication";
 import { getCalendarEvents } from "../native/calendar";
 import { queryDocuments } from "./document-retriever";
+import { answerTimeQuestion, deviceZone, type TimeQuestionKind } from "../time/world-time";
 import { isValidYMD } from "./date-utils";
 
 const FORMAT_VALIDATORS: Record<string, (value: string) => string | null> = {
@@ -98,11 +104,26 @@ export async function dispatchToolCall(
   tool: string,
   rawParameters: Record<string, unknown>,
   lang: Language = "en",
+  grounding?: Grounding,
 ): Promise<ToolCallResult> {
   const parameters = normalizeToolParams(tool, rawParameters);
   const validationError = validateParams(tool, parameters);
   if (validationError) {
     return { success: false, message: "Invalid parameters", error: validationError };
+  }
+
+  // The last gate before something is armed at a time. Schema validation only
+  // asks whether a required field is PRESENT — which is exactly the pressure
+  // that makes a sampled model invent one. This asks where the value came
+  // from, and refuses when the answer is "nowhere the user said".
+  const ungrounded = ungroundedTemporalValue(tool, parameters, grounding);
+  if (ungrounded) {
+    console.warn(`[ToolDispatcher] refusing ungrounded ${tool}: ${ungrounded}`);
+    return {
+      success: false,
+      message: groundingRefusal(lang),
+      error: ungrounded,
+    };
   }
 
   try {
@@ -156,6 +177,27 @@ export async function dispatchToolCall(
 
       case "query_document":
         return await queryDocuments(parameters.query as string, lang);
+
+      case "get_time": {
+        // No network, no model arithmetic: the device clock and ICU's copy of
+        // the IANA database, which is where DST correctness comes from.
+        const kind = (parameters.kind as TimeQuestionKind) ?? "time";
+        const answer = answerTimeQuestion(
+          {
+            kind: ["time", "date", "zone", "difference"].includes(kind)
+              ? kind
+              : "time",
+            place: (parameters.place as string | undefined) ?? null,
+            other: (parameters.other as string | undefined) ?? null,
+          },
+          new Date(),
+          deviceZone(),
+          lang,
+        );
+        // An ambiguous place is a real answer, not a failure: the model should
+        // relay the question rather than pick a zone on the user's behalf.
+        return { success: true, message: answer.status === "resolved" ? answer.text : answer.question };
+      }
 
       case "general_chat":
         return { success: true, message: "OK" };

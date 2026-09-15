@@ -12,7 +12,14 @@ describe("buildMcpToolList", () => {
   it("exposes exactly the returnsData read tools with JSON-schema inputs", () => {
     const tools = buildMcpToolList();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["get_calendar_events", "query_document", "search_contacts"]);
+    expect(names).toEqual([
+      "get_calendar_events",
+      // Deterministic, offline, read-only: the device clock plus the IANA zone
+      // database, so neither Vesta nor an MCP client has to recall an offset.
+      "get_time",
+      "query_document",
+      "search_contacts",
+    ]);
     const cal = tools.find((t) => t.name === "get_calendar_events")!;
     expect(cal.description.length).toBeGreaterThan(0);
     expect(cal.inputSchema).toHaveProperty("type", "object");

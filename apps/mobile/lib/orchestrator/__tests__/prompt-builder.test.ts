@@ -109,8 +109,31 @@ describe("prompt content guards", () => {
   });
 
   test("late-night terms are quoted in both languages", () => {
-    expect(buildStablePrefix("it")).toContain('"Stanotte" significa');
-    expect(buildStablePrefix("en")).toContain('"Late tonight" means');
+    expect(buildStablePrefix("it")).toContain('"stanotte" significa');
+    expect(buildStablePrefix("en")).toContain('"late tonight" means');
+  });
+
+  // The rule that stops a required field being filled in with a plausible
+  // time. On device, "How do you handle different tenses in Latin? Actually,
+  // cancel." became a reminder for 11:30 — the model had to produce SOMETHING
+  // for a required parameter, and produced a time. The dispatch guard is the
+  // hard stop (see scheduling/grounding); this is the instruction that should
+  // mean the guard is never reached.
+  test("forbids inventing a time outright, in both languages", () => {
+    expect(buildStablePrefix("en")).toContain("NEVER invent a time, date or duration");
+    expect(buildStablePrefix("it")).toContain("Non inventare MAI un orario");
+    for (const lang of LANGS) {
+      // The old wording told the model to DEFAULT a missing time. Nothing in
+      // the prompt may read as permission to supply one.
+      expect(buildStablePrefix(lang)).not.toContain("default to 19:00 if no specific time");
+      expect(buildStablePrefix(lang)).not.toContain("orario predefinito se non specificato");
+    }
+  });
+
+  test("points the model at the deterministic clock instead of its memory", () => {
+    expect(buildStablePrefix("en")).toContain("get_time");
+    expect(buildStablePrefix("en")).toContain("no live access");
+    expect(buildStablePrefix("it")).toContain("get_time");
   });
 
   test("no stale hardcoded example date in the rules", () => {

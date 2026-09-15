@@ -15,6 +15,7 @@ import type {
   ParsedToolCall,
 } from "./types";
 import { dispatchToolCall } from "./tool-dispatcher";
+import type { Grounding } from "../scheduling/grounding";
 import {
   getMemoriesForPrompt,
   extractMemories,
@@ -25,6 +26,9 @@ import { getKnowledgeForPrompt } from "./knowledge-manager";
 import { getConfig } from "../storage/database";
 import { toolRequiresConfirmation, toolReturnsData } from "../tools/tool-registry";
 import { parseSchedulingCommand } from "../scheduling/parse";
+import { abandonmentMarker, abandonmentAcknowledgement } from "../scheduling/cancellation";
+import { parserGrounding, apiGrounding } from "../scheduling/grounding";
+import { answerIfTimeQuestion, deviceZone } from "../time/world-time";
 import { intentToToolCalls, clarificationFor } from "../scheduling/intent-to-tool";
 
 export interface ProcessOptions {
@@ -60,8 +64,12 @@ export function executeToolCall(
   tool: string,
   parameters: Record<string, unknown>,
   lang: Language = "en",
+  grounding?: Grounding,
 ): Promise<ToolCallResult> {
-  return dispatchToolCall(tool, parameters, lang);
+  // The caller knows where these values came from; without that this is an
+  // unattributed dispatch and the guard refuses it. The assistant's confirm
+  // button passes the utterance that produced the proposal.
+  return dispatchToolCall(tool, parameters, lang, grounding ?? apiGrounding);
 }
 
 // Deterministic scheduling fast path. Timers, alarms, reminders and calendar
@@ -115,8 +123,9 @@ async function tryDeterministicScheduling(
   // slightly noisier message.
   let failure: ToolCallResult | null = null;
   let last: ToolCallResult | null = null;
+  const grounding = parserGrounding(userText, lang);
   for (const call of calls) {
-    last = await dispatchToolCall(call.tool, call.parameters, lang);
+    last = await dispatchToolCall(call.tool, call.parameters, lang, grounding);
     if (!last.success && !failure) failure = last;
   }
 
@@ -127,6 +136,131 @@ async function tryDeterministicScheduling(
     message: primary.message,
     result: failure ?? last!,
   };
+}
+
+/**
+ * What a deterministic layer produced, and whether it is the end of the turn.
+ *
+ * The distinction is the whole point of this type. A deterministic layer can
+ * return prose for two completely different reasons — here is your answer, or
+ * I need one more thing from you — and `OrchestratorResponse` renders both as
+ * `{ type: "text" }`. The assistant surface has to tell them apart: an ANSWER
+ * is a finished turn that speaks and gets out of the way, while a QUESTION
+ * must keep the surface open with an Answer button and remember what to resume.
+ *
+ * Conflating the two is a bug this project has now shipped twice. The first
+ * time, a chat answer was filed as a clarification and prepended to the next
+ * invocation. The second time, "What time is it in Norway?" — a completed
+ * deterministic answer — was filed the same way, so the NEXT invocation
+ * ("What time is it in the United States?") was really asked as both questions
+ * at once, inherited the previous turn's session, and ended up in the model and
+ * then in the wrong chat. `resume` being present or absent is now the only
+ * thing that decides, and it is set at the point that knows.
+ */
+export interface DeterministicResult {
+  response: OrchestratorResponse;
+  /**
+   * Present ONLY when `response` is a question the user still owes an answer
+   * to. Its value is the text a follow-up is appended to — the original
+   * utterance for a scheduling clarification, or the world-time question with
+   * the ambiguous place removed ("what time is it in" + "Chicago").
+   */
+  resume?: string;
+}
+
+/**
+ * Everything Vesta can answer WITHOUT a model, in the order it is tried.
+ *
+ * Three layers, each of which either answers or steps aside:
+ *
+ *   1. abandonment — "…actually, cancel". A withdrawn request must not be
+ *      acted on by anything downstream, so this runs before routing rather
+ *      than inside it. Dictation has no backspace; see scheduling/cancellation.
+ *   2. scheduling — timers, alarms, reminders, events. Resolves from the
+ *      user's own tokens or asks; never invents a value.
+ *   3. world time — "what time is it in Norway". The device has the IANA tz
+ *      database; asking a 4B model to recall UTC offsets is how you get
+ *      confident wrong answers, and it used to decline the question outright.
+ *
+ * Null means none of them applied and the utterance belongs to the model.
+ */
+export async function tryDeterministicAnswer(
+  userText: string,
+  lang: Language,
+  now: Date,
+  confirmEnabled: boolean,
+): Promise<DeterministicResult | null> {
+  const marker = abandonmentMarker(userText, lang);
+  if (marker) {
+    // Terminal. Nothing parses, nothing dispatches, no model is loaded — the
+    // user has said to drop it, and the rest of the transcript is the request
+    // they dropped. No resume: there is nothing left to finish.
+    return { response: { type: "text", content: abandonmentAcknowledgement(lang) } };
+  }
+
+  const scheduled = await tryDeterministicScheduling(
+    userText,
+    lang,
+    now,
+    confirmEnabled,
+  );
+  if (scheduled) {
+    // The parser's only prose is a clarification question, and a follow-up
+    // completes the ORIGINAL utterance ("set an alarm tomorrow at four" + "pm").
+    return scheduled.type === "text"
+      ? { response: scheduled, resume: userText }
+      : { response: scheduled };
+  }
+
+  const timeAnswer = answerIfTimeQuestion(userText, lang, now, deviceZone());
+  if (timeAnswer) {
+    if (timeAnswer.status === "resolved") {
+      // A finished answer. Nothing is pending, and nothing may be carried into
+      // the next invocation.
+      return { response: { type: "text", content: timeAnswer.text } };
+    }
+    return {
+      response: { type: "text", content: timeAnswer.question },
+      // The question minus the ambiguous place, so "Chicago" completes it.
+      // Absent for the forms that cannot be rewritten that way.
+      resume: timeAnswer.resume,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * The deterministic layers, and nothing else. Returns null when none applies.
+ *
+ * This exists because the assistant surface must be able to ask "is this a
+ * timer?" without any chance of starting a generation. It used to ask by
+ * calling processMessage and treating the "No model loaded" error as "not
+ * scheduling" — which held only while no model was resident. Once one WAS
+ * loaded (any warm process, which is the normal case), that same call ran a
+ * full chat turn instead: the answer came back as `type: "text"`, which the
+ * assistant reads as the parser's own clarification question. Everything
+ * downstream then went wrong at once — the answer was shown unrendered, the
+ * utterance was stored as a pending clarification and prepended to the NEXT
+ * invocation, and that invocation inherited the previous turn's session. One
+ * ambiguous return value, four bugs.
+ *
+ * There is no ambiguity here: a result means a deterministic layer handled it
+ * (and `resume` says whether it finished or asked), null means none did. Model
+ * involvement is the caller's decision.
+ */
+export async function processDeterministic(
+  userText: string,
+  lang: Language,
+  sentAt: Date = new Date(),
+): Promise<DeterministicResult | null> {
+  let confirmEnabled = true;
+  try {
+    confirmEnabled = (await getConfig("confirm_destructive_actions")) !== "false";
+  } catch (err) {
+    console.warn("[Orchestrator] Failed to read the confirmation setting:", err);
+  }
+  return tryDeterministicAnswer(userText, lang, sentAt, confirmEnabled);
 }
 
 export async function processMessage(
@@ -157,15 +291,18 @@ export async function processMessage(
     console.warn("[Orchestrator] Failed to read the confirmation setting:", err);
   }
 
-  // Deterministic scheduling first — before the model-loaded check, so a timer
-  // or an alarm still works while a model is downloading or failed to load.
-  const scheduled = await tryDeterministicScheduling(
+  // The deterministic layers first — before the model-loaded check, so a
+  // timer, an alarm or a world-clock question still works while a model is
+  // downloading or failed to load, and an abandoned utterance stops here.
+  const deterministic = await tryDeterministicAnswer(
     userText,
     lang,
     sentAt,
     confirmEnabled,
   );
-  if (scheduled) return scheduled;
+  // Chat renders a question and an answer the same way, so it only needs the
+  // response. The assistant surface needs `resume` as well — see the type.
+  if (deterministic) return deterministic.response;
 
   if (!isLoaded()) {
     return { type: "error", error: "No model loaded" };
@@ -277,6 +414,7 @@ export async function processMessage(
           call.tool,
           call.parameters,
           lang,
+          { source: "model", utterance: userText, lang },
         );
         if (!toolResult.success) {
           // e.g. permission denied or no data — surface the reason as text.
@@ -330,7 +468,15 @@ export async function processMessage(
           message: confirmMessage,
         };
       }
-      const toolResult = await dispatchToolCall(call.tool, call.parameters, lang);
+      // A model-produced call. `model` provenance means the temporal values
+      // are checked against what the user actually said before anything is
+      // armed — the guard that stops a required field being filled in with a
+      // plausible time nobody asked for.
+      const toolResult = await dispatchToolCall(call.tool, call.parameters, lang, {
+        source: "model",
+        utterance: userText,
+        lang,
+      });
       return {
         type: "tool_call",
         tool: call.tool,
