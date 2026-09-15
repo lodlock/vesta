@@ -14,6 +14,7 @@ import { useModelStore, type NpuStatus } from "../lib/store/model-store";
 import { CATALOG } from "../lib/models/catalog";
 import { listGgufFiles, type HfFile } from "../lib/models/hf-client";
 import type { NpuCatalogModel } from "../lib/models/npu-catalog";
+import type { HubCatalog } from "../lib/models/npu-hub";
 import { isNpuModel } from "../lib/models/npu-compat";
 import type { CatalogModel, InstalledModel, ModelTrust } from "../lib/models/types";
 import { formatBytes, formatDuration, percent, fitLabel, type FitLabel } from "../lib/models/format";
@@ -39,6 +40,9 @@ export default function ModelsScreen() {
   const npu = useModelStore((s) => s.npu);
   const npuCatalog = useModelStore((s) => s.npuCatalog);
   const installNpuModel = useModelStore((s) => s.installNpuModel);
+  const importNpuBundle = useModelStore((s) => s.importNpuBundle);
+  const npuHub = useModelStore((s) => s.npuHub);
+  const loadNpuHub = useModelStore((s) => s.loadNpuHub);
   const verifyNpuBundle = useModelStore((s) => s.verifyNpuBundle);
   // Optional: a SHA-256 the user has for the file they are about to import.
   // Left empty, the import still works — see importLocalModel's policy.
@@ -92,6 +96,23 @@ export default function ModelsScreen() {
     setImportChecksum("");
   };
 
+  // An AI Hub bundle the user exported themselves. A .zip because that is one
+  // of the three layouts the runtime accepts and the only one a file picker can
+  // return — Android's picker hands back a single document, not a directory.
+  const pickNpuBundle = useCallback(
+    async (m: NpuCatalogModel) => {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ["application/zip", "application/octet-stream", "*/*"],
+        copyToCacheDirectory: false,
+      });
+      if (result.canceled) return;
+      const asset = result.assets?.[0];
+      if (!asset) return;
+      await importNpuBundle(m, asset.uri);
+    },
+    [importNpuBundle],
+  );
+
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
       <Text style={styles.notice}>
@@ -138,6 +159,9 @@ export default function ModelsScreen() {
           on hardware that can run it. */}
       <NpuSection
         npu={npu}
+        hub={npuHub}
+        onCheckHub={loadNpuHub}
+        onImport={pickNpuBundle}
         catalog={npuCatalog}
         installedFor={installedNpu}
         progress={progress}
@@ -419,9 +443,12 @@ function InstalledRow({
  */
 function NpuSection({
   npu,
+  hub,
   catalog,
   installedFor,
   progress,
+  onCheckHub,
+  onImport,
   onInstall,
   onActivate,
   onCancel,
@@ -429,9 +456,12 @@ function NpuSection({
   onVerify,
 }: {
   npu: NpuStatus;
+  hub: HubCatalog | null;
   catalog: NpuCatalogModel[];
   installedFor: (modelName: string) => InstalledModel | undefined;
   progress: Record<string, { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string }>;
+  onCheckHub: () => void;
+  onImport: (m: NpuCatalogModel) => void;
   onInstall: (m: NpuCatalogModel) => void;
   onActivate: (id: string) => void;
   onCancel: (id: string) => void;
@@ -469,7 +499,29 @@ function NpuSection({
           </Text>
         </View>
       ) : (
-        catalog.map((m) => {
+        <>
+          {/* What the hub itself says, before anyone presses Install. An
+              install that fails after a progress bar has been moving is the
+              worst way to learn that an asset was never published. */}
+          <View style={styles.card}>
+            <Text style={styles.rowHint}>
+              {hub === null
+                ? "Qualcomm's model hub has not been checked yet."
+                : hub.ok
+                  ? `Qualcomm's hub is reachable and lists ${hub.models.length} model(s).`
+                  : `Qualcomm's hub could not be reached: ${hub.error}`}
+            </Text>
+            {hub === null && (
+              <TouchableOpacity
+                style={[styles.btn, styles.btnOutline, { marginTop: spacing.sm }]}
+                onPress={onCheckHub}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.btnOutlineText}>Check hub</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+          {catalog.map((m) => {
           const row = installedFor(m.modelName);
           const prog = row ? progress[row.id] : undefined;
           const downloading = prog?.status === "downloading" || row?.state === "downloading";
@@ -527,6 +579,18 @@ function NpuSection({
                     <Text style={styles.btnPrimaryText}>Install</Text>
                   </TouchableOpacity>
                 )}
+                {/* Always offered, not only after a failed download. Whether
+                    Qualcomm has published this asset is not something the user
+                    should have to discover by waiting for a 404. */}
+                {!row && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnOutline]}
+                    onPress={() => onImport(m)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnOutlineText}>Import bundle</Text>
+                  </TouchableOpacity>
+                )}
                 {row && downloading && (
                   <TouchableOpacity
                     style={[styles.btn, styles.btnOutline]}
@@ -571,7 +635,8 @@ function NpuSection({
               </View>
             </View>
           );
-        })
+          })}
+        </>
       )}
     </>
   );

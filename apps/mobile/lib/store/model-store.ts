@@ -49,11 +49,20 @@ import {
 import { isNpuModel } from "../models/npu-compat";
 import {
   npuPull,
+  npuImportBundle,
+  npuHubModels,
+  npuQueryModel,
   npuCancelPull,
   npuBundleInfo,
   npuRemoveBundle,
   onNpuPullProgress,
 } from "../native/npu";
+import {
+  resolveAgainstHub,
+  explainResolution,
+  type HubCatalog,
+} from "../models/npu-hub";
+import { describeGenieXFailure } from "../models/npu-errors";
 import { checkGgufFile } from "../models/gguf-header";
 import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
 import { sha256File, normalizeSha256 } from "../native/file-hash";
@@ -111,9 +120,19 @@ interface ModelState {
   npu: NpuStatus;
   /** Curated NPU entries for THIS chipset. Empty on every other device. */
   npuCatalog: NpuCatalogModel[];
+  /**
+   * What Qualcomm's hub says it has, once asked. Null until then.
+   *
+   * Kept in state rather than fetched per install so the Models screen can say
+   * up front whether an asset exists for this phone, instead of only after a
+   * download has failed.
+   */
+  npuHub: HubCatalog | null;
 
   refresh: () => Promise<void>;
+  loadNpuHub: () => Promise<HubCatalog>;
   installNpuModel: (model: NpuCatalogModel) => Promise<void>;
+  importNpuBundle: (model: NpuCatalogModel, uri: string) => Promise<void>;
   cancelNpuInstall: (id: string) => Promise<void>;
   verifyNpuBundle: (id: string) => Promise<void>;
   downloadFromCatalog: (model: CatalogModel) => Promise<void>;
@@ -135,6 +154,11 @@ interface ModelState {
   clearError: () => void;
 }
 
+// Said in one place so the hub-resolution refusal and the -100010 message
+// point at the same escape hatch.
+const MANUAL_IMPORT_HINT =
+  "If you have exported a compatible bundle yourself, use Import bundle.";
+
 export const useModelStore = create<ModelState>((set, get) => ({
   installed: [],
   progress: {},
@@ -153,6 +177,31 @@ export const useModelStore = create<ModelState>((set, get) => ({
     chipsets: undefined,
   },
   npuCatalog: [],
+  npuHub: null,
+
+  /**
+   * Asks GenieX for the hub's own catalogue, once.
+   *
+   * Cached in state for the session: it is a network call, the answer does not
+   * change while the app is open, and both the Models screen and the install
+   * path want it.
+   */
+  loadNpuHub: async () => {
+    const cached = get().npuHub;
+    if (cached) return cached;
+    const result = await npuHubModels();
+    const catalog: HubCatalog = result?.models
+      ? { ok: true, models: result.models }
+      : {
+          ok: false,
+          error:
+            result?.error ??
+            result?.nativeMessage ??
+            "The Qualcomm model hub could not be reached.",
+        };
+    set({ npuHub: catalog });
+    return catalog;
+  },
 
   refresh: async () => {
     const [installed, caps] = await Promise.all([listInstalled(), getDeviceCaps()]);
@@ -218,6 +267,22 @@ export const useModelStore = create<ModelState>((set, get) => ({
       return;
     }
 
+    // Ask the hub what it actually has, before a placeholder row exists and
+    // before anything is downloaded. A "not offered for this chipset" answer
+    // here is worth far more than the same answer as an rc after a failed
+    // pull: it can name what IS offered.
+    const resolution = resolveAgainstHub(
+      await get().loadNpuHub(),
+      model.modelName,
+      npu.soc,
+      npu.chipsets,
+    );
+    const unavailable = explainResolution(resolution, model.displayName, npu.soc);
+    if (unavailable) {
+      set({ error: `${unavailable} ${MANUAL_IMPORT_HINT}` });
+      return;
+    }
+
     // A placeholder row so the download is visible, cancellable and -- above
     // all -- recoverable: a process killed mid-pull leaves a row in
     // "downloading" that the user can see and cancel, rather than gigabytes in
@@ -258,14 +323,48 @@ export const useModelStore = create<ModelState>((set, get) => ({
     });
 
     try {
+      // The chipset string comes from the HUB'S OWN list for this model, not
+      // from our catalog and not from Build.SOC_MODEL. Three vocabularies name
+      // this silicon and only one of them resolves an asset; asking removes the
+      // guess. `unreachable` keeps the catalog's target, because the runtime's
+      // verdict is the authority anyway and a phone that cannot reach the hub
+      // should still be allowed to try.
+      const chipset =
+        resolution.status === "available" ? resolution.chipset : model.targetSoc;
+
+      // A dry run first. It costs one request, it cannot leave anything on
+      // disk, and it answers the question a failed download answers far more
+      // expensively: does this model, at this precision, for this chipset,
+      // resolve to an asset at all?
+      const probe = await npuQueryModel({
+        modelName: model.modelName,
+        chipset,
+        precision: model.precision,
+        hub: model.hub,
+        displayName: model.displayName,
+      });
+      if (probe?.error) {
+        // Reported with the request beside it. An rc with no subject — no
+        // model name, no chipset, no precision — cannot be acted on.
+        const asked = probe.request;
+        const detail = asked
+          ? ` (asked for ${asked.modelName} · ${asked.chipset} · ${asked.precision ?? "default precision"} · ${asked.hub})`
+          : "";
+        await removeModel(row.id);
+        await get().refresh();
+        set({
+          error:
+            `${model.displayName}: ${describeGenieXFailure(probe.error)}${detail}` +
+            (probe.nativeMessage && probe.nativeMessage !== probe.error
+              ? ` — ${probe.nativeMessage}`
+              : ""),
+        });
+        return;
+      }
+
       const bundle = await npuPull({
         modelName: model.modelName,
-        // The runtime's OWN name for this chip when it has one, and only the
-        // catalog's SoC id as a fallback. `listChipsets()` is the vocabulary
-        // the AI Hub release manifest is keyed by, so asking for assets in the
-        // runtime's own words is the request most likely to resolve; the
-        // canonical layer has already established the two name one chip.
-        chipset: npu.runtimeChipset ?? model.targetSoc,
+        chipset,
         precision: model.precision,
         hub: model.hub,
         displayName: model.displayName,
@@ -298,15 +397,173 @@ export const useModelStore = create<ModelState>((set, get) => ({
       const active = await getActiveModel();
       if (!active) await get().activate(row.id);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
       // A cancelled or failed pull leaves partial files in the SDK's cache,
       // where a later pull resumes them. The ROW goes, because a row pointing
       // at an incomplete bundle is what makes a later load fail confusingly.
       await removeModel(row.id);
       await get().refresh();
-      set({ error: `${model.displayName}: ${message}` });
+      // Readable, with the runtime's own code kept on the end — see
+      // npu-errors. The raw rc must survive: it is the only token that can be
+      // looked up against Qualcomm's error definitions.
+      set({ error: `${model.displayName}: ${describeGenieXFailure(err)}` });
     } finally {
       unsubscribe();
+      set((state) => {
+        const progress = { ...state.progress };
+        delete progress[row.id];
+        return { progress };
+      });
+    }
+  },
+
+  // -- Manual bundle import -----------------------------------------------
+  //
+  // The hub path can fail for a reason no client code can fix: Qualcomm has
+  // not published the asset for this chipset. A user who exported one
+  // themselves with `qai-hub-models` should not be blocked on someone else's
+  // release schedule.
+  //
+  // What this is NOT is a way around the compatibility guard. The identical
+  // refusal runs first, on the identical catalog entry, so an imported bundle
+  // still has to be for THIS silicon; and the manager does the same layout
+  // validation, the same measurement and the same hashing it does for a
+  // download, so the row that lands is indistinguishable from a pulled one
+  // except in where the bytes came from.
+  //
+  // Deliberately separate from importLocalModel(), which imports a .gguf. The
+  // two share no code, no directory and no validation, and merging them would
+  // mean one function that sometimes means a file and sometimes a directory.
+  importNpuBundle: async (model: NpuCatalogModel, uri: string) => {
+    set({ error: null });
+
+    const npu = get().npu;
+    if (!npu.available) {
+      set({
+        error:
+          npu.reason ??
+          "There is no Qualcomm NPU runtime in this build, so an NPU bundle cannot be imported.",
+      });
+      return;
+    }
+
+    // The same gate the download path runs, before the same work. An import
+    // skips the hub, not the chipset check.
+    const refusal = npuRefusalFor(
+      backendModelRef({
+        filePath: "",
+        artifact: model.artifact,
+        contextSize: 4096,
+        displayName: model.displayName,
+        targetSoc: model.targetSoc,
+        runtimeVersion: model.runtimeVersion,
+        quant: model.precision,
+      }),
+    );
+    if (refusal) {
+      set({ error: refusal });
+      return;
+    }
+
+    if (get().installed.some((m) => m.runtimeModelName === model.modelName)) {
+      set({ error: `${model.displayName} is already installed.` });
+      return;
+    }
+
+    const row = await insertModel({
+      displayName: `${model.displayName} (NPU)`,
+      filePath: "",
+      quant: model.precision,
+      sizeBytes: 0,
+      minRamMb: model.minRamMb,
+      contextSize: 4096,
+      role: model.role,
+      state: "downloading",
+      backend: "qualcomm_npu",
+      artifact: model.artifact,
+      targetSoc: model.targetSoc,
+      runtimeVersion: model.runtimeVersion,
+      runtimeModelName: model.modelName,
+      trust: "unverified",
+    });
+    await get().refresh();
+
+    // An import still emits progress — unpacking a multi-gigabyte .zip is not
+    // instant, and a screen that looks frozen gets force-quit.
+    const unsubscribe = onNpuPullProgress((p) => {
+      if (p.modelName !== model.modelName) return;
+      set((state) => ({
+        progress: {
+          ...state.progress,
+          [row.id]: {
+            modelId: row.id,
+            status: "downloading",
+            bytesWritten: p.downloaded,
+            bytesTotal: p.total,
+            bytesPerSec: 0,
+            etaSeconds: null,
+          },
+        },
+      }));
+    });
+
+    // The picker hands back a content:// URI, which is not a filesystem path
+    // and cannot be opened as a File by the native side. So the archive is
+    // staged into app storage first — the same thing the GGUF import does —
+    // and removed as soon as the manager has unpacked it. That costs a second
+    // copy of a multi-gigabyte file for the duration of the import, which is
+    // the price of the picker handing out URIs rather than paths.
+    let staged: string | null = null;
+    try {
+      const dir = `${FileSystem.cacheDirectory}npu-import/`;
+      await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(
+        () => {},
+      );
+      staged = `${dir}bundle-${row.id}.zip`;
+      await FileSystem.copyAsync({ from: uri, to: staged });
+
+      const bundle = await npuImportBundle({
+        modelName: model.modelName,
+        localPath: staged,
+        precision: model.precision,
+        displayName: model.displayName,
+      });
+
+      // Identical to the download path on purpose: one definition of "a
+      // bundle Vesta will load", applied to both sources.
+      const check = checkBundle(bundle as MeasuredBundle);
+      if (!check.ok) {
+        await npuRemoveBundle(model.modelName).catch(() => {});
+        await removeModel(row.id);
+        await get().refresh();
+        set({ error: `${model.displayName}: ${check.message}` });
+        return;
+      }
+
+      await finalizeBundle(row.id, {
+        filePath: bundle.modelPath,
+        tokenizerPath: bundle.tokenizerPath ?? null,
+        sizeBytes: bundle.totalBytes,
+        bundleFiles: toBundleFiles(bundle.files),
+      });
+      await get().refresh();
+
+      if (check.warnings.length > 0) set({ error: check.warnings.join(" ") });
+
+      const active = await getActiveModel();
+      if (!active) await get().activate(row.id);
+    } catch (err) {
+      await npuRemoveBundle(model.modelName).catch(() => {});
+      await removeModel(row.id);
+      await get().refresh();
+      set({ error: `${model.displayName}: ${describeGenieXFailure(err)}` });
+    } finally {
+      unsubscribe();
+      // The staging copy has served its purpose either way: on success the
+      // manager holds its own unpacked copy, on failure there is nothing to
+      // resume from a half-read archive.
+      if (staged) {
+        await FileSystem.deleteAsync(staged, { idempotent: true }).catch(() => {});
+      }
       set((state) => {
         const progress = { ...state.progress };
         delete progress[row.id];

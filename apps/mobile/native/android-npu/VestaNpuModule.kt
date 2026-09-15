@@ -396,6 +396,268 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * sample refuses without one) and is validated on the TypeScript side
      * against this device before we get here.
      */
+    // ── Hub interrogation ────────────────────────────────────────────────
+    //
+    // Everything below asks the SAME source the pull itself resolves against,
+    // rather than re-deriving Qualcomm's catalogue by hand. That distinction is
+    // the whole reason these exist: an `rc=-100010` (hub model not found) is
+    // unactionable without knowing what the hub DOES have, and a hand-written
+    // answer to that question is stale the moment Qualcomm publishes anything.
+
+    /**
+     * One ModelPullInput, built once, used by pull(), queryModel() and
+     * importBundle().
+     *
+     * Shared on purpose. A dry run that resolves a DIFFERENT request from the
+     * one the download will make is worse than no dry run at all — it would
+     * report success for something we never asked for.
+     *
+     * `hf_token` is left null here and is never read from the config: nothing
+     * in Vesta's NPU path uses a credential, and this keeps it impossible for
+     * one to reach a log line.
+     */
+    private fun pullInputFrom(config: JSONObject): ModelPullInput {
+        val hub =
+            try {
+                HubSource.valueOf(config.optString("hub", "AIHUB").uppercase())
+            } catch (e: IllegalArgumentException) {
+                HubSource.AIHUB
+            }
+        return ModelPullInput(
+            config.getString("modelName"),
+            config.optString("precision", "").ifBlank { null },
+            hub,
+            config.optString("localPath", "").ifBlank { null },
+            null, // hf_token — never populated, never logged
+            config.optString("chipset", "").ifBlank { null },
+            config.optString("displayName", "").ifBlank { null },
+            ModelType.LLM,
+        )
+    }
+
+    /** What a request looks like, for the log and for the error report. */
+    private fun describeRequest(input: ModelPullInput): WritableMap {
+        val out = Arguments.createMap()
+        out.putString("modelName", input.model_name)
+        out.putString("precision", input.precision)
+        out.putString("chipset", input.chipset)
+        out.putString("hub", input.hub.name)
+        out.putString("modelType", input.model_type.name)
+        out.putString("localPath", input.local_path)
+        // Pinned for every session this module creates; stated here so one log
+        // line carries the whole request rather than half of it.
+        out.putString("runtimeId", RuntimeIdValue.QAIRT.value)
+        out.putString("computeUnit", ComputeUnitValue.NPU.value)
+        return out
+    }
+
+    /**
+     * Runs a pull flow to completion, emitting progress. Returns the failure as
+     * `(rc, message)` or null on success.
+     *
+     * Shared by pull() and importBundle() so the progress events, the
+     * cancellation behaviour and the error shape cannot diverge between them.
+     */
+    private suspend fun collectPull(
+        input: ModelPullInput,
+        modelName: String,
+    ): Pair<Int, String>? {
+        var failure: Pair<Int, String>? = null
+        ModelManagerWrapper.pullFlow(input).collect { event ->
+            when (event) {
+                is ModelManagerWrapper.PullEvent.Progress -> {
+                    var done = 0L
+                    var total = 0L
+                    val files = Arguments.createArray()
+                    for (f in event.files) {
+                        done += f.downloaded_bytes
+                        if (f.total_bytes > 0) total += f.total_bytes
+                        val entry = Arguments.createMap()
+                        entry.putString("name", f.file_name)
+                        entry.putDouble("downloaded", f.downloaded_bytes.toDouble())
+                        entry.putDouble("total", f.total_bytes.toDouble())
+                        files.pushMap(entry)
+                    }
+                    val payload = Arguments.createMap()
+                    payload.putString("modelName", modelName)
+                    payload.putDouble("downloaded", done.toDouble())
+                    payload.putDouble("total", total.toDouble())
+                    payload.putArray("files", files)
+                    reactApplicationContext.emitDeviceEvent(EVENT_PULL, payload)
+                }
+
+                is ModelManagerWrapper.PullEvent.Completed -> Unit
+
+                is ModelManagerWrapper.PullEvent.Error -> failure = event.code to event.message
+            }
+        }
+        return failure
+    }
+
+    /**
+     * A failure string that keeps the machine-readable parts machine-readable.
+     *
+     * `rc=<n>` first and always, because that is the only token that can be
+     * looked up against Qualcomm's error definitions, and the TypeScript side
+     * parses it back out to choose a readable sentence. The runtime's own
+     * message and its `lastErrorMessage()` follow when they say something the
+     * code does not — `-100010` alone does not tell you WHICH model the hub
+     * could not find.
+     */
+    private fun formatPullFailure(rc: Int, message: String): String {
+        val native = lastNativeError()
+        val parts = mutableListOf("rc=$rc")
+        if (message.isNotBlank()) parts.add(message)
+        if (native != null && native != message) parts.add(native)
+        return parts.joinToString(": ")
+    }
+
+    /**
+     * The native model manager, for the two calls the Kotlin wrapper does not
+     * re-export: `query()` and `lastErrorMessage()`.
+     *
+     * Instantiating a second one is safe, and that is not an assumption: the
+     * class has NO instance fields (verified with javap), and
+     * `ModelManagerWrapper`'s own static initializer does nothing but
+     * `ModelManager()`. Every method is a proxy onto process-global native
+     * state that `ensureSdk()` has already initialized.
+     *
+     * Used only inside try/catch, so an SDK release that drops or renames
+     * either method degrades to "not reported" instead of taking a screen down.
+     */
+    private val nativeManager: com.geniex.sdk.jni.ModelManager by lazy {
+        com.geniex.sdk.jni.ModelManager()
+    }
+
+    /** The runtime's own last error text, or null. Never carries a credential. */
+    private fun lastNativeError(): String? =
+        try {
+            nativeManager.lastErrorMessage()?.takeIf { it.isNotBlank() }
+        } catch (e: Throwable) {
+            null
+        }
+
+    /**
+     * Every model the hub offers, with the chipsets it offers each one FOR.
+     *
+     * `HubModel.chipsets` is the authoritative answer to "can this device have
+     * this model", in the hub's own vocabulary — which is also the string the
+     * pull must then be given. Asking beats guessing: Android says `SM8850`,
+     * GenieX's chipset table answers with a device name, and AI Hub's release
+     * manifest keys on a third spelling. Only one of those resolves an asset,
+     * and this is the call that says which.
+     */
+    @ReactMethod
+    fun hubModels(domain: String?, promise: Promise) {
+        scope.launch {
+            try {
+                if (!ensureSdk()) {
+                    promise.reject("NPU_UNAVAILABLE", initError ?: "No usable Qualcomm NPU runtime")
+                    return@launch
+                }
+                val models = ModelManagerWrapper.listHubModels(domain?.ifBlank { null })
+                val entries: WritableArray = Arguments.createArray()
+                for (m in models) {
+                    val entry = Arguments.createMap()
+                    entry.putString("name", m.name)
+                    entry.putString("modelType", m.model_type.name)
+                    val chipsets = Arguments.createArray()
+                    m.chipsets.forEach { chipsets.pushString(it) }
+                    entry.putArray("chipsets", chipsets)
+                    entries.pushMap(entry)
+                }
+                android.util.Log.i(TAG, "listHubModels -> ${models.size} entries")
+                val out = Arguments.createMap()
+                out.putArray("models", entries)
+                promise.resolve(out)
+            } catch (e: Throwable) {
+                // Resolved-with-error rather than rejected: "the hub could not
+                // be reached" is an ANSWER the Models screen has to show, and
+                // it is a different answer from "the hub does not have this".
+                android.util.Log.w(TAG, "listHubModels failed", e)
+                val out = Arguments.createMap()
+                out.putString("error", e.message ?: e.toString())
+                out.putString("nativeMessage", lastNativeError())
+                promise.resolve(out)
+            }
+        }
+    }
+
+    /**
+     * Resolves a pull WITHOUT downloading it.
+     *
+     * `ModelManager.query` takes the same ModelPullInput the download takes and
+     * returns what the hub would actually serve: the resolved model name, the
+     * runtime the asset was built for, and one candidate per available
+     * precision with its size. That size is the only published figure for these
+     * bundles — the release manifest carries none and the object cannot be
+     * HEADed — so it is also what lets the UI stop saying "approx 3 GB".
+     *
+     * A failure here costs nothing, which is exactly what should precede a
+     * multi-gigabyte download.
+     */
+    @ReactMethod
+    fun queryModel(configJson: String, promise: Promise) {
+        scope.launch {
+            val out = Arguments.createMap()
+            try {
+                if (!ensureSdk()) {
+                    promise.reject("NPU_UNAVAILABLE", initError ?: "No usable Qualcomm NPU runtime")
+                    return@launch
+                }
+                val input = pullInputFrom(JSONObject(configJson))
+                out.putMap("request", describeRequest(input))
+                android.util.Log.i(TAG, "query: model=${input.model_name} chipset=${input.chipset} precision=${input.precision} hub=${input.hub.name}")
+
+                val result = nativeManager.query(input)
+                if (result == null) {
+                    // The native side answers null for "nothing resolved" and
+                    // leaves the reason in lastErrorMessage.
+                    out.putString("error", lastNativeError() ?: "The hub did not resolve this model.")
+                    promise.resolve(out)
+                    return@launch
+                }
+                out.putString("resolvedName", result.model_name)
+                out.putString("runtimeId", result.runtime_id)
+                out.putString("modelType", result.model_type.name)
+                val candidates = Arguments.createArray()
+                for (c in result.candidates) {
+                    val entry = Arguments.createMap()
+                    entry.putString("precision", c.precision)
+                    entry.putDouble("sizeBytes", c.size.toDouble())
+                    candidates.pushMap(entry)
+                }
+                out.putArray("candidates", candidates)
+                promise.resolve(out)
+            } catch (e: Throwable) {
+                android.util.Log.w(TAG, "query failed", e)
+                out.putString("error", e.message ?: e.toString())
+                out.putString("nativeMessage", lastNativeError())
+                (e as? ModelManagerWrapper.GenieXModelError)?.let { out.putInt("rc", it.code) }
+                promise.resolve(out)
+            }
+        }
+    }
+
+    /**
+     * The name the manager resolves an alias to. Null when it cannot, which is
+     * itself worth knowing when a pull reports "model not found".
+     */
+    @ReactMethod
+    fun resolveModelAlias(modelName: String, promise: Promise) {
+        scope.launch {
+            try {
+                if (!ensureSdk()) {
+                    promise.resolve(null)
+                    return@launch
+                }
+                promise.resolve(ModelManagerWrapper.resolveAlias(modelName))
+            } catch (e: Throwable) {
+                promise.resolve(null)
+            }
+        }
+    }
+
     @ReactMethod
     fun pull(configJson: String, promise: Promise) {
         if (pullJob?.isActive == true) {
@@ -410,17 +672,10 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                         return@launch
                     }
                     val config = JSONObject(configJson)
-                    val modelName = config.getString("modelName")
-                    val chipset = config.optString("chipset", "").ifBlank { null }
-                    val precision = config.optString("precision", "").ifBlank { null }
-                    val hub =
-                        try {
-                            HubSource.valueOf(config.optString("hub", "AIHUB").uppercase())
-                        } catch (e: IllegalArgumentException) {
-                            HubSource.AIHUB
-                        }
+                    val input = pullInputFrom(config)
+                    val modelName = input.model_name
 
-                    if (hub == HubSource.AIHUB && chipset == null) {
+                    if (input.hub == HubSource.AIHUB && input.chipset == null) {
                         promise.reject(
                             "NPU_CHIPSET_REQUIRED",
                             "An AI Hub bundle cannot be pulled without a chipset.",
@@ -428,52 +683,25 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                         return@launch
                     }
 
-                    val input =
-                        ModelPullInput(
-                            modelName,
-                            precision,
-                            hub,
-                            null,
-                            null,
-                            chipset,
-                            config.optString("displayName", "").ifBlank { null },
-                            ModelType.LLM,
+                    // The whole request, before a byte moves. Without this an
+                    // rc=-100010 is a number with no subject: it does not say
+                    // which name, which chipset or which precision was asked
+                    // for, and those are exactly the three things that decide
+                    // whether an asset resolves.
+                    android.util.Log.i(
+                        TAG,
+                        "pull: model=${input.model_name} chipset=${input.chipset} " +
+                            "precision=${input.precision} hub=${input.hub.name} " +
+                            "runtime=${RuntimeIdValue.QAIRT.value} compute=${ComputeUnitValue.NPU.value}",
+                    )
+
+                    val failure = collectPull(input, modelName)
+
+                    if (failure != null) {
+                        promise.reject(
+                            "NPU_PULL_FAILED",
+                            formatPullFailure(failure.first, failure.second),
                         )
-
-                    var failure: Pair<Int, String>? = null
-                    ModelManagerWrapper.pullFlow(input).collect { event ->
-                        when (event) {
-                            is ModelManagerWrapper.PullEvent.Progress -> {
-                                var done = 0L
-                                var total = 0L
-                                val files = Arguments.createArray()
-                                for (f in event.files) {
-                                    done += f.downloaded_bytes
-                                    if (f.total_bytes > 0) total += f.total_bytes
-                                    val entry = Arguments.createMap()
-                                    entry.putString("name", f.file_name)
-                                    entry.putDouble("downloaded", f.downloaded_bytes.toDouble())
-                                    entry.putDouble("total", f.total_bytes.toDouble())
-                                    files.pushMap(entry)
-                                }
-                                val payload = Arguments.createMap()
-                                payload.putString("modelName", modelName)
-                                payload.putDouble("downloaded", done.toDouble())
-                                payload.putDouble("total", total.toDouble())
-                                payload.putArray("files", files)
-                                reactApplicationContext.emitDeviceEvent(EVENT_PULL, payload)
-                            }
-
-                            is ModelManagerWrapper.PullEvent.Completed -> Unit
-
-                            is ModelManagerWrapper.PullEvent.Error ->
-                                failure = event.code to event.message
-                        }
-                    }
-
-                    val err = failure
-                    if (err != null) {
-                        promise.reject("NPU_PULL_FAILED", "rc=${err.first}: ${err.second}")
                         return@launch
                     }
                     // Completion is not "the flow ended" — it is "the manager now
@@ -492,6 +720,84 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     promise.reject("NPU_PULL_CANCELED", "Download canceled")
                 } catch (e: Throwable) {
                     promise.reject("NPU_PULL_FAILED", e.message, e)
+                }
+            }
+    }
+
+    /**
+     * Registers a bundle the user already has, from a local directory or a
+     * `.zip`, through the manager's own `LOCALFS` source.
+     *
+     * Deliberately the same code path as the AI Hub pull, differing only in
+     * `hub` and `local_path`. The manager does the unpacking, the layout
+     * validation and the `runtime_id` determination it always does, and the
+     * result goes through `describeBundle()` — so an imported bundle is
+     * measured, hashed and recorded EXACTLY like a downloaded one. A separate
+     * hand-rolled importer would be a second definition of "valid bundle", and
+     * the two would drift.
+     *
+     * This exists because the hub path can fail for reasons no amount of client
+     * code can fix: an asset that is not published for this chipset yet. A user
+     * who has exported one themselves with `qai-hub-models` should not be
+     * blocked on Qualcomm's release schedule.
+     */
+    @ReactMethod
+    fun importBundle(configJson: String, promise: Promise) {
+        if (pullJob?.isActive == true) {
+            promise.reject("NPU_PULL_BUSY", "A bundle is already being installed")
+            return
+        }
+        pullJob =
+            scope.launch {
+                try {
+                    if (!ensureSdk()) {
+                        promise.reject("NPU_UNAVAILABLE", initError ?: "No usable Qualcomm NPU runtime")
+                        return@launch
+                    }
+                    val config = JSONObject(configJson)
+                    val localPath = config.optString("localPath", "").ifBlank { null }
+                    if (localPath == null) {
+                        promise.reject("NPU_IMPORT_NO_PATH", "No bundle path was given.")
+                        return@launch
+                    }
+                    val source = File(stripScheme(localPath))
+                    if (!source.exists()) {
+                        // Checked here rather than left to the manager, because
+                        // "that path does not exist" is a mistake the user can
+                        // fix and deserves to be told in those words.
+                        promise.reject(
+                            "NPU_IMPORT_NOT_FOUND",
+                            "Nothing at $localPath — pick the bundle directory or its .zip.",
+                        )
+                        return@launch
+                    }
+
+                    val input = pullInputFrom(
+                        JSONObject(configJson).put("hub", HubSource.LOCALFS.name),
+                    )
+                    android.util.Log.i(TAG, "import: model=${input.model_name} from=${source.absolutePath}")
+
+                    val failure = collectPull(input, input.model_name)
+                    if (failure != null) {
+                        promise.reject(
+                            "NPU_IMPORT_FAILED",
+                            formatPullFailure(failure.first, failure.second),
+                        )
+                        return@launch
+                    }
+                    val paths = ModelManagerWrapper.getPaths(input.model_name)
+                    if (paths == null) {
+                        promise.reject(
+                            "NPU_IMPORT_INCOMPLETE",
+                            "The import ended without producing a complete bundle.",
+                        )
+                        return@launch
+                    }
+                    promise.resolve(describeBundle(input.model_name, paths))
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    promise.reject("NPU_PULL_CANCELED", "Import canceled")
+                } catch (e: Throwable) {
+                    promise.reject("NPU_IMPORT_FAILED", e.message, e)
                 }
             }
     }

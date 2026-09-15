@@ -19,6 +19,10 @@ interface NpuNativeModule {
   probe(): Promise<NpuProbeResult>;
   deviceChipset(): Promise<NpuChipsetReport>;
   pull(configJson: string): Promise<NpuBundleInfo>;
+  importBundle(configJson: string): Promise<NpuBundleInfo>;
+  hubModels(domain: string | null): Promise<NpuHubModelsResult>;
+  queryModel(configJson: string): Promise<NpuModelQuery>;
+  resolveModelAlias(modelName: string): Promise<string | null>;
   cancelPull(): void;
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
   removeBundle(modelName: string): Promise<void>;
@@ -122,6 +126,69 @@ export interface NpuBundleInfo {
   modelType?: string | null;
   files: NpuBundleFile[];
   totalBytes: number;
+}
+
+/** One row of the hub catalogue, as `listHubModels()` returns it. */
+export interface NpuHubModel {
+  name: string;
+  modelType: string;
+  /** Every chipset the hub has this model for, in the hub's own spelling. */
+  chipsets: string[];
+}
+
+/**
+ * Either the catalogue or the reason there isn't one.
+ *
+ * Resolved-with-error rather than thrown: "the hub could not be reached" is an
+ * answer the install path has to act on, and it is a different answer from
+ * "the hub does not have this model".
+ */
+export interface NpuHubModelsResult {
+  models?: NpuHubModel[];
+  error?: string | null;
+  nativeMessage?: string | null;
+}
+
+/** A precision the hub can serve, with the size it would download. */
+export interface NpuPrecisionCandidate {
+  precision: string | null;
+  sizeBytes: number;
+}
+
+/**
+ * What `ModelManager.query()` says a pull WOULD resolve to — no download.
+ *
+ * `request` echoes exactly what was asked, so a failure report carries its own
+ * subject: an rc with no model name, chipset and precision beside it cannot be
+ * acted on.
+ */
+export interface NpuModelQuery {
+  request?: {
+    modelName: string | null;
+    precision: string | null;
+    chipset: string | null;
+    hub: string | null;
+    modelType: string | null;
+    localPath: string | null;
+    runtimeId: string | null;
+    computeUnit: string | null;
+  };
+  resolvedName?: string | null;
+  runtimeId?: string | null;
+  modelType?: string | null;
+  candidates?: NpuPrecisionCandidate[];
+  /** Set when nothing resolved. The runtime's own words where it gave any. */
+  error?: string | null;
+  nativeMessage?: string | null;
+  rc?: number;
+}
+
+export interface NpuImportConfig {
+  modelName: string;
+  /** The directory or .zip the user picked. */
+  localPath: string;
+  precision?: string | null;
+  displayName?: string | null;
 }
 
 export interface NpuPullConfig {
@@ -269,6 +336,56 @@ export async function npuUnload(): Promise<void> {
 export async function npuPull(config: NpuPullConfig): Promise<NpuBundleInfo> {
   if (!moduleAvailable()) throw new Error("No Qualcomm NPU runtime in this build.");
   return Npu!.pull(JSON.stringify(config));
+}
+
+/**
+ * Registers a bundle the user already has, through the manager's own LOCALFS
+ * source — the same validation, measurement and hashing a downloaded bundle
+ * gets, differing only in where the bytes came from.
+ */
+export async function npuImportBundle(
+  config: NpuImportConfig,
+): Promise<NpuBundleInfo> {
+  if (!moduleAvailable()) throw new Error("No Qualcomm NPU runtime in this build.");
+  return Npu!.importBundle(JSON.stringify(config));
+}
+
+/**
+ * The hub's own catalogue. Null when there is no bridge to ask.
+ *
+ * @param domain Optional hub domain filter; null asks for everything.
+ */
+export async function npuHubModels(
+  domain: string | null = null,
+): Promise<NpuHubModelsResult | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.hubModels(domain);
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Dry-runs a pull. Cheap, and exactly what should precede a multi-GB download. */
+export async function npuQueryModel(
+  config: NpuPullConfig,
+): Promise<NpuModelQuery | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.queryModel(JSON.stringify(config));
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** What the manager resolves a model alias to, or null when it cannot. */
+export async function npuResolveAlias(modelName: string): Promise<string | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.resolveModelAlias(modelName);
+  } catch {
+    return null;
+  }
 }
 
 export function npuCancelPull(): void {
