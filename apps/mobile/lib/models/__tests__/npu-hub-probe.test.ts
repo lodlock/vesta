@@ -100,14 +100,61 @@ describe("asking the runtime", () => {
     );
   });
 
-  it("formats one line per candidate, with the pull request named", () => {
+  it("gives every value its own full-length line, under its own label", () => {
+    // The screen truncated `qualcomm/Qwen3-4B-Instruct-2507` and
+    // `ai-hub-models/Qwen3-4B-Instruct-2507` down to an identical stub — they
+    // differ only in a prefix, and a two-column layout put that prefix off the
+    // right edge. So the text form never abbreviates and never aligns.
+    return probeHubIdentity(
+      QWEN,
+      null,
+      async (n) => (n.startsWith("ai-hub-models/") ? "resolved/x" : null),
+      QWEN,
+      "AIHUB",
+    ).then((probe) => {
+      const lines = formatProbe(probe).split("\n");
+
+      // Each candidate appears ALONE on a line, whole.
+      for (const row of probe.rows) {
+        expect(lines).toContain(row.candidate);
+      }
+      expect(lines).toContain("ai-hub-models/Qwen3-4B-Instruct-2507");
+      expect(lines).toContain(QWEN);
+
+      // Nothing is shortened.
+      expect(formatProbe(probe)).not.toContain("…");
+      expect(formatProbe(probe)).not.toContain("...");
+    });
+  });
+
+  it("keeps the four values distinguishable, each explicitly labelled", () => {
+    // Pull name, hub, candidate and resolveAlias result. Conflating any two of
+    // them is how the last three attempts went wrong.
     return probeHubIdentity(QWEN, null, async () => null, QWEN, "AIHUB").then(
       (probe) => {
         const text = formatProbe(probe);
-        expect(text).toContain(QWEN);
-        expect(text).toContain("AIHUB");
-        expect(text).toContain("(no answer)");
-        expect(text.split("\n").length).toBe(probe.rows.length + 1);
+        expect(text).toContain("Pull model name: " + QWEN);
+        expect(text).toContain("HubSource: AIHUB");
+        expect(text).toContain("Candidate:");
+        expect(text).toContain("resolveAlias:");
+        expect(text).toContain("source: ");
+      },
+    );
+  });
+
+  it("writes <null> for a resolver that answered nothing", () => {
+    // Distinct from the string echoing back unchanged, and distinct from a
+    // blank — a blank reads as neither.
+    return probeHubIdentity(QWEN, null, async () => null, QWEN, "AIHUB").then(
+      (probe) => {
+        const lines = formatProbe(probe).split("\n");
+        expect(lines).toContain("<null>");
+        // Every resolveAlias label is followed by a real value, never by a
+        // blank. Blank lines DO appear — they separate entries — so the
+        // invariant is about position, not about their absence.
+        lines.forEach((line, i) => {
+          if (line === "resolveAlias:") expect(lines[i + 1]).not.toBe("");
+        });
       },
     );
   });

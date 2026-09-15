@@ -403,6 +403,25 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * sample refuses without one) and is validated on the TypeScript side
      * against this device before we get here.
      */
+    /**
+     * Writes a diagnostic block to logcat under this module's own tag.
+     *
+     * So `adb logcat -s VestaNpu` carries the identity probe in the SAME
+     * capture as the pull request and its failure — three things that have to
+     * be read together and were landing under two different tags
+     * (ReactNativeJS for anything console.log touched).
+     *
+     * Split per line rather than logged as one blob: logcat truncates a single
+     * entry at a few kilobytes, and a truncated diagnostic is the problem this
+     * whole pass exists to fix.
+     */
+    @ReactMethod
+    fun logDiagnostic(message: String) {
+        for (line in message.lines()) {
+            android.util.Log.i(TAG, line)
+        }
+    }
+
     // ── Hub interrogation ────────────────────────────────────────────────
     //
     // Everything below asks the SAME source the pull itself resolves against,

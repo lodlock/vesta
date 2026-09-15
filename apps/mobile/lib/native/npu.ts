@@ -22,6 +22,7 @@ interface NpuNativeModule {
   importBundle(configJson: string): Promise<NpuBundleInfo>;
   hubModels(domain: string | null): Promise<NpuHubModelsResult>;
   resolveModelAlias(modelName: string): Promise<string | null>;
+  logDiagnostic(message: string): void;
   cancelPull(): void;
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
   removeBundle(modelName: string): Promise<void>;
@@ -328,6 +329,25 @@ export async function npuHubModels(
     return await Npu!.hubModels(domain);
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Writes a diagnostic block to logcat under the VestaNpu tag.
+ *
+ * So one `adb logcat -s VestaNpu` capture carries the identity probe, the pull
+ * request and its failure together — three things that have to be read side by
+ * side and were landing under two different tags.
+ *
+ * Silently does nothing in a default build; the caller logs to the console
+ * either way, so nothing is lost.
+ */
+export function npuLogDiagnostic(message: string): void {
+  if (!moduleAvailable()) return;
+  try {
+    Npu!.logDiagnostic(message);
+  } catch {
+    // A logging call must never be the thing that breaks a screen.
   }
 }
 

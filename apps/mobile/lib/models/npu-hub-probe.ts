@@ -113,10 +113,40 @@ export async function probeHubIdentity(
   return { rows, pullName, hub };
 }
 
-/** The probe as a log line, one row per candidate. */
+/**
+ * The probe as plain text: the clipboard payload, and the logcat payload.
+ *
+ * Deliberately NOT a two-column table. The first rendering of this aligned
+ * candidate and result in columns, and the screen truncated exactly the part
+ * that mattered — `qualcomm/Qwen3-4B-Instruct-2507` and
+ * `ai-hub-models/Qwen3-4B-Instruct-2507` differ only in a prefix that fell off
+ * the right edge. So every value gets its own line, under its own label, at
+ * full length.
+ *
+ * The four things this has to keep distinguishable, because conflating any two
+ * of them is how the last three attempts went wrong:
+ *
+ *   Pull model name   what the install path would actually send
+ *   HubSource         which hub it would send it to
+ *   Candidate         the string handed to resolveAlias()
+ *   resolveAlias      what came back — `<null>` when nothing did, which is a
+ *                     different answer from the string echoing back unchanged
+ */
 export function formatProbe(probe: HubIdentityProbe): string {
-  const rows = probe.rows
-    .map((r) => `  ${r.candidate}  ->  ${r.resolved ?? "(no answer)"}   [${r.source}]`)
-    .join("\n");
-  return `hub identity probe (pull would use ${probe.pullName} via ${probe.hub}):\n${rows}`;
+  const lines = [
+    "Hub identity probe",
+    `Pull model name: ${probe.pullName}`,
+    `HubSource: ${probe.hub}`,
+  ];
+  for (const row of probe.rows) {
+    lines.push(
+      "",
+      "Candidate:",
+      row.candidate,
+      "resolveAlias:",
+      row.resolved ?? "<null>",
+      `source: ${row.source}`,
+    );
+  }
+  return lines.join("\n");
 }

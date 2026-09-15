@@ -11,6 +11,8 @@ import {
   Text,
   TouchableOpacity,
   StyleSheet,
+  Platform,
+  Clipboard,
 } from "react-native";
 import {
   getModelInfo,
@@ -42,7 +44,7 @@ import {
   formatProbe,
   type HubIdentityProbe,
 } from "../lib/models/npu-hub-probe";
-import { npuResolveAlias } from "../lib/native/npu";
+import { npuResolveAlias, npuLogDiagnostic } from "../lib/native/npu";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
@@ -147,6 +149,7 @@ function Row({ label, value }: { label: string; value: string }) {
 export default function DiagnosticsScreen() {
   const [probe, setProbe] = useState<HubIdentityProbe | null>(null);
   const [probing, setProbing] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
 
   // Explicitly triggered, never on render: this calls into the runtime, and a
   // diagnostics screen that fetched on its own would report a state the rest
@@ -172,12 +175,32 @@ export default function DiagnosticsScreen() {
         "AIHUB",
       );
       setProbe(result);
-      // Logged as well, so it lands in the same logcat capture as the pull.
-      console.log(`[Diagnostics] ${formatProbe(result)}`);
+      // Logged under the VestaNpu tag, not the JS one, so a single
+      // `adb logcat -s VestaNpu` capture carries the probe, the pull request
+      // and its failure together. Also to the JS console, which is where a
+      // default build (no native bridge) can still see it.
+      const text = formatProbe(result);
+      npuLogDiagnostic(text);
+      console.log(`[Diagnostics] ${text}`);
     } finally {
       setProbing(false);
     }
   }, []);
+
+  // Clipboard comes from react-native core. Still present in 0.83 (with a
+  // deprecation warning) and already linked — pulling in a new native
+  // dependency mid-investigation would cost a rebuild to copy a string.
+  // Reports failure honestly rather than claiming a copy that did not happen.
+  const copyProbe = useCallback(() => {
+    if (!probe) return;
+    try {
+      Clipboard.setString(formatProbe(probe));
+      setCopied("Copied");
+    } catch {
+      setCopied("Copy failed");
+    }
+    setTimeout(() => setCopied(null), 2000);
+  }, [probe]);
 
   const [diag, setDiag] = useState<Diag | null>(null);
 
@@ -299,15 +322,34 @@ export default function DiagnosticsScreen() {
               <Text style={styles.probeTitle}>Hub identity probe</Text>
               {probe ? (
                 <>
-                  <Text style={styles.hint}>
-                    Pull would use {probe.pullName} via {probe.hub}
+                  {/* The four values that must stay distinguishable. Each on
+                      its own line, at full length: the first rendering of this
+                      put candidate and result in aligned columns and the screen
+                      truncated exactly the prefix that distinguishes
+                      qualcomm/… from ai-hub-models/…. */}
+                  <Text style={styles.probeKey}>Pull model name:</Text>
+                  <Text style={styles.probeVal} selectable>
+                    {probe.pullName}
+                  </Text>
+                  <Text style={styles.probeKey}>HubSource:</Text>
+                  <Text style={styles.probeVal} selectable>
+                    {probe.hub}
                   </Text>
                   {probe.rows.map((r) => (
-                    <Row
-                      key={r.candidate}
-                      label={r.candidate}
-                      value={r.resolved ?? "(no answer)"}
-                    />
+                    <View key={r.candidate} style={styles.probeEntry}>
+                      <Text style={styles.probeKey}>Candidate:</Text>
+                      <Text style={styles.probeVal} selectable>
+                        {r.candidate}
+                      </Text>
+                      <Text style={styles.probeKey}>resolveAlias:</Text>
+                      {/* <null> rather than a blank: "the runtime said
+                          nothing" is a different answer from "it echoed the
+                          string back", and a blank reads as neither. */}
+                      <Text style={styles.probeVal} selectable>
+                        {r.resolved ?? "<null>"}
+                      </Text>
+                      <Text style={styles.probeSource}>source: {r.source}</Text>
+                    </View>
                   ))}
                 </>
               ) : (
@@ -316,16 +358,27 @@ export default function DiagnosticsScreen() {
                   name. Run it, then read the answers beside the pull log.
                 </Text>
               )}
-              <TouchableOpacity
-                style={styles.probeBtn}
-                onPress={runProbe}
-                disabled={probing}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.probeBtnText}>
-                  {probing ? "Probing…" : probe ? "Run again" : "Run identity probe"}
-                </Text>
-              </TouchableOpacity>
+              <View style={styles.probeActions}>
+                <TouchableOpacity
+                  style={styles.probeBtn}
+                  onPress={runProbe}
+                  disabled={probing}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.probeBtnText}>
+                    {probing ? "Probing…" : probe ? "Run again" : "Run identity probe"}
+                  </Text>
+                </TouchableOpacity>
+                {probe && (
+                  <TouchableOpacity
+                    style={styles.probeBtn}
+                    onPress={copyProbe}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.probeBtnText}>{copied ?? "Copy"}</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
             </View>
           </>
         )}
@@ -585,6 +638,27 @@ const styles = StyleSheet.create({
   },
   probeBtnText: { ...typography.bodySmall, color: colors.textPrimary },
   probeTitle: { ...typography.body, color: colors.textPrimary },
+  probeActions: { flexDirection: "row", gap: spacing.sm, flexWrap: "wrap" },
+  probeEntry: {
+    marginTop: spacing.md,
+    paddingTop: spacing.sm,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+  },
+  probeKey: {
+    ...typography.caption,
+    color: colors.textMuted,
+    marginTop: spacing.xs,
+  },
+  // Monospaced and free to wrap. No numberOfLines, no ellipsis: a truncated
+  // identifier is the bug this screen exists to avoid.
+  probeVal: {
+    fontFamily: Platform.select({ android: "monospace", default: "Menlo" }),
+    fontSize: 12,
+    lineHeight: 17,
+    color: colors.textPrimary,
+  },
+  probeSource: { ...typography.caption, color: colors.textMuted },
   backendBlock: { paddingVertical: 4 },
   container: { flex: 1, backgroundColor: colors.bg },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
