@@ -23,6 +23,7 @@ interface NpuNativeModule {
   hubModels(domain: string | null): Promise<NpuHubModelsResult>;
   resolveModelAlias(modelName: string): Promise<string | null>;
   logDiagnostic(message: string): void;
+  hubCacheReport(): Promise<NpuHubCacheReport>;
   cancelPull(): void;
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
   removeBundle(modelName: string): Promise<void>;
@@ -147,6 +148,37 @@ export interface NpuHubModelsResult {
   models?: NpuHubModel[];
   error?: string | null;
   nativeMessage?: string | null;
+}
+
+/** One file in the runtime's own hub-metadata cache. */
+export interface NpuCacheFile {
+  path: string;
+  sizeBytes: number;
+  modifiedAt: number;
+  /** Present for .json only — the metadata, never the weights. */
+  content?: string | null;
+}
+
+/**
+ * Where the AI Hub data this app is acting on actually came from.
+ *
+ * The runtime caches its hub metadata under our own data directory, so the
+ * manifests `listHubModels()` and `pull()` consulted are files we own and may
+ * read. This is the only way to answer whether the two are looking at the same
+ * release — the SDK exposes no API for it.
+ */
+export interface NpuHubCacheReport {
+  env?: {
+    GENIEX_AIHUBBASEURL: string | null;
+    GENIEX_AIHUBVERSION: string | null;
+    GENIEX_DATADIR: string | null;
+    /** "set" or "unset". The value is never read or reported. */
+    GENIEX_HFTOKEN: string | null;
+  };
+  dataDir?: string;
+  dataDirExists?: boolean;
+  files?: NpuCacheFile[];
+  error?: string | null;
 }
 
 export interface NpuImportConfig {
@@ -348,6 +380,21 @@ export function npuLogDiagnostic(message: string): void {
     Npu!.logDiagnostic(message);
   } catch {
     // A logging call must never be the thing that breaks a screen.
+  }
+}
+
+/**
+ * Reads the runtime's own hub-metadata cache. Null in a default build.
+ *
+ * Read-only, and it triggers no fetch: the point is to report what the app has
+ * already acted on, not to go and get a fresh answer that nothing else saw.
+ */
+export async function npuHubCacheReport(): Promise<NpuHubCacheReport | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.hubCacheReport();
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
   }
 }
 

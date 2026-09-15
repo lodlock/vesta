@@ -42,9 +42,14 @@ import { breakDownHubModels } from "../lib/models/npu-hub";
 import {
   probeHubIdentity,
   formatProbe,
+  formatCacheReport,
   type HubIdentityProbe,
 } from "../lib/models/npu-hub-probe";
-import { npuResolveAlias, npuLogDiagnostic } from "../lib/native/npu";
+import {
+  npuResolveAlias,
+  npuLogDiagnostic,
+  npuHubCacheReport,
+} from "../lib/native/npu";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
@@ -150,6 +155,10 @@ export default function DiagnosticsScreen() {
   const [probe, setProbe] = useState<HubIdentityProbe | null>(null);
   const [probing, setProbing] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  // The whole diagnostic as text: what gets copied and what gets logged.
+  // Kept beside the structured probe because the text is the artefact that
+  // leaves the device, and it must never be the abbreviated one.
+  const [report, setReport] = useState<string | null>(null);
 
   // Explicitly triggered, never on render: this calls into the runtime, and a
   // diagnostics screen that fetched on its own would report a state the rest
@@ -175,11 +184,24 @@ export default function DiagnosticsScreen() {
         "AIHUB",
       );
       setProbe(result);
+
+      // The cache the runtime actually read, gathered in the same action.
+      // listHubModels() finds this model and pull() reports it missing; both
+      // cannot be true of one manifest, and the manifests are files in our own
+      // data directory. Read-only, and it triggers no fetch — the point is to
+      // report what the app already acted on.
+      const repo = entry.modelName.slice(entry.modelName.lastIndexOf("/") + 1);
+      const cache = await npuHubCacheReport();
+
       // Logged under the VestaNpu tag, not the JS one, so a single
-      // `adb logcat -s VestaNpu` capture carries the probe, the pull request
-      // and its failure together. Also to the JS console, which is where a
-      // default build (no native bridge) can still see it.
-      const text = formatProbe(result);
+      // `adb logcat -s VestaNpu` capture carries the probe, the cache, the
+      // pull request and its failure together. Also to the JS console, which
+      // is where a default build (no native bridge) can still see it.
+      const text = [
+        formatProbe(result),
+        cache ? formatCacheReport(cache, repo) : "Hub cache report\nunavailable (no NPU bridge in this build)",
+      ].join("\n\n");
+      setReport(text);
       npuLogDiagnostic(text);
       console.log(`[Diagnostics] ${text}`);
     } finally {
@@ -192,15 +214,15 @@ export default function DiagnosticsScreen() {
   // dependency mid-investigation would cost a rebuild to copy a string.
   // Reports failure honestly rather than claiming a copy that did not happen.
   const copyProbe = useCallback(() => {
-    if (!probe) return;
+    if (!report) return;
     try {
-      Clipboard.setString(formatProbe(probe));
+      Clipboard.setString(report);
       setCopied("Copied");
     } catch {
       setCopied("Copy failed");
     }
     setTimeout(() => setCopied(null), 2000);
-  }, [probe]);
+  }, [report]);
 
   const [diag, setDiag] = useState<Diag | null>(null);
 
@@ -335,6 +357,12 @@ export default function DiagnosticsScreen() {
                   <Text style={styles.probeVal} selectable>
                     {probe.hub}
                   </Text>
+                  {report && (
+                    <Text style={styles.probeSource}>
+                      {report.split("\n").length} lines captured, including the
+                      cached hub manifests. Use Copy for the whole thing.
+                    </Text>
+                  )}
                   {probe.rows.map((r) => (
                     <View key={r.candidate} style={styles.probeEntry}>
                       <Text style={styles.probeKey}>Candidate:</Text>
@@ -355,7 +383,9 @@ export default function DiagnosticsScreen() {
               ) : (
                 <Text style={styles.hint}>
                   Asks the runtime what it makes of each spelling of the model
-                  name. Run it, then read the answers beside the pull log.
+                  name, and reads the hub manifests it cached under this app&rsquo;s
+                  own data directory. Copy the result — it is the full text,
+                  never the abbreviated one.
                 </Text>
               )}
               <View style={styles.probeActions}>
@@ -366,10 +396,10 @@ export default function DiagnosticsScreen() {
                   activeOpacity={0.7}
                 >
                   <Text style={styles.probeBtnText}>
-                    {probing ? "Probing…" : probe ? "Run again" : "Run identity probe"}
+                    {probing ? "Probing…" : probe ? "Run again" : "Run hub diagnostics"}
                   </Text>
                 </TouchableOpacity>
-                {probe && (
+                {report && (
                   <TouchableOpacity
                     style={styles.probeBtn}
                     onPress={copyProbe}

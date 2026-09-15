@@ -13,6 +13,8 @@ import {
   identityCandidates,
   probeHubIdentity,
   formatProbe,
+  formatCacheReport,
+  mentionsModel,
 } from "../npu-hub-probe";
 
 const QWEN = "qualcomm/Qwen3-4B-Instruct-2507";
@@ -157,5 +159,102 @@ describe("asking the runtime", () => {
         });
       },
     );
+  });
+});
+
+// The runtime caches its hub metadata under our own data directory, so the
+// manifests listHubModels() and pull() consulted are files we can read.
+// listHubModels() finds Qwen3-4B-Instruct-2507 and pull() reports it missing;
+// both cannot be true of one manifest, and this is how a human sees which.
+describe("the cache report", () => {
+  const REPO = "Qwen3-4B-Instruct-2507";
+
+  it("says plainly whether a cached manifest mentions the model", () => {
+    expect(mentionsModel('{"id":"Qwen3-4B-Instruct-2507"}', REPO)).toContain(
+      REPO,
+    );
+    // And catches the other spellings a manifest might key on.
+    expect(mentionsModel('{"id":"qwen3_4b_instruct_2507"}', REPO)).toContain(
+      "qwen3_4b_instruct_2507",
+    );
+    expect(mentionsModel('{"models":[]}', REPO)).toEqual([]);
+  });
+
+  it("marks a manifest that does NOT mention it, which is the whole point", () => {
+    const text = formatCacheReport(
+      {
+        dataDir: "/data/geniex",
+        dataDirExists: true,
+        files: [
+          {
+            path: "aihub/info.json",
+            sizeBytes: 12,
+            modifiedAt: 0,
+            content: '{"models":[]}',
+          },
+        ],
+      },
+      REPO,
+    );
+    expect(text).toContain(`mentions ${REPO}: NO`);
+  });
+
+  it("includes JSON bodies whole — an abbreviated manifest answers nothing", () => {
+    const body = '{"models":[{"id":"Qwen3-4B-Instruct-2507","domain":"qualcomm"}]}';
+    const text = formatCacheReport(
+      {
+        dataDir: "/data/geniex",
+        dataDirExists: true,
+        files: [
+          { path: "aihub/info.json", sizeBytes: 99, modifiedAt: 0, content: body },
+        ],
+      },
+      REPO,
+    );
+    expect(text).toContain(body);
+    expect(text).not.toContain("…");
+  });
+
+  it("reports the endpoint and release, and says when they are unset", () => {
+    // Unset is an ANSWER: it means the SDK's built-in default applies, and it
+    // is what decides which manifest gets fetched.
+    const text = formatCacheReport(
+      {
+        env: {
+          GENIEX_AIHUBBASEURL: null,
+          GENIEX_AIHUBVERSION: null,
+          GENIEX_DATADIR: null,
+          GENIEX_HFTOKEN: "unset",
+        },
+        files: [],
+      },
+      REPO,
+    );
+    expect(text).toContain("GENIEX_AIHUBBASEURL: <unset>");
+    expect(text).toContain("GENIEX_AIHUBVERSION: <unset>");
+  });
+
+  it("never reports a token value, only whether one is set", () => {
+    const text = formatCacheReport(
+      {
+        env: {
+          GENIEX_AIHUBBASEURL: null,
+          GENIEX_AIHUBVERSION: null,
+          GENIEX_DATADIR: null,
+          GENIEX_HFTOKEN: "set",
+        },
+        files: [],
+      },
+      REPO,
+    );
+    expect(text).toContain("GENIEX_HFTOKEN: set");
+    // The native side only ever sends "set"/"unset"; nothing here can leak one.
+    expect(text).not.toMatch(/hf_[A-Za-z0-9]{8,}/);
+  });
+
+  it("survives an empty or failed report without inventing content", () => {
+    expect(formatCacheReport({ error: "boom" }, REPO)).toContain("error: boom");
+    expect(formatCacheReport({}, REPO)).toContain("files: 0");
+    expect(formatCacheReport({}, REPO)).toContain("dataDir: <none>");
   });
 });

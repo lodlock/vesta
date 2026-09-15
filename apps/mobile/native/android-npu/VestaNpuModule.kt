@@ -159,6 +159,10 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         private const val EVENT_TOKEN = "vestaNpuToken"
         private const val EVENT_PULL = "vestaNpuPullProgress"
 
+        /** Cache-report bounds. Metadata is small; the weights are not. */
+        private const val MAX_CACHE_ENTRIES = 200
+        private const val MAX_JSON_BYTES = 128L * 1024L
+
         /** The plugin GenieX loads for the Hexagon path, as a file name. */
         private const val QAIRT_PLUGIN_LIB = "libgeniex_plugin_qairt.so"
 
@@ -419,6 +423,83 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
     fun logDiagnostic(message: String) {
         for (line in message.lines()) {
             android.util.Log.i(TAG, line)
+        }
+    }
+
+    /**
+     * Everything this app can see about where the AI Hub data came from.
+     *
+     * The runtime caches its hub metadata under OUR data directory — the
+     * binary carries "aihub cache mkdir", "aihub cache write", "aihub
+     * info.json fetch for" and "aihub info.json parse for" — so the manifests
+     * that listHubModels() and pull() actually consulted are files we own and
+     * may simply read. No reflection, no internal classes, nothing inferred.
+     *
+     * This exists to answer one question the SDK exposes no API for: whether
+     * the catalogue listing and the download are looking at the same release.
+     * listHubModels() finds Qwen3-4B-Instruct-2507; pull() reports it missing.
+     * Both cannot be true of one manifest.
+     *
+     * `GENIEX_HFTOKEN` is reported as set/unset and NEVER by value. Nothing
+     * else here is a credential.
+     */
+    @ReactMethod
+    fun hubCacheReport(promise: Promise) {
+        scope.launch {
+            val out = Arguments.createMap()
+            try {
+                // The endpoint and release the native side resolves from. Read
+                // through the public System.getenv rather than guessed: an
+                // unset value is itself the answer (the SDK's built-in default
+                // applies), and it is what decides which manifest is fetched.
+                val env = Arguments.createMap()
+                env.putString("GENIEX_AIHUBBASEURL", System.getenv("GENIEX_AIHUBBASEURL"))
+                env.putString("GENIEX_AIHUBVERSION", System.getenv("GENIEX_AIHUBVERSION"))
+                env.putString("GENIEX_DATADIR", System.getenv("GENIEX_DATADIR"))
+                env.putString(
+                    "GENIEX_HFTOKEN",
+                    if (System.getenv("GENIEX_HFTOKEN").isNullOrBlank()) "unset" else "set",
+                )
+                out.putMap("env", env)
+
+                val dir = File(reactApplicationContext.filesDir, "geniex")
+                out.putString("dataDir", dir.absolutePath)
+                out.putBoolean("dataDirExists", dir.isDirectory)
+
+                val files: WritableArray = Arguments.createArray()
+                if (dir.isDirectory) {
+                    dir.walkTopDown()
+                        .filter { it.isFile }
+                        .sortedBy { it.absolutePath }
+                        .take(MAX_CACHE_ENTRIES)
+                        .forEach { f ->
+                            val entry = Arguments.createMap()
+                            entry.putString(
+                                "path",
+                                f.relativeTo(dir).path.replace(File.separatorChar, '/'),
+                            )
+                            entry.putDouble("sizeBytes", f.length().toDouble())
+                            entry.putDouble("modifiedAt", f.lastModified().toDouble())
+                            // JSON is the metadata; the multi-gigabyte weights
+                            // are not, and reading one into a bridge map would
+                            // take the screen down.
+                            if (f.name.endsWith(".json", ignoreCase = true)) {
+                                if (f.length() <= MAX_JSON_BYTES) {
+                                    entry.putString("content", f.readText())
+                                } else {
+                                    entry.putString("content", "(too large to inline)")
+                                }
+                            }
+                            files.pushMap(entry)
+                        }
+                }
+                out.putArray("files", files)
+                promise.resolve(out)
+            } catch (e: Throwable) {
+                android.util.Log.w(TAG, "hubCacheReport failed", e)
+                out.putString("error", e.message ?: e.toString())
+                promise.resolve(out)
+            }
         }
     }
 

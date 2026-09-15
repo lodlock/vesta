@@ -150,3 +150,91 @@ export function formatProbe(probe: HubIdentityProbe): string {
   }
   return lines.join("\n");
 }
+
+// ── The cache the runtime actually read ───────────────────────────────────
+
+/** Minimal shape of the native cache report, so this module stays testable. */
+export interface CacheReportLike {
+  env?: Record<string, string | null>;
+  dataDir?: string;
+  dataDirExists?: boolean;
+  files?: {
+    path: string;
+    sizeBytes: number;
+    modifiedAt: number;
+    content?: string | null;
+  }[];
+  error?: string | null;
+}
+
+/**
+ * Whether a cached manifest mentions a model, and under which key.
+ *
+ * Substring search on purpose: this is a REPORT, not a matcher. Nothing
+ * downstream branches on it — it exists so a human can see at a glance whether
+ * the release the runtime cached even contains the model that listHubModels()
+ * claims to offer, without scrolling a 100 KB JSON blob on a phone.
+ */
+export function mentionsModel(content: string, repo: string): string[] {
+  const hits: string[] = [];
+  const lower = content.toLowerCase();
+  for (const form of [
+    repo,
+    repo.toLowerCase(),
+    repo.toLowerCase().replace(/-/g, "_"),
+  ]) {
+    if (lower.includes(form.toLowerCase())) hits.push(form);
+  }
+  return [...new Set(hits)];
+}
+
+/**
+ * The cache report as plain text, for the clipboard and for logcat.
+ *
+ * Same rule as the identity probe: full values, one per line, never a column
+ * that can be truncated. JSON bodies are included whole — they are the
+ * evidence, and an abbreviated manifest answers nothing.
+ */
+export function formatCacheReport(
+  report: CacheReportLike,
+  repo: string,
+): string {
+  const lines = ["Hub cache report"];
+  if (report.error) lines.push(`error: ${report.error}`);
+
+  const env = report.env ?? {};
+  lines.push("", "Environment (unset = the SDK's built-in default applies):");
+  for (const key of [
+    "GENIEX_AIHUBBASEURL",
+    "GENIEX_AIHUBVERSION",
+    "GENIEX_DATADIR",
+    "GENIEX_HFTOKEN",
+  ]) {
+    lines.push(`${key}: ${env[key] ?? "<unset>"}`);
+  }
+
+  lines.push(
+    "",
+    `dataDir: ${report.dataDir ?? "<none>"}`,
+    `dataDirExists: ${report.dataDirExists ?? false}`,
+    `files: ${report.files?.length ?? 0}`,
+  );
+
+  for (const file of report.files ?? []) {
+    lines.push(
+      "",
+      `path: ${file.path}`,
+      `sizeBytes: ${file.sizeBytes}`,
+      `modified: ${new Date(file.modifiedAt).toISOString()}`,
+    );
+    if (file.content) {
+      const hits = mentionsModel(file.content, repo);
+      lines.push(
+        `mentions ${repo}: ${hits.length > 0 ? hits.join(", ") : "NO"}`,
+        "content:",
+        file.content,
+      );
+    }
+  }
+  return lines.join("\n");
+}
