@@ -20,12 +20,14 @@ describe("the catalog entry for this phone", () => {
     expect(entry).toBeDefined();
   });
 
-  it("uses the model name Qualcomm's own AI Hub catalog publishes", () => {
-    // `org/repo`, in the ai-hub-models namespace — the runtime rejects
-    // anything else ("invalid model name: … must be 'org/repo'"), and this
-    // exact string is what Qualcomm's Android sample lists for the qairt
-    // runtime.
-    expect(entry?.modelName).toBe("ai-hub-models/Qwen3-4B-Instruct-2507");
+  it("uses the identifier the HUB publishes, not the one the sample uses", () => {
+    // `org/repo` — the runtime rejects anything else ("invalid model name: …
+    // must be 'org/repo'"). The org segment is the part that mattered:
+    // listHubModels() on device returns `qualcomm/…`, while Qualcomm's Android
+    // sample model_list.json says `ai-hub-models/…`. Trusting the sample over
+    // the runtime made the lookup miss and the card claim the model was
+    // unavailable when the hub was listing it all along.
+    expect(entry?.modelName).toBe("qualcomm/Qwen3-4B-Instruct-2507");
   });
 
   it("targets SM8850 at w4a16", () => {

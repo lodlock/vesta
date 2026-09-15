@@ -7,10 +7,12 @@
 // to substitute, so the catalog states facts rather than offering options.
 //
 // Every string here was verified against primary sources, not recalled:
-//   - the model name format `org/repo` and the `ai-hub-models/` namespace come
-//     from the GenieX runtime's own validation message and from Qualcomm's
-//     Android sample (`apps/geniex_chat_android/src/main/assets/model_list.json`),
-//     which lists `ai-hub-models/Qwen3-4B-Instruct-2507` with runtime `qairt`.
+//   - the model name format `org/repo` comes from the GenieX runtime's own
+//     validation message ("invalid model name: … must be 'org/repo'"). The org
+//     segment comes from the DEVICE: listHubModels() returns
+//     `qualcomm/Qwen3-4B-Instruct-2507`. Qualcomm's Android sample
+//     (`apps/geniex_chat_android/.../model_list.json`) says `ai-hub-models/…`,
+//     and trusting the sample over the runtime cost a false "not available".
 //   - `SM8850` as the chipset string for Snapdragon 8 Elite Gen 5 comes from
 //     the GenieX Android API reference, and is the same string Android's
 //     `Build.SOC_MODEL` reports on this device. The GenieX RUNTIME, measured on
@@ -90,7 +92,13 @@ export const NPU_CATALOG: NpuCatalogModel[] = [
     description:
       "The same model as the GGUF entry, compiled ahead of time for this phone's Hexagon NPU. " +
       "Runs on the NPU only — it cannot fall back to the CPU, and it will not install on another chipset.",
-    modelName: "ai-hub-models/Qwen3-4B-Instruct-2507",
+    // Verified against the DEVICE, not against a sample: listHubModels() on a
+    // OnePlus 15 returns this model as `qualcomm/Qwen3-4B-Instruct-2507`.
+    // Qualcomm's Android sample model_list.json says `ai-hub-models/…`, which
+    // is what this entry carried before — and which made the hub lookup miss,
+    // so the card reported the model "not available" when it was listed all
+    // along. The hub's own answer wins over a sample file.
+    modelName: "qualcomm/Qwen3-4B-Instruct-2507",
     targetSoc: "SM8850",
     socName: "Snapdragon 8 Elite Gen 5",
     precision: "w4a16",
