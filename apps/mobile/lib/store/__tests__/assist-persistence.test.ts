@@ -11,7 +11,11 @@
 // rows a turn produces.
 
 import { useAssistStore } from "../assist-store";
-import { processMessage, executeToolCall } from "../../orchestrator/orchestrator";
+import {
+  processMessage,
+  processDeterministic,
+  executeToolCall,
+} from "../../orchestrator/orchestrator";
 import { finishAssistantActivity } from "../../native/assist";
 import { speak } from "../../native/speech";
 import {
@@ -28,6 +32,7 @@ const mockOrder: string[] = [];
 
 jest.mock("../../orchestrator/orchestrator", () => ({
   processMessage: jest.fn(),
+  processDeterministic: jest.fn(),
   executeToolCall: jest.fn(),
 }));
 jest.mock("../../native/assist", () => ({
@@ -66,6 +71,11 @@ jest.mock("../chat-store", () => ({
 }));
 
 const mockProcess = processMessage as jest.MockedFunction<typeof processMessage>;
+const mockScheduling = processDeterministic as jest.MockedFunction<
+  typeof processDeterministic
+>;
+/** The parser declines the utterance, so the turn goes to the model. */
+const declines = () => mockScheduling.mockResolvedValue(null);
 const mockExecute = executeToolCall as jest.MockedFunction<typeof executeToolCall>;
 const mockFinish = finishAssistantActivity as jest.MockedFunction<
   typeof finishAssistantActivity
@@ -93,6 +103,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockOrder.length = 0;
   useAssistStore.getState().dismiss();
+  declines();
   mockConfig.mockResolvedValue(null);
   mockCreate.mockImplementation(async (id: string) => {
     mockOrder.push(`create:${id}`);
@@ -111,6 +122,20 @@ afterEach(() => {
   jest.useRealTimers();
 });
 
+// The deterministic layers return { response, resume }. `resume` present means
+// "a question the user still owes an answer to"; absent means "finished". That
+// distinction is the whole reason the type exists — see DeterministicResult.
+const resolves = (response: unknown) =>
+  mockScheduling.mockResolvedValue({ response } as never);
+const resolvesOnce = (response: unknown) =>
+  mockScheduling.mockResolvedValueOnce({ response } as never);
+/** A clarification question, and the text a follow-up completes. */
+const asks = (content: string, resume: string) =>
+  mockScheduling.mockResolvedValueOnce({
+    response: { type: "text", content },
+    resume,
+  } as never);
+
 const state = () => useAssistStore.getState();
 
 const savedMessages = () => mockSave.mock.calls.map((c) => c[0] as Message);
@@ -125,8 +150,11 @@ const timerResult = (message: string) =>
     result: { success: true, message: "ok" },
   });
 
+// Long enough to outrun the speech ceiling, which is derived from the length
+// of the utterance now rather than being a flat few seconds — a flat cap is
+// what used to cut real answers off mid-sentence.
 /** Runs a turn to its very end, including the auto-finish timeout. */
-async function runToCompletion(turn: Promise<void>, ms = 20000) {
+async function runToCompletion(turn: Promise<void>, ms = 180_000) {
   await jest.advanceTimersByTimeAsync(ms);
   await turn;
 }
@@ -148,7 +176,7 @@ async function pauseAtResponse(transcript: string): Promise<{ turn: Promise<void
 
 describe("a deterministic action is its own receipt", () => {
   it("timer + Done leaves no chat behind", async () => {
-    mockProcess.mockResolvedValue(timerResult("Timer set for 30 seconds"));
+    resolves(timerResult("Timer set for 30 seconds"));
     const { turn } = await pauseAtResponse("set a 30 second timer");
 
     expect(state()).toMatchObject({ phase: "done", failed: false });
@@ -161,7 +189,7 @@ describe("a deterministic action is its own receipt", () => {
   });
 
   it("timer + timeout leaves no chat behind", async () => {
-    mockProcess.mockResolvedValue(timerResult("Timer set for 30 seconds"));
+    resolves(timerResult("Timer set for 30 seconds"));
     jest.useFakeTimers();
     const turn = state().handle("set a 30 second timer");
     await runToCompletion(turn);
@@ -173,7 +201,7 @@ describe("a deterministic action is its own receipt", () => {
   });
 
   it("timer + Open Chat creates one chat holding request and confirmation", async () => {
-    mockProcess.mockResolvedValue(timerResult("Timer set for 30 seconds"));
+    resolves(timerResult("Timer set for 30 seconds"));
     const { turn } = await pauseAtResponse("set a 30 second timer");
 
     const chatId = await state().openChat();
@@ -188,13 +216,15 @@ describe("a deterministic action is its own receipt", () => {
   });
 
   it("never reaches a model backend, not even to write the turn down", async () => {
-    mockProcess.mockResolvedValue(timerResult("Timer set for 30 seconds"));
+    resolves(timerResult("Timer set for 30 seconds"));
     const { turn } = await pauseAtResponse("set a 30 second timer");
     await state().openChat();
 
     // Persisting a turn must never become an excuse to load multi-GB weights.
     expect(mockEnsureModelLoaded).not.toHaveBeenCalled();
-    expect(mockProcess).toHaveBeenCalledTimes(1);
+    // The parser answered it; processMessage — the model route — is untouched.
+    expect(mockScheduling).toHaveBeenCalledTimes(1);
+    expect(mockProcess).not.toHaveBeenCalled();
     await runToCompletion(turn);
     expect(mockEnsureModelLoaded).not.toHaveBeenCalled();
   });
@@ -202,9 +232,8 @@ describe("a deterministic action is its own receipt", () => {
 
 describe("a model answer is kept without being asked", () => {
   const askModel = (answer: string) => {
-    mockProcess
-      .mockResolvedValueOnce({ type: "error", error: "No model loaded" })
-      .mockResolvedValueOnce({ type: "text", content: answer });
+    mockScheduling.mockResolvedValue(null);
+    mockProcess.mockResolvedValueOnce({ type: "text", content: answer });
   };
 
   it("model Q&A + Done keeps the saved chat", async () => {
@@ -264,7 +293,8 @@ describe("a model answer is kept without being asked", () => {
 
     jest.clearAllMocks();
     mockCreate.mockImplementation(async () => {});
-    mockProcess.mockResolvedValue(timerResult("Timer set for 30 seconds"));
+    mockSpeak.mockImplementation(async () => "done");
+    resolves(timerResult("Timer set for 30 seconds"));
     const { turn: timerTurn } = await pauseAtResponse("set a 30 second timer");
     const fromTimer = await state().openChat();
 
@@ -308,16 +338,13 @@ describe("a model answer is kept without being asked", () => {
 
 describe("a clarification is whichever path it ends on", () => {
   it("resolved locally, it does not persist unless Open Chat is chosen", async () => {
-    mockProcess.mockResolvedValueOnce({
-      type: "text",
-      content: "Do you mean 4 AM or 4 PM?",
-    });
+    asks("Do you mean 4 AM or 4 PM?", "set an alarm tomorrow at four");
     jest.useFakeTimers();
     await state().handle("set an alarm tomorrow at four");
     expect(state().phase).toBe("clarify");
     expect(mockCreate).not.toHaveBeenCalled();
 
-    mockProcess.mockResolvedValueOnce(timerResult("Alarm set for 16:00 tomorrow"));
+    resolvesOnce(timerResult("Alarm set for 16:00 tomorrow"));
     silentEngine();
     const turn = state().handle("pm");
     await jest.advanceTimersByTimeAsync(0);
@@ -337,14 +364,16 @@ describe("a clarification is whichever path it ends on", () => {
   });
 
   it("ending up on the model, it follows the model policy", async () => {
-    mockProcess.mockResolvedValueOnce({ type: "text", content: "What time?" });
+    asks("What time?", "set an alarm");
     jest.useFakeTimers();
     await state().handle("set an alarm");
     expect(mockCreate).not.toHaveBeenCalled();
 
-    mockProcess
-      .mockResolvedValueOnce({ type: "error", error: "No model loaded" })
-      .mockResolvedValueOnce({ type: "text", content: "I can't tell when you mean." });
+    mockScheduling.mockResolvedValueOnce(null);
+    mockProcess.mockResolvedValueOnce({
+      type: "text",
+      content: "I can't tell when you mean.",
+    });
     const turn = state().handle("whenever, you decide");
     await runToCompletion(turn);
 
@@ -360,7 +389,7 @@ describe("a clarification is whichever path it ends on", () => {
 
 describe("a gated action follows the deterministic policy", () => {
   it("confirming an alarm writes nothing until Open Chat is chosen", async () => {
-    mockProcess.mockResolvedValue({
+    resolves({
       type: "pending_tool_call",
       tool: "set_alarm",
       parameters: { time: "07:00" },

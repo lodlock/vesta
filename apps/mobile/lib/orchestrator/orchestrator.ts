@@ -571,7 +571,12 @@ export async function processMessage(
     // called BEFORE extractMemories: the persist path is synchronous up to its
     // engine-lock enqueue, so the snapshot enters the FIFO lock queue ahead of
     // the extraction generate and captures the just-finished turn's KV state.
-    if (!result.stoppedByUser && !extraGenerationRan) {
+    //
+    // Assist mode is excluded deliberately. A spoken one-shot turn must leave
+    // the stable prefix EXACTLY as it found it: the prefix is the session
+    // cache's key, and an assistant turn that changed it would invalidate the
+    // restored KV state and make the next invocation pay a full cold prefill.
+    if (!result.stoppedByUser && !extraGenerationRan && !options.assistMode) {
       schedulePrefixPersist(stablePrefix, lang, messages, result.tokensPredicted);
     }
 
@@ -582,9 +587,18 @@ export async function processMessage(
     // Pass this turn's message list: extraction appends its request to the chat
     // context so it reuses (and preserves) the cached prompt prefix instead of
     // evicting it with a standalone prompt — see extractMemories (REV-1).
+    //
+    // Assist mode never extracts. An assistant invocation is standalone by
+    // construction, and memories are injected into the stable prefix of every
+    // later turn — so mining a spoken one-shot answer would feed that answer
+    // back into the NEXT invocation's system prompt (a question about dwarves
+    // bleeding into "what time is it"), and change the prefix hash each time,
+    // costing a full re-prefill on top. Things the user asks Vesta to remember
+    // are still extracted from the chat screen, which is where a conversation
+    // actually happens.
     const isToolTurn =
       response.type === "tool_call" || response.type === "pending_tool_call";
-    if (shouldExtractMemory(userText, isToolTurn)) {
+    if (!options.assistMode && shouldExtractMemory(userText, isToolTurn)) {
       const assistantContent =
         response.type === "text" ? stripThinkTags(response.content) : response.message;
       extractMemories(messages, assistantContent, "", lang).catch((err) => {

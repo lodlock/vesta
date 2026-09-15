@@ -8,13 +8,18 @@
 // just the visible outcome.
 
 import { useAssistStore } from "../assist-store";
-import { processMessage, executeToolCall } from "../../orchestrator/orchestrator";
+import {
+  processMessage,
+  processDeterministic,
+  executeToolCall,
+} from "../../orchestrator/orchestrator";
 import { startAssistCapture, finishAssistantActivity } from "../../native/assist";
 import { speak, stopSpeaking } from "../../native/speech";
 import { getConfig } from "../../storage/database";
 
 jest.mock("../../orchestrator/orchestrator", () => ({
   processMessage: jest.fn(),
+  processDeterministic: jest.fn(),
   executeToolCall: jest.fn(),
 }));
 jest.mock("../../native/assist", () => ({
@@ -47,6 +52,16 @@ jest.mock("../chat-store", () => ({
 }));
 
 const mockProcess = processMessage as jest.MockedFunction<typeof processMessage>;
+// The assistant asks the deterministic parser DIRECTLY. It used to ask via
+// processMessage and read "No model loaded" as "not a scheduling command",
+// which silently became a full chat generation the moment a model was
+// resident. Mocking the two separately is what keeps that distinction
+// testable: a null here means declined, and nothing else can.
+const mockScheduling = processDeterministic as jest.MockedFunction<
+  typeof processDeterministic
+>;
+/** The parser declines the utterance, so the turn goes to the model. */
+const declines = () => mockScheduling.mockResolvedValue(null);
 const mockExecute = executeToolCall as jest.MockedFunction<typeof executeToolCall>;
 const mockCapture = startAssistCapture as jest.MockedFunction<typeof startAssistCapture>;
 const mockFinish = finishAssistantActivity as jest.MockedFunction<
@@ -59,9 +74,24 @@ const mockConfig = getConfig as jest.MockedFunction<typeof getConfig>;
 beforeEach(() => {
   jest.clearAllMocks();
   useAssistStore.getState().dismiss();
+  declines();
   mockSpeak.mockResolvedValue("done");
   mockConfig.mockResolvedValue(null);
 });
+
+// The deterministic layers return { response, resume }. `resume` present means
+// "a question the user still owes an answer to"; absent means "finished". That
+// distinction is the whole reason the type exists — see DeterministicResult.
+const resolves = (response: unknown) =>
+  mockScheduling.mockResolvedValue({ response } as never);
+const resolvesOnce = (response: unknown) =>
+  mockScheduling.mockResolvedValueOnce({ response } as never);
+/** A clarification question, and the text a follow-up completes. */
+const asks = (content: string, resume: string) =>
+  mockScheduling.mockResolvedValueOnce({
+    response: { type: "text", content },
+    resume,
+  } as never);
 
 const state = () => useAssistStore.getState();
 const spokenWords = () => mockSpeak.mock.calls.map((c) => c[0]);
@@ -77,17 +107,18 @@ const toolCall = (message: string, success = true) =>
 
 describe("scheduling stays local", () => {
   it("runs the action, speaks it, and never loads the model", async () => {
-    mockProcess.mockResolvedValue(toolCall("Timer set for 5 minutes"));
+    resolves(toolCall("Timer set for 5 minutes"));
 
     await state().handle("set a five minute timer");
 
-    expect(mockProcess).toHaveBeenCalledWith("set a five minute timer", [], "en");
+    expect(mockScheduling).toHaveBeenCalledWith("set a five minute timer", "en");
+    expect(mockProcess).not.toHaveBeenCalled();
     expect(mockEnsureModelLoaded).not.toHaveBeenCalled();
     expect(spokenWords()).toEqual(["Timer set for 5 minutes"]);
   });
 
   it("dismisses AND leaves the screen once the confirmation is spoken", async () => {
-    mockProcess.mockResolvedValue(toolCall("Timer set for 5 minutes"));
+    resolves(toolCall("Timer set for 5 minutes"));
 
     await state().handle("set a five minute timer");
 
@@ -100,7 +131,7 @@ describe("scheduling stays local", () => {
   });
 
   it("stays put when the action FAILED — nothing to return from yet", async () => {
-    mockProcess.mockResolvedValue(toolCall("No clock app installed", false));
+    resolves(toolCall("No clock app installed", false));
 
     await state().handle("set a five minute timer");
 
@@ -108,7 +139,7 @@ describe("scheduling stays local", () => {
   });
 
   it("stays open when the action FAILED", async () => {
-    mockProcess.mockResolvedValue(toolCall("No clock app installed", false));
+    resolves(toolCall("No clock app installed", false));
 
     await state().handle("set a five minute timer");
 
@@ -117,7 +148,7 @@ describe("scheduling stays local", () => {
   });
 
   it("gates a destructive action, then dismisses after confirming", async () => {
-    mockProcess.mockResolvedValue({
+    resolves({
       type: "pending_tool_call",
       tool: "set_alarm",
       parameters: { time: "07:00" },
@@ -133,17 +164,21 @@ describe("scheduling stays local", () => {
     mockExecute.mockResolvedValue({ success: true, message: "Alarm set for 07:00" });
     await state().confirm(true);
 
-    expect(mockExecute).toHaveBeenCalledWith("set_alarm", { time: "07:00" }, "en");
+    // Confirming approves the ACTION; it does not launder where the values
+    // came from. The parser's provenance rides through to the dispatch guard.
+    expect(mockExecute).toHaveBeenCalledWith(
+      "set_alarm",
+      { time: "07:00" },
+      "en",
+      expect.objectContaining({ source: "parser", utterance: "wake me at seven" }),
+    );
     expect(state().active).toBe(false);
   });
 });
 
 describe("clarification stays local", () => {
   it("asks aloud without loading the model, and completes the original", async () => {
-    mockProcess.mockResolvedValueOnce({
-      type: "text",
-      content: "Do you mean 4 AM or 4 PM?",
-    });
+    asks("Do you mean 4 AM or 4 PM?", "set an alarm tomorrow at four");
 
     await state().handle("set an alarm tomorrow at four");
 
@@ -154,12 +189,11 @@ describe("clarification stays local", () => {
     await state().listenAgain();
     expect(mockCapture).toHaveBeenCalled();
 
-    mockProcess.mockResolvedValueOnce(toolCall("Alarm set for 16:00 tomorrow"));
+    resolvesOnce(toolCall("Alarm set for 16:00 tomorrow"));
     await state().handle("pm");
 
-    expect(mockProcess).toHaveBeenLastCalledWith(
+    expect(mockScheduling).toHaveBeenLastCalledWith(
       "set an alarm tomorrow at four pm",
-      [],
       "en",
     );
     // Resolved by the parser — still no model.
@@ -167,13 +201,15 @@ describe("clarification stays local", () => {
   });
 
   it("falls back to the model only if the CLARIFIED request still declines", async () => {
-    mockProcess.mockResolvedValueOnce({ type: "text", content: "What time?" });
+    asks("What time?", "set an alarm");
     await state().handle("set an alarm");
     expect(mockEnsureModelLoaded).not.toHaveBeenCalled();
 
-    mockProcess
-      .mockResolvedValueOnce({ type: "error", error: "No model loaded" })
-      .mockResolvedValueOnce({ type: "text", content: "I couldn't work that out." });
+    mockScheduling.mockResolvedValueOnce(null);
+    mockProcess.mockResolvedValueOnce({
+      type: "text",
+      content: "I couldn't work that out.",
+    });
     await state().handle("whenever, you decide");
 
     expect(mockEnsureModelLoaded).toHaveBeenCalledTimes(1);
@@ -182,14 +218,12 @@ describe("clarification stays local", () => {
 
 describe("catch-all fallback", () => {
   it("routes a declined utterance to the model with no extra tap", async () => {
-    mockProcess
-      .mockResolvedValueOnce({ type: "error", error: "No model loaded" })
-      .mockResolvedValueOnce({ type: "text", content: "Providence." });
+    mockProcess.mockResolvedValueOnce({ type: "text", content: "Providence." });
 
     await state().handle("what is the capital of rhode island");
 
     expect(mockEnsureModelLoaded).toHaveBeenCalledTimes(1);
-    // Second call runs in assist mode, which disables the reasoning pass.
+    // The model call runs in assist mode, which disables the reasoning pass.
     expect(mockProcess).toHaveBeenLastCalledWith(
       "what is the capital of rhode island",
       [],
@@ -203,9 +237,7 @@ describe("catch-all fallback", () => {
   });
 
   it("keeps the answer on the assistant overlay and speaks it", async () => {
-    mockProcess
-      .mockResolvedValueOnce({ type: "error", error: "No model loaded" })
-      .mockResolvedValueOnce({ type: "text", content: "Providence." });
+    mockProcess.mockResolvedValueOnce({ type: "text", content: "Providence." });
 
     await state().handle("what is the capital of rhode island");
 
@@ -215,7 +247,7 @@ describe("catch-all fallback", () => {
   });
 
   it("shows nothing the model thought to itself", async () => {
-    mockProcess.mockResolvedValueOnce({ type: "error", error: "No model loaded" }).mockResolvedValueOnce({
+    mockProcess.mockResolvedValueOnce({
       type: "text",
       content:
         "<think>The user wants a capital. Rhode Island's capital is Providence.</think>Providence is the capital.",
@@ -232,8 +264,6 @@ describe("catch-all fallback", () => {
     mockConfig.mockImplementation(async (key: string) =>
       key === "assist_auto_model" ? "false" : null,
     );
-    mockProcess.mockResolvedValueOnce({ type: "error", error: "No model loaded" });
-
     await state().handle("tell me a story");
 
     expect(mockEnsureModelLoaded).not.toHaveBeenCalled();
@@ -251,7 +281,7 @@ describe("speech lifecycle", () => {
     mockConfig.mockImplementation(async (key: string) =>
       key === "assist_speak" ? "false" : null,
     );
-    mockProcess.mockResolvedValue(toolCall("Timer set for 5 minutes"));
+    resolves(toolCall("Timer set for 5 minutes"));
 
     await state().handle("set a five minute timer");
 
@@ -261,7 +291,7 @@ describe("speech lifecycle", () => {
   });
 
   it("cuts off the previous answer when invoked again", async () => {
-    mockProcess.mockResolvedValue(toolCall("Timer set for 5 minutes"));
+    resolves(toolCall("Timer set for 5 minutes"));
     await state().handle("set a five minute timer");
     mockStop.mockClear();
 
@@ -276,13 +306,16 @@ describe("speech lifecycle", () => {
   });
 
   it("does not let a silent engine hold the overlay open", async () => {
-    // An engine that never reports back.
+    // An engine that never reports back. The ceiling is derived from the
+    // length of the utterance rather than being a flat few seconds: a flat one
+    // cannot tell a dead engine from a long answer, and cut real ones off
+    // mid-sentence. A short confirmation still gives up quickly.
     mockSpeak.mockImplementation(() => new Promise(() => {}));
-    mockProcess.mockResolvedValue(toolCall("Timer set for 5 minutes"));
+    resolves(toolCall("Timer set for 5 minutes"));
 
     jest.useFakeTimers();
     const turn = state().handle("set a five minute timer");
-    await jest.advanceTimersByTimeAsync(20000);
+    await jest.advanceTimersByTimeAsync(180_000);
     await turn;
     jest.useRealTimers();
 

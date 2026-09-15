@@ -72,25 +72,28 @@ export function visibleAnswer(raw: string): string {
     .trim();
 }
 
-// Roughly how much an assistant should say out loud before it becomes a
-// monologue. Sentence-aware, so speech ends on a full stop rather than
-// mid-clause.
-const SPOKEN_LIMIT = 320;
-
 /**
- * The spoken form of an answer. Speech is linear and uninterruptible in a way
- * a screen is not, so this is deliberately shorter than what is displayed:
- * whole sentences up to the limit, and a hard clip only if the model produced
- * one enormous sentence.
+ * The spoken form of an answer: the same words, without the punctuation that
+ * only means something to eyes.
+ *
+ * NOT clipped by default. It used to be — whole sentences up to 320 characters
+ * — on the theory that speech is linear and a monologue is worse than a
+ * summary. On a page-length answer that theory reads out two sentences and
+ * stops, which is indistinguishable from a broken TTS engine and was reported
+ * as one. The user can always cut it off (Done, Back, a new invocation); they
+ * cannot un-cut an answer Vesta decided not to finish.
+ *
+ * `limit` is kept for callers that genuinely want a précis; sentence-aware, so
+ * a clipped read still ends on a full stop rather than mid-clause.
  */
-export function spokenAnswer(visible: string, limit = SPOKEN_LIMIT): string {
+export function spokenAnswer(visible: string, limit?: number): string {
   const text = visible
     // Markdown is for eyes: don't read asterisks, backticks and hashes aloud.
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/[*_`#>]/g, "")
     .replace(/\s+/g, " ")
     .trim();
-  if (text.length <= limit) return text;
+  if (limit === undefined || text.length <= limit) return text;
 
   const sentences = text.match(/[^.!?]+[.!?]+(\s|$)/g);
   if (sentences) {

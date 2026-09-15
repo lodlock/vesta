@@ -25,6 +25,7 @@ export default function RootLayout() {
   const init = useChatStore((s) => s.init);
   const [ready, setReady] = useState(false);
   const assistActive = useAssistStore((s) => s.active);
+  const assistLeaving = useAssistStore((s) => s.leaving);
 
   useEffect(() => {
     (async () => {
@@ -38,6 +39,16 @@ export default function RootLayout() {
       getProcessStartMillis().then(recordNativeToJs).catch(() => {});
 
       const assist = await consumeAssistRequest();
+      // The launch origin is what decides whether the assistant surface is
+      // allowed on screen at all. The store is module state and the React root
+      // is rebuilt per Activity, so without this an abandoned turn — Android
+      // does not reliably kill the process on a swipe from Recents — would put
+      // its overlay back up on an ordinary launch from the app icon. No
+      // pending invocation means this launch is not an assistant invocation,
+      // and anything left over from an earlier one ends here. It is transient
+      // state only: a model answer already written to the database is
+      // untouched, and still in the chat list.
+      if (!assist) useAssistStore.getState().endSession();
       try {
         await init({ loadModel: assist === null });
       } catch (err) {
@@ -45,7 +56,7 @@ export default function RootLayout() {
       }
       finishTrace(Date.now() - startedAt);
       setReady(true);
-      if (assist) useAssistStore.getState().handle(assist);
+      if (assist) useAssistStore.getState().handle(assist.text, assist.invocationId);
     })();
   }, []);
 
@@ -54,8 +65,8 @@ export default function RootLayout() {
     // signal; the transcript is read back the same way as on a cold start, so
     // it is acted on exactly once.
     return onAssistRequest(() => {
-      consumeAssistRequest().then((text) => {
-        if (text) useAssistStore.getState().handle(text);
+      consumeAssistRequest().then((assist) => {
+        if (assist) useAssistStore.getState().handle(assist.text, assist.invocationId);
       });
     });
   }, []);
@@ -66,6 +77,15 @@ export default function RootLayout() {
     const sub = AppState.addEventListener("change", (state) => {
       if (state === "background") {
         unloadEmbeddingModel().catch(() => {});
+      }
+      // A settled assistant turn does not survive the app leaving the
+      // foreground, and does not come back with it. Checked on the way out AND
+      // on the way in because the Activity is not always destroyed in between:
+      // a resume without a remount skips the launch-origin gate above.
+      // Turns that are legitimately waiting on something off-screen (the
+      // system recognizer is its own Activity) are left alone.
+      if (state === "background" || state === "active") {
+        useAssistStore.getState().endIfSettled();
       }
     });
     return () => sub.remove();
@@ -96,6 +116,16 @@ export default function RootLayout() {
         <ActivityIndicator size="large" color={colors.accent} />
       </View>
     );
+  }
+
+  // Back or Done, with the Activity on its way out. Rendering the navigator
+  // here would mount the whole chat screen — and start loading the model —
+  // for the moments before the Activity actually goes, which is exactly the
+  // stutter that made Back feel unresponsive. A bare background instead, so
+  // the surface disappears on the very next frame. The store arms a fallback
+  // that clears this if the finish never lands.
+  if (assistLeaving) {
+    return <View style={{ flex: 1, backgroundColor: colors.bg }} />;
   }
 
   // The assistant surface replaces the navigator rather than sitting on top of

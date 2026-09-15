@@ -30,6 +30,15 @@ import type { Message } from "../orchestrator/types";
 export type AssistInteractionKind = "deterministic" | "clarification" | "model";
 
 export interface AssistSession {
+  /**
+   * The invocation this record belongs to, or 0 for the empty one.
+   *
+   * A session record is not just data, it is a CLAIM about which turn produced
+   * it — and acting on a claim from an earlier invocation is how Open Chat on
+   * the second question opened the first question's conversation. Every reader
+   * checks this against the live session before trusting `persistedChatId`.
+   */
+  sessionId: number;
   /** What the user asked, as the parser finally saw it. */
   prompt: string | null;
   /** The final VISIBLE response — a confirmation, or the model's answer. */
@@ -42,6 +51,7 @@ export interface AssistSession {
 }
 
 export const emptySession: AssistSession = {
+  sessionId: 0,
   prompt: null,
   response: null,
   kind: null,

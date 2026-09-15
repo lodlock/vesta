@@ -22,11 +22,25 @@ function available(): boolean {
   );
 }
 
-/** The pending assistant transcript, or null. Reading it clears it. */
-export async function consumeAssistRequest(): Promise<string | null> {
+/** One assistant invocation: what was said, and which invocation it is. */
+export interface AssistRequest {
+  text: string;
+  /**
+   * Monotonic per-process invocation id from the native bridge. It becomes the
+   * assistant session id, so everything a turn owns — the surface, the TTS
+   * utterance, the persistence record — can be checked against the invocation
+   * that is actually live.
+   */
+  invocationId: number;
+}
+
+/** The pending assistant invocation, or null. Reading it clears it. */
+export async function consumeAssistRequest(): Promise<AssistRequest | null> {
   if (!available()) return null;
   try {
-    return (await SystemActionsModule.consumeAssistRequest()) ?? null;
+    const raw = await SystemActionsModule.consumeAssistRequest();
+    if (!raw || typeof raw.text !== "string" || !raw.text) return null;
+    return { text: raw.text, invocationId: Number(raw.invocationId) || 0 };
   } catch {
     return null;
   }

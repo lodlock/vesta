@@ -96,3 +96,84 @@ describe("parseMarkdown", () => {
     expect(() => parseMarkdown("**unclosed and `also")).not.toThrow();
   });
 });
+
+// Real model output, from a device screenshot where the asterisks were still
+// visible on screen. The parser handled these all along — the answer was
+// reaching a branch that rendered it as plain text — but the exact strings are
+// pinned here so a regression in either layer has somewhere to fail.
+describe("the shapes a model actually emits for a list of editions", () => {
+  const bold = (blocks: ReturnType<typeof parseMarkdown>) =>
+    JSON.stringify(blocks).includes('"t":"bold"');
+
+  it("renders a bold run containing punctuation, ampersands and an en dash", () => {
+    const blocks = parseMarkdown("**Original D&D (OD&D) – 1974:**");
+    expect(blocks).toEqual([
+      {
+        t: "p",
+        inline: [
+          { t: "bold", children: [{ t: "text", v: "Original D&D (OD&D) – 1974:" }] },
+        ],
+      },
+    ]);
+  });
+
+  it("renders a bold lead-in followed by its sentence", () => {
+    expect(parseMarkdown("**AD&D 1st Edition (1977–1979):** Dwarves had level limits."))
+      .toEqual([
+        {
+          t: "p",
+          inline: [
+            {
+              t: "bold",
+              children: [{ t: "text", v: "AD&D 1st Edition (1977–1979):" }],
+            },
+            { t: "text", v: " Dwarves had level limits." },
+          ],
+        },
+      ]);
+  });
+
+  it("renders bold lead-ins inside bullet and numbered lists", () => {
+    expect(bold(parseMarkdown("- **3rd Edition (2000):** Dwarves became a race."))).toBe(
+      true,
+    );
+    expect(bold(parseMarkdown("* **4th Edition (2008):** Dwarves kept darkvision."))).toBe(
+      true,
+    );
+    expect(bold(parseMarkdown("1. **5th Edition (2014):** Subraces returned."))).toBe(
+      true,
+    );
+  });
+
+  it("renders a mixed answer of paragraphs and a list, markers and all", () => {
+    const answer = [
+      "Here's how dwarves changed:",
+      "",
+      "**Original D&D (OD&D) – 1974:**",
+      "- Dwarves were a *class*, not a race.",
+      "- Limited to fighting men.",
+      "",
+      "**3rd Edition (2000):** Race and class finally separated.",
+    ].join("\n");
+
+    const rendered = JSON.stringify(parseMarkdown(answer));
+    expect(rendered).toContain('"t":"bold"');
+    expect(rendered).toContain('"t":"italic"');
+    expect(rendered).toContain('"t":"ul"');
+    // No marker survives into any text node.
+    const texts: string[] = [];
+    const walk = (node: unknown): void => {
+      if (Array.isArray(node)) return node.forEach(walk);
+      if (node && typeof node === "object") {
+        const n = node as Record<string, unknown>;
+        if (n.t === "text" && typeof n.v === "string") texts.push(n.v);
+        Object.values(n).forEach(walk);
+      }
+    };
+    walk(parseMarkdown(answer));
+    for (const text of texts) {
+      expect(text).not.toContain("**");
+      expect(text).not.toMatch(/^- /);
+    }
+  });
+});

@@ -205,10 +205,25 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
     // REQUEST — the default assistant is the user's choice to make, and
     // nothing here changes it silently.
 
-    /** The pending assistant transcript, consumed. Null when there isn't one. */
+    /**
+     * The pending assistant invocation, consumed. Null when there isn't one.
+     *
+     * Resolves `{ text, invocationId }`. The id is what the JS side uses as the
+     * assistant session identity, so "this is a newer invocation than the one
+     * that is still talking" is a fact from the native bridge rather than a
+     * guess made after the fact.
+     */
     @ReactMethod
     fun consumeAssistRequest(promise: Promise) {
-        promise.resolve(VestaAssistBridge.consume())
+        val invocation = VestaAssistBridge.consume()
+        if (invocation == null) {
+            promise.resolve(null)
+            return
+        }
+        val map = Arguments.createMap()
+        map.putString("text", invocation.text)
+        map.putDouble("invocationId", invocation.id.toDouble())
+        promise.resolve(map)
     }
 
     /**
