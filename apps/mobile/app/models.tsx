@@ -857,8 +857,12 @@ function HubCatalogSection({
             <Text style={styles.rowHint}>
               {m.entry.modelType} · Qualcomm Hexagon NPU
             </Text>
+            {/* Both vocabularies, labelled, because they are not the same
+                thing: the SoC id is what the pull and the compatibility guard
+                use, the catalogue key is AI Hub's manifest metadata. */}
+            <Text style={styles.rowHint}>Target: {m.canonicalSoc}</Text>
             <Text style={styles.rowHint}>
-              Target: {m.canonicalSoc} (hub: {m.chipset})
+              Hub catalog key: {m.hubChipsetKey}
             </Text>
             {/* No quality ranking is offered or implied. Availability is the
                 only claim the hub makes, so availability is the only claim

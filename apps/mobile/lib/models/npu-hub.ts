@@ -203,12 +203,33 @@ export const EMPTY_HUB: HubState = {
   checking: false,
 };
 
-/** A hub model this device can actually install, with the string to pull it by. */
+/**
+ * A hub model this device can install.
+ *
+ * TWO chipset strings, and conflating them is the bug this shape exists to
+ * prevent — they come from different places and mean different things:
+ *
+ *   hubChipsetKey  CATALOG METADATA. `HubModel.chipsets`, which is the release
+ *                  manifest's `supported_chipsets` — AI Hub's asset key, e.g.
+ *                  "qualcomm-snapdragon-8-elite-gen5". Good for display and for
+ *                  deciding compatibility. NOT a pull parameter.
+ *   canonicalSoc   The SoC IDENTIFIER, e.g. "SM8850". This is what
+ *                  `ModelPullInput.chipset` takes — Qualcomm's Android API
+ *                  documents it with exactly that example (SM8750 = Snapdragon
+ *                  8 Elite, SM8850 = Snapdragon 8 Elite Gen 5) — and it is also
+ *                  what the registry row records for the load-time guard.
+ *
+ * They are different fields on different beans (`HubModel.chipsets` vs
+ * `ModelPullInput.chipset`) and the type system never claimed they matched. An
+ * earlier revision passed the asset key to the pull on the assumption that
+ * "the hub's own spelling" must be what the hub wants back; it is not, and the
+ * result was an indistinguishable second round of -100010.
+ */
 export interface CompatibleHubModel {
   entry: HubModel;
-  /** The hub's OWN chipset spelling for this device. Never ours. */
-  chipset: string;
-  /** The canonical id that spelling belongs to — what the row records. */
+  /** Catalog metadata: the release manifest's key. Display and matching only. */
+  hubChipsetKey: string;
+  /** The SoC identifier: what the pull takes, and what the row records. */
   canonicalSoc: string;
 }
 
@@ -257,10 +278,10 @@ export function breakDownHubModels(
     }
     compatible.push({
       entry,
-      chipset,
-      // The row records the CANONICAL id, not the hub's spelling: it is what
-      // the load-time guard compares against Build.SOC_MODEL on every later
-      // boot, long after this catalogue is gone.
+      hubChipsetKey: chipset,
+      // The SoC identifier for this class. It is what the pull is given and
+      // what the row records — the latter because it is compared against
+      // Build.SOC_MODEL on every later boot, long after this catalogue is gone.
       canonicalSoc: canonicalChipset(chipset, table)?.canonical ?? chipset,
     });
   }
@@ -271,8 +292,11 @@ export function breakDownHubModels(
 export type HubAvailability =
   /** No successful query yet — nothing is known, and nothing is claimed. */
   | { status: "unchecked" }
-  /** Listed, for this silicon. `chipset` is the string to pull with. */
-  | { status: "listed"; chipset: string; canonicalSoc: string }
+  /**
+   * Listed, for this silicon. `canonicalSoc` is the string to pull with —
+   * `hubChipsetKey` is catalog metadata, see CompatibleHubModel.
+   */
+  | { status: "listed"; hubChipsetKey: string; canonicalSoc: string }
   /** The hub answered, and this model was not in it for this device. */
   | { status: "absent"; checkedAt: number; cached: boolean };
 
@@ -304,7 +328,7 @@ export function hubAvailability(
   if (resolution.status === "available") {
     return {
       status: "listed",
-      chipset: resolution.chipset,
+      hubChipsetKey: resolution.chipset,
       canonicalSoc:
         canonicalChipset(resolution.chipset, table)?.canonical ?? resolution.chipset,
     };

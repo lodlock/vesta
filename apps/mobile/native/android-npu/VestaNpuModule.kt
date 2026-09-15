@@ -647,6 +647,17 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     val failure = collectPull(input, modelName)
 
                     if (failure != null) {
+                        // The request again, at the moment it failed. A code on
+                        // its own is not diagnosable: it does not say which
+                        // name, which chipset or which precision was asked for,
+                        // and those are the three things that decide whether an
+                        // asset resolves. Logged adjacent to the rc so one
+                        // logcat capture carries both.
+                        android.util.Log.w(
+                            TAG,
+                            "pull FAILED rc=${failure.first} for ${describeRequest(input)} " +
+                                "(Build.SOC_MODEL=${socModel()}) :: ${failure.second}",
+                        )
                         promise.reject(
                             "NPU_PULL_FAILED",
                             formatPullFailure(failure.first, failure.second),

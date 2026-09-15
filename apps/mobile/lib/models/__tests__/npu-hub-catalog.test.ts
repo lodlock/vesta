@@ -1,12 +1,17 @@
 // The hub AS the catalogue.
 //
-// On device, `listHubModels()` returned 19 models and Qwen3-4B-Instruct-2507
-// was not among them. That settles the -100010 — the asset is not published —
-// and it condemns the shape of the old UI: a hard-coded list of one
-// downloadable model was going to be wrong whenever Qualcomm's list changed,
-// and it is wrong now.
+// A hard-coded list of one downloadable model was going to be wrong whenever
+// Qualcomm's list changed. The device proved it twice over: `listHubModels()`
+// returns 19 models, and the one Vesta had hard-coded WAS among them — under
+// `qualcomm/Qwen3-4B-Instruct-2507`, not the `ai-hub-models/…` the Android
+// sample uses. The exact-match lookup missed, and the card reported "not
+// available" for a model that was listed all along.
 //
-// So these tests are written against a catalogue nobody here controls. Nothing
+// Two lessons are pinned down below. Identifiers come from the hub, not from a
+// sample file. And the hub's chipset METADATA is not the pull's chipset
+// PARAMETER — see the asset-key test.
+//
+// These tests are written against a catalogue nobody here controls. Nothing
 // below hard-codes which models exist; every case is about what the code does
 // with whatever comes back.
 
@@ -61,18 +66,51 @@ describe("splitting the hub's catalogue against this device", () => {
     expect(breakdown.otherChipsets).toBe(1);
   });
 
-  it("hands back the HUB'S chipset spelling to pull with, and the canonical id to record", () => {
-    // Two different jobs: one string goes to Qualcomm, the other is what the
-    // load-time guard checks against Build.SOC_MODEL on every later boot.
+  // The bug this pins down cost a second identical -100010. AI Hub's release
+  // manifest keys assets as "qualcomm-snapdragon-8-elite-gen5"; GenieX's
+  // ModelPullInput.chipset takes the SoC identifier, and Qualcomm's Android
+  // docs give exactly this example (SM8750 = Snapdragon 8 Elite, SM8850 =
+  // Snapdragon 8 Elite Gen 5). They are different fields on different beans —
+  // HubModel.chipsets vs ModelPullInput.chipset — and the type system never
+  // claimed they matched. An earlier revision passed the asset key to the pull
+  // on the assumption that "the hub's own spelling" must be what the hub wants
+  // back. It is not.
+  it("separates the catalogue's asset key from the SoC id the pull takes", () => {
     const breakdown = breakDownHubModels(
-      [model("ai-hub-models/A", ["qualcomm-snapdragon-8-elite-gen5"])],
+      [model("qualcomm/Qwen3-4B-Instruct-2507", ["qualcomm-snapdragon-8-elite-gen5"])],
       "SM8850",
       TABLE,
     );
-    expect(breakdown.compatible[0].chipset).toBe(
-      "qualcomm-snapdragon-8-elite-gen5",
-    );
-    expect(breakdown.compatible[0].canonicalSoc).toBe("SM8850");
+    const entry = breakdown.compatible[0];
+
+    // What goes to ModelPullInput.chipset.
+    expect(entry.canonicalSoc).toBe("SM8850");
+    // What the manifest calls it. Display and matching only.
+    expect(entry.hubChipsetKey).toBe("qualcomm-snapdragon-8-elite-gen5");
+    // And they are genuinely not interchangeable.
+    expect(entry.canonicalSoc).not.toBe(entry.hubChipsetKey);
+  });
+
+  it("still decides compatibility through the canonical equivalence machinery", () => {
+    // The SoC id is DERIVED from the runtime's own chipset table, not pattern-
+    // matched out of the asset key: strip the table and nothing resolves, which
+    // is the same refusal the load-time guard makes.
+    expect(
+      breakDownHubModels(
+        [model("qualcomm/Qwen3-4B-Instruct-2507", ["qualcomm-snapdragon-8-elite-gen5"])],
+        "SM8850",
+        undefined,
+      ).compatible,
+    ).toEqual([]);
+
+    // And a neighbouring generation stays out, one character apart.
+    expect(
+      breakDownHubModels(
+        [model("qualcomm/X", ["qualcomm-snapdragon-8-elite"])],
+        "SM8850",
+        TABLE,
+      ).compatible,
+    ).toEqual([]);
   });
 
   it("does not offer a model type this app has no runtime for", () => {
@@ -143,13 +181,14 @@ describe("where Vesta's preferred model stands", () => {
     );
     expect(availability.status).toBe("listed");
     if (availability.status === "listed") {
-      expect(availability.chipset).toBe("qualcomm-snapdragon-8-elite-gen5");
+      // Same split as above: the SoC id is the pull parameter, the asset key
+      // is metadata.
       expect(availability.canonicalSoc).toBe("SM8850");
+      expect(availability.hubChipsetKey).toBe("qualcomm-snapdragon-8-elite-gen5");
     }
   });
 
-  it("reports absent — the state the device is actually in today", () => {
-    // 19 models came back and this was not one of them.
+  it("reports absent only when the name is genuinely not in the catalogue", () => {
     const availability = hubAvailability(
       snapshotOf([model("ai-hub-models/Something-Else", ["SM8850"])]),
       QWEN,
@@ -181,6 +220,34 @@ describe("where Vesta's preferred model stands", () => {
     if (availability.status !== "absent") throw new Error("expected absent");
     expect(availability.checkedAt).toBe(42);
     expect(availability.cached).toBe(true);
+  });
+
+  it("misses a model listed under a different org segment — exactly what happened", () => {
+    // The hub lists `qualcomm/Qwen3-4B-Instruct-2507`; Vesta asked for
+    // `ai-hub-models/…`. Matching is exact by design — a loose match would
+    // install a different model than the card promised — so the fix is to
+    // carry the identifier the hub actually publishes, not to relax this.
+    const availability = hubAvailability(
+      snapshotOf([model("qualcomm/Qwen3-4B-Instruct-2507", ["SM8850"])]),
+      "ai-hub-models/Qwen3-4B-Instruct-2507",
+      "SM8850",
+      TABLE,
+    );
+    expect(availability.status).toBe("absent");
+
+    // With the right identifier it resolves, and the pull gets the SoC id.
+    const fixed = hubAvailability(
+      snapshotOf([
+        model("qualcomm/Qwen3-4B-Instruct-2507", [
+          "qualcomm-snapdragon-8-elite-gen5",
+        ]),
+      ]),
+      "qualcomm/Qwen3-4B-Instruct-2507",
+      "SM8850",
+      TABLE,
+    );
+    expect(fixed.status).toBe("listed");
+    if (fixed.status === "listed") expect(fixed.canonicalSoc).toBe("SM8850");
   });
 
   it("finds it under an alias the manager resolved", () => {

@@ -385,7 +385,16 @@ async function runNpuInstall(
     // Readable, with the runtime's own code kept on the end — see npu-errors.
     // The raw rc must survive: it is the only token that can be looked up
     // against Qualcomm's error definitions.
-    failInstall(set, spec.errorKey, describeGenieXFailure(err));
+    //
+    // The REQUEST goes with it. An rc with no subject cannot be acted on, and
+    // the three values below are exactly what decides whether an asset
+    // resolves — twice now a -100010 has turned out to be one of them being
+    // wrong rather than the asset being absent.
+    failInstall(
+      set,
+      spec.errorKey,
+      `${describeGenieXFailure(err)} — asked for ${spec.modelName} · chipset ${spec.chipset} · ${spec.precision ?? "default precision"}`,
+    );
   } finally {
     unsubscribe();
     set((state) => {
@@ -541,8 +550,12 @@ export const useModelStore = create<ModelState>((set, get) => ({
     // verdict is the authority regardless.
     await runNpuInstall(set, get, {
       modelName: model.modelName,
+      // The SoC identifier, never the catalogue asset key — see
+      // CompatibleHubModel for why those are two different vocabularies.
       chipset:
-        availability.status === "listed" ? availability.chipset : model.targetSoc,
+        availability.status === "listed"
+          ? availability.canonicalSoc
+          : model.targetSoc,
       targetSoc:
         availability.status === "listed"
           ? availability.canonicalSoc
@@ -582,7 +595,11 @@ export const useModelStore = create<ModelState>((set, get) => ({
     }
     await runNpuInstall(set, get, {
       modelName: hubModel.entry.name,
-      chipset: hubModel.chipset,
+      // The SoC IDENTIFIER, never the catalogue asset key. `ModelPullInput`
+      // documents this field with SM8850/SM8750; `HubModel.chipsets` is a
+      // different field on a different bean carrying AI Hub's manifest key
+      // ("qualcomm-snapdragon-8-elite-gen5"). See CompatibleHubModel.
+      chipset: hubModel.canonicalSoc,
       targetSoc: hubModel.canonicalSoc,
       displayName: hubModelLabel(hubModel.entry.name),
       precision: null,
