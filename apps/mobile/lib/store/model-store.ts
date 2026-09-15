@@ -40,7 +40,11 @@ import {
 } from "../models/hf-client";
 import { canActivate } from "../models/activation";
 import { backendModelRef, npuRefusalFor } from "../llm/backends/registry";
-import { npuCatalogFor, type NpuCatalogModel } from "../models/npu-catalog";
+import {
+  npuCatalogFor,
+  pullIdentifier,
+  type NpuCatalogModel,
+} from "../models/npu-catalog";
 import { prepareNpuBackend, type NpuReadiness } from "../models/npu-ready";
 import {
   checkBundle,
@@ -247,6 +251,11 @@ interface NpuInstallSpec {
   minRamMb: number | null;
   role: ModelRole;
   artifact: ModelArtifact;
+  /**
+   * Which hub to resolve through. AUTO lets the runtime route by model-name
+   * prefix instead of being told; AIHUB names it outright.
+   */
+  hub: "AIHUB" | "AUTO";
   /** Which card shows a failure from this install. */
   errorKey: string;
 }
@@ -342,7 +351,7 @@ async function runNpuInstall(
       modelName: spec.modelName,
       chipset: spec.chipset,
       precision: spec.precision,
-      hub: "AIHUB",
+      hub: spec.hub,
       displayName: spec.displayName,
     });
 
@@ -549,7 +558,13 @@ export const useModelStore = create<ModelState>((set, get) => ({
     // hub being unreachable is not evidence of anything, and the runtime's
     // verdict is the authority regardless.
     await runNpuInstall(set, get, {
-      modelName: model.modelName,
+      // The ROUTING identifier, which is not always the catalogue one. The
+      // card is still found in the hub list by modelName — see
+      // npu-catalog.pullIdentifier.
+      modelName: pullIdentifier(model),
+      // Which hub the entry declares. AUTO lets the runtime route by
+      // model-name prefix rather than being told.
+      hub: model.hub,
       // The SoC identifier, never the catalogue asset key — see
       // CompatibleHubModel for why those are two different vocabularies.
       chipset:
@@ -595,6 +610,10 @@ export const useModelStore = create<ModelState>((set, get) => ({
     }
     await runNpuInstall(set, get, {
       modelName: hubModel.entry.name,
+      // Unchanged, and deliberately so: the AUTO / ai-hub-models experiment is
+      // scoped to one known model. A generic hub row still asks for exactly
+      // the identifier the catalogue returned, on the hub it came from.
+      hub: "AIHUB",
       // The SoC IDENTIFIER, never the catalogue asset key. `ModelPullInput`
       // documents this field with SM8850/SM8750; `HubModel.chipsets` is a
       // different field on a different bean carrying AI Hub's manifest key
@@ -659,7 +678,9 @@ export const useModelStore = create<ModelState>((set, get) => ({
       return;
     }
 
-    if (get().installed.some((m) => m.runtimeModelName === model.modelName)) {
+    if (
+      get().installed.some((m) => m.runtimeModelName === pullIdentifier(model))
+    ) {
       set({ error: `${model.displayName} is already installed.` });
       return;
     }
@@ -677,7 +698,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
       artifact: model.artifact,
       targetSoc: model.targetSoc,
       runtimeVersion: model.runtimeVersion,
-      runtimeModelName: model.modelName,
+      runtimeModelName: pullIdentifier(model),
       trust: "unverified",
     });
     await get().refresh();
@@ -685,7 +706,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
     // An import still emits progress — unpacking a multi-gigabyte .zip is not
     // instant, and a screen that looks frozen gets force-quit.
     const unsubscribe = onNpuPullProgress((p) => {
-      if (p.modelName !== model.modelName) return;
+      if (p.modelName !== pullIdentifier(model)) return;
       set((state) => ({
         progress: {
           ...state.progress,
@@ -717,7 +738,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
       await FileSystem.copyAsync({ from: uri, to: staged });
 
       const bundle = await npuImportBundle({
-        modelName: model.modelName,
+        modelName: pullIdentifier(model),
         localPath: staged,
         precision: model.precision,
         displayName: model.displayName,
@@ -727,7 +748,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
       // bundle Vesta will load", applied to both sources.
       const check = checkBundle(bundle as MeasuredBundle);
       if (!check.ok) {
-        await npuRemoveBundle(model.modelName).catch(() => {});
+        await npuRemoveBundle(pullIdentifier(model)).catch(() => {});
         await removeModel(row.id);
         await get().refresh();
         set({ error: `${model.displayName}: ${check.message}` });
@@ -747,7 +768,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
       const active = await getActiveModel();
       if (!active) await get().activate(row.id);
     } catch (err) {
-      await npuRemoveBundle(model.modelName).catch(() => {});
+      await npuRemoveBundle(pullIdentifier(model)).catch(() => {});
       await removeModel(row.id);
       await get().refresh();
       set({ error: `${model.displayName}: ${describeGenieXFailure(err)}` });

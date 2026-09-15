@@ -44,16 +44,39 @@ export interface NpuCatalogModel {
   id: string;
   displayName: string;
   description: string;
-  /** The name GenieX pulls by: "ai-hub-models/Qwen3-4B-Instruct-2507". */
+  /**
+   * How this model is identified in the HUB CATALOGUE — what
+   * `listHubModels()` returns, and what the card is matched against.
+   * On device that is `qualcomm/Qwen3-4B-Instruct-2507`.
+   */
   modelName: string;
+  /**
+   * The identifier handed to `ModelPullInput.model_name`, when it differs
+   * from the catalogue one.
+   *
+   * These are NOT known to be the same thing, and assuming they were is how
+   * the last two attempts failed. Qualcomm's Android documentation pairs
+   * `ai-hub-models/<repo>` with `HubSource.AUTO`, and states that AUTO routes
+   * that prefix to AI Hub — so the routing identifier can differ from the
+   * repository identifier the catalogue displays.
+   *
+   * Absent means "the catalogue identifier is also the pull identifier",
+   * which is what every generic hub row still assumes.
+   */
+  pullModelName?: string;
   /** The chipset this entry is for. One entry per chipset, on purpose. */
   targetSoc: string;
   /** Marketing name, for the UI — never used for matching. */
   socName: string;
   /** "w4a16". Null lets GenieX pick the bundle's only precision. */
   precision: string | null;
-  /** Which hub GenieX resolves it from. */
-  hub: "AIHUB";
+  /**
+   * Which hub GenieX resolves it from.
+   *
+   * AUTO lets the runtime route by model-name prefix rather than being told;
+   * Qualcomm's own Android example uses it for `ai-hub-models/*`.
+   */
+  hub: "AIHUB" | "AUTO";
   artifact: ModelArtifact;
   sizeBytesApprox: number;
   /**
@@ -102,7 +125,13 @@ export const NPU_CATALOG: NpuCatalogModel[] = [
     targetSoc: "SM8850",
     socName: "Snapdragon 8 Elite Gen 5",
     precision: "w4a16",
-    hub: "AIHUB",
+    // Qualcomm's documented Android combination, exactly: the
+    // `ai-hub-models/` identifier with AUTO, which their docs say routes that
+    // prefix to AI Hub. Deliberately NOT generalized to other hub rows — this
+    // is one controlled test of a documented path for one known model, and
+    // the generic installer still sends what the catalogue returned.
+    hub: "AUTO",
+    pullModelName: "ai-hub-models/Qwen3-4B-Instruct-2507",
     artifact: "qairt_context",
     // Order of magnitude only — a 4B at int4 plus tokenizer and metadata. The
     // real figure is measured at install and is what the UI shows afterwards.
@@ -114,6 +143,21 @@ export const NPU_CATALOG: NpuCatalogModel[] = [
     licenseUrl: APACHE,
   },
 ];
+
+/**
+ * The identifier to pull by, which is not always the one the catalogue lists.
+ *
+ * One function so the download, the duplicate check, the registry row and the
+ * Models screen's "is this installed" lookup cannot disagree about which name
+ * identifies a model. The MANAGER keys its cache by whatever `pullFlow` was
+ * given — `getPaths()` is called with that same string — so this is also the
+ * value that must land in `runtime_model_name`.
+ */
+export function pullIdentifier(
+  model: Pick<NpuCatalogModel, "modelName" | "pullModelName">,
+): string {
+  return model.pullModelName ?? model.modelName;
+}
 
 export function getNpuCatalogModel(id: string): NpuCatalogModel | undefined {
   return NPU_CATALOG.find((m) => m.id === id);

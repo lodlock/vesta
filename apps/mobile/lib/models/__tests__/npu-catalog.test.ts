@@ -11,6 +11,7 @@ import {
   getNpuCatalogModel,
   npuCatalogFor,
   normalizeSocId,
+  pullIdentifier,
 } from "../npu-catalog";
 
 describe("the catalog entry for this phone", () => {
@@ -41,6 +42,63 @@ describe("the catalog entry for this phone", () => {
     // These are the three facts the Models screen puts on the card.
     expect(entry?.artifact).not.toBe("gguf");
     expect(entry?.targetSoc).toBeTruthy();
+  });
+});
+
+// Qualcomm's documented Android combination, pinned as a controlled test.
+//
+// Three -100010s came from three different request strings, and resolveAlias()
+// answered <null> for every spelling we could think to ask about — so guessing
+// a fourth was not a strategy. This is instead Qualcomm's own documented
+// example, copied exactly: `ai-hub-models/<repo>` with HubSource.AUTO, which
+// their docs say routes that prefix to AI Hub.
+//
+// The catalogue identifier and the routing identifier are SEPARATE fields
+// here, because they are not known to be the same thing and assuming they were
+// is precisely how the previous attempts failed.
+describe("the documented AI Hub pull combination", () => {
+  const entry = getNpuCatalogModel("qwen3-4b-instruct-2507-npu-sm8850");
+
+  it("is listed in the catalogue under the identifier the hub returns", () => {
+    // listHubModels() says `qualcomm/…` on device, so the card matches on it.
+    expect(entry?.modelName).toBe("qualcomm/Qwen3-4B-Instruct-2507");
+  });
+
+  it("is pulled by the identifier Qualcomm's own example uses", () => {
+    expect(pullIdentifier(entry!)).toBe("ai-hub-models/Qwen3-4B-Instruct-2507");
+  });
+
+  it("routes through AUTO, which is what the docs pair that prefix with", () => {
+    expect(entry?.hub).toBe("AUTO");
+  });
+
+  it("changes nothing else — chipset, precision and artifact stand", () => {
+    // One variable at a time. If this attempt fails too, the result is still
+    // interpretable.
+    expect(entry?.targetSoc).toBe("SM8850");
+    expect(entry?.precision).toBe("w4a16");
+    expect(entry?.artifact).toBe("qairt_context");
+  });
+
+  it("keeps the two identifiers genuinely distinct", () => {
+    expect(pullIdentifier(entry!)).not.toBe(entry?.modelName);
+  });
+});
+
+describe("pullIdentifier", () => {
+  it("falls back to the catalogue identifier when no routing one is given", () => {
+    // Which is what every generic hub row does: it asks for exactly the
+    // identifier listHubModels() returned. The experiment is not generalized.
+    expect(pullIdentifier({ modelName: "org/repo" })).toBe("org/repo");
+    expect(
+      pullIdentifier({ modelName: "org/repo", pullModelName: undefined }),
+    ).toBe("org/repo");
+  });
+
+  it("prefers the routing identifier when one is declared", () => {
+    expect(
+      pullIdentifier({ modelName: "a/b", pullModelName: "c/d" }),
+    ).toBe("c/d");
   });
 });
 

@@ -13,7 +13,10 @@ import * as DocumentPicker from "expo-document-picker";
 import { useModelStore, type NpuStatus } from "../lib/store/model-store";
 import { CATALOG } from "../lib/models/catalog";
 import { listGgufFiles, type HfFile } from "../lib/models/hf-client";
-import type { NpuCatalogModel } from "../lib/models/npu-catalog";
+import {
+  pullIdentifier,
+  type NpuCatalogModel,
+} from "../lib/models/npu-catalog";
 import {
   breakDownHubModels,
   hubAvailability,
@@ -556,7 +559,10 @@ function NpuSection({
               it is a recommendation, not an offer, and the hub answer only
               decides which actions on it can possibly work. */}
           {catalog.map((m) => {
-          const row = installedFor(m.modelName);
+          // By the PULL identifier: the registry row records whatever the
+          // model manager was asked for, which is not always what the
+          // catalogue lists. See npu-catalog.pullIdentifier.
+          const row = installedFor(pullIdentifier(m));
           const prog = row ? progress[row.id] : undefined;
           const downloading = prog?.status === "downloading" || row?.state === "downloading";
           const activation = row ? canActivate(row) : null;
