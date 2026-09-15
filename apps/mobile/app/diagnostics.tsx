@@ -34,6 +34,10 @@ import {
 } from "../lib/assist/assist-trace";
 import { getDatabaseSizeBytes } from "../lib/storage/database";
 import { getActiveModel } from "../lib/models/model-registry";
+import type { InstalledModel } from "../lib/models/types";
+import { useModelStore } from "../lib/store/model-store";
+import { breakDownHubModels } from "../lib/models/npu-hub";
+import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
 import { colors, spacing, typography, radii } from "../lib/theme";
 
@@ -51,6 +55,25 @@ interface Diag {
   startup: StartupTrace;
   assist: AssistTurnTrace | null;
   assistTurns: number;
+  /** Hub state, or null on a build with no NPU bridge in it. */
+  hub: HubDiag | null;
+}
+
+/**
+ * What is worth knowing about the hub without reprinting it.
+ *
+ * Counts and a timestamp, not a model list: the list belongs on the Models
+ * screen, and these values are what EXPLAIN it — in particular why a catalogue
+ * of many models can show as none here.
+ */
+interface HubDiag {
+  checkedAt: number | null;
+  cached: boolean;
+  total: number;
+  compatible: number;
+  canonicalSoc: string | null;
+  error: string | null;
+  activeNpuModel: string | null;
 }
 
 async function gather(): Promise<Diag> {
@@ -74,6 +97,32 @@ async function gather(): Promise<Diag> {
     startup: getStartupTrace(),
     assist: getLastAssistTurn(),
     assistTurns: getAssistModelTurns(),
+    hub: gatherHub(active),
+  };
+}
+
+/**
+ * Read straight off the store rather than re-queried.
+ *
+ * Diagnostics must not cause a network call: the point is to report what the
+ * app currently believes, and a screen that went and fetched a fresh answer
+ * would be describing a state the rest of the app was never in.
+ */
+function gatherHub(active: InstalledModel | null): HubDiag | null {
+  const store = useModelStore.getState();
+  if (!store.npu.inBuild) return null;
+  const snapshot = store.npuHub.snapshot;
+  const breakdown = snapshot
+    ? breakDownHubModels(snapshot.models, store.npu.soc, store.npu.chipsets)
+    : null;
+  return {
+    checkedAt: snapshot?.checkedAt ?? null,
+    cached: snapshot?.cached ?? false,
+    total: snapshot?.models.length ?? 0,
+    compatible: breakdown?.compatible.length ?? 0,
+    canonicalSoc: store.npu.canonicalSoc,
+    error: store.npuHub.error,
+    activeNpuModel: active && isNpuModel(active) ? active.displayName : null,
   };
 }
 
@@ -154,6 +203,51 @@ export default function DiagnosticsScreen() {
             </Text>
           )}
         </View>
+
+        {/* Qualcomm's catalogue, as state rather than as a list. The models
+            themselves live on the Models screen; what belongs here is whether
+            the query worked, when, and how much of the answer this device can
+            actually use — the four numbers that explain an empty list. */}
+        {diag.hub && (
+          <>
+            <Text style={styles.sectionTitle}>Qualcomm Hub</Text>
+            <View style={styles.card}>
+              <Row
+                label="Last check"
+                value={
+                  diag.hub.checkedAt === null
+                    ? "never"
+                    : `${new Date(diag.hub.checkedAt).toLocaleString()}${diag.hub.cached ? " (cached)" : ""}`
+                }
+              />
+              <Row label="Models returned" value={String(diag.hub.total)} />
+              <Row
+                label="Compatible here"
+                value={String(diag.hub.compatible)}
+              />
+              <Row
+                label="Filtering on"
+                value={diag.hub.canonicalSoc ?? "unknown chipset"}
+              />
+              <Row
+                label="Active NPU model"
+                value={diag.hub.activeNpuModel ?? "none"}
+              />
+              {diag.hub.error && (
+                <Text style={styles.hint}>
+                  Last hub error: {diag.hub.error}
+                </Text>
+              )}
+              <Text style={styles.hint}>
+                &ldquo;Compatible here&rdquo; counts models the hub offers for this
+                device&rsquo;s canonical chipset class AND in a model type this
+                app has a runtime for. A model absent from the list is absent as
+                of the check above, not permanently — Qualcomm publishes on its
+                own schedule.
+              </Text>
+            </View>
+          </>
+        )}
 
         {/* Every backend, whether or not it is in use — so a device with an NPU
             is told WHY it isn't being used rather than left guessing. */}
