@@ -14,6 +14,11 @@
 // anyway.
 
 import type { InstalledModel } from "./types";
+import {
+  canonicalChipset,
+  type ChipsetIdentity,
+  type RuntimeChipset,
+} from "./chipset-identity";
 
 export type NpuRefusal =
   | "not-npu-artifact" // a GGUF; llama.cpp's job, not a failure
@@ -21,6 +26,7 @@ export type NpuRefusal =
   | "device-unknown" // the platform won't tell us the chipset
   | "artifact-untargeted" // the artifact doesn't say what it was built for
   | "soc-mismatch" // built for a different chip
+  | "chipset-unrecognised" // the runtime has never heard of this chip
   | "runtime-too-old"; // the artifact needs a newer runtime than we have
 
 export type NpuCompatibility =
@@ -34,16 +40,35 @@ export interface NpuDevice {
   runtimeAvailable: boolean;
   /** The runtime's version, when it is available. */
   runtimeVersion: string | null;
+  /**
+   * The runtime's own chipset vocabulary — `ModelManagerWrapper.listChipsets()`,
+   * one entry per chip with every spelling it answers to.
+   *
+   * Three states, and they are not the same:
+   *   undefined  — never asked. Nothing extra is checked, and the device's own
+   *                reported id is matched against the bundle's target directly.
+   *   empty/null — asked, and the runtime had no table to give. Same treatment:
+   *                an empty table is evidence of nothing, so it refuses nothing.
+   *   entries    — the authority. Every id below is resolved through it, and a
+   *                device chip that does not appear in it is refused: a runtime
+   *                that does not know this silicon cannot be relied on to
+   *                reject a bundle built for different silicon either.
+   *
+   * This is what lets "SM8850" (Android), the runtime's own device name, and
+   * "SM8850" (the bundle's target) be recognised as one chip without any
+   * hand-written marketing-name table — see chipset-identity.
+   */
+  chipsets?: RuntimeChipset[] | null;
+}
+
+/** How a chipset is named in a refusal: its canonical id, plus what was reported. */
+function describe(id: ChipsetIdentity): string {
+  return id.runtimeName && id.runtimeName.toUpperCase() !== id.canonical
+    ? `${id.canonical} (${id.runtimeName})`
+    : id.canonical;
 }
 
 const NPU_ARTIFACTS = new Set(["qairt_context", "geniex_bundle"]);
-
-// SoC ids are case-insensitive in practice and sometimes carry a vendor prefix.
-function normalizeSoc(soc: string | null): string | null {
-  if (!soc) return null;
-  const trimmed = soc.trim().toUpperCase().replace(/^QCOM[-_]?/, "");
-  return trimmed.length > 0 ? trimmed : null;
-}
 
 // "0.4.0" → [0,4,0]. Anything unparseable sorts as "unknown" rather than zero,
 // so a garbled version never reads as older-than-everything.
@@ -83,10 +108,15 @@ export function checkNpuCompatibility(
     };
   }
 
-  const deviceSoc = normalizeSoc(device.soc);
-  const targetSoc = normalizeSoc(model.targetSoc);
+  // Every id — Android's, the runtime's, the bundle's — reduced to one
+  // canonical form through the runtime's own table. Comparing the raw strings
+  // is what made a OnePlus 15 refuse an SM8850 bundle: Android calls the chip
+  // "SM8850" and GenieX calls the same chip by a device name.
+  const table = device.chipsets;
+  const target = canonicalChipset(model.targetSoc, table);
+  const deviceChip = canonicalChipset(device.soc, table);
 
-  if (!targetSoc) {
+  if (!target) {
     // An NPU artifact that doesn't say what it was compiled for cannot be
     // matched to anything. Refusing is the only honest answer.
     return {
@@ -95,18 +125,31 @@ export function checkNpuCompatibility(
       message: `${model.displayName} doesn't record which chipset it was built for, so it can't be run safely.`,
     };
   }
-  if (!deviceSoc) {
+  if (!deviceChip) {
     return {
       ok: false,
       reason: "device-unknown",
       message: "This device doesn't report its chipset, so NPU compatibility can't be confirmed.",
     };
   }
-  if (deviceSoc !== targetSoc) {
+
+  // The runtime was asked and has a vocabulary, but this chip is not in it.
+  // Fail closed, before the mismatch check: "the runtime has never heard of
+  // this chip" is a different problem from "wrong chip", and sending a user
+  // looking for a different artifact would be the wrong advice.
+  if (deviceChip.tableConsulted && !deviceChip.knownToRuntime) {
+    return {
+      ok: false,
+      reason: "chipset-unrecognised",
+      message: `The Qualcomm runtime does not recognise this device's chipset (${deviceChip.canonical}), so it can't confirm ${model.displayName} will run here.`,
+    };
+  }
+
+  if (deviceChip.canonical !== target.canonical) {
     return {
       ok: false,
       reason: "soc-mismatch",
-      message: `${model.displayName} was built for ${targetSoc}; this device is ${deviceSoc}.`,
+      message: `${model.displayName} was built for ${describe(target)}; this device is ${describe(deviceChip)}.`,
     };
   }
 

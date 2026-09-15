@@ -30,6 +30,8 @@ function model(overrides: Partial<InstalledModel> = {}): InstalledModel {
     artifact: "gguf" as const,
     targetSoc: null,
     runtimeVersion: null,
+    runtimeModelName: null,
+    tokenizerPath: null,
     bundleFiles: [],
     isActive: false,
     createdAt: 0,

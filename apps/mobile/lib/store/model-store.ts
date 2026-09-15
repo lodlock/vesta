@@ -18,6 +18,7 @@ import {
   setModelState,
   setResumeToken,
   finalizeModel,
+  finalizeBundle,
   setModelIntegrity,
   setActiveModel,
   removeModel,
@@ -36,7 +37,23 @@ import {
   type HfFile,
 } from "../models/hf-client";
 import { canActivate } from "../models/activation";
-import { setDeviceSoc } from "../llm/backends/registry";
+import { backendModelRef, npuRefusalFor } from "../llm/backends/registry";
+import { npuCatalogFor, type NpuCatalogModel } from "../models/npu-catalog";
+import { prepareNpuBackend, type NpuReadiness } from "../models/npu-ready";
+import {
+  checkBundle,
+  toBundleFiles,
+  verifyAgainstBaseline,
+  type MeasuredBundle,
+} from "../models/npu-bundle";
+import { isNpuModel } from "../models/npu-compat";
+import {
+  npuPull,
+  npuCancelPull,
+  npuBundleInfo,
+  npuRemoveBundle,
+  onNpuPullProgress,
+} from "../native/npu";
 import { checkGgufFile } from "../models/gguf-header";
 import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
 import { sha256File, normalizeSha256 } from "../native/file-hash";
@@ -74,6 +91,16 @@ function baseName(path: string): string {
   return path.split("/").pop() ?? path;
 }
 
+/**
+ * What this build and this phone can do with the Qualcomm NPU.
+ *
+ * The facts are kept separate because they fail separately, and a user staring
+ * at "NPU unavailable" deserves to know which one it was. Produced by
+ * npu-ready, which is also what the cold-start load path uses — one place that
+ * decides, so the Models screen and the loader can never disagree.
+ */
+export type NpuStatus = NpuReadiness;
+
 interface ModelState {
   installed: InstalledModel[];
   progress: Record<string, DownloadProgress>;
@@ -81,8 +108,14 @@ interface ModelState {
   caps: DeviceCaps | null;
   busy: boolean;
   error: string | null;
+  npu: NpuStatus;
+  /** Curated NPU entries for THIS chipset. Empty on every other device. */
+  npuCatalog: NpuCatalogModel[];
 
   refresh: () => Promise<void>;
+  installNpuModel: (model: NpuCatalogModel) => Promise<void>;
+  cancelNpuInstall: (id: string) => Promise<void>;
+  verifyNpuBundle: (id: string) => Promise<void>;
   downloadFromCatalog: (model: CatalogModel) => Promise<void>;
   downloadFromRepo: (
     repo: string,
@@ -109,17 +142,243 @@ export const useModelStore = create<ModelState>((set, get) => ({
   caps: null,
   busy: false,
   error: null,
+  npu: {
+    inBuild: false,
+    available: false,
+    reason: null,
+    runtimeVersion: null,
+    soc: null,
+    runtimeChipset: undefined,
+    canonicalSoc: null,
+    chipsets: undefined,
+  },
+  npuCatalog: [],
 
   refresh: async () => {
     const [installed, caps] = await Promise.all([listInstalled(), getDeviceCaps()]);
-    // The NPU backend can only match an artifact's target against a chipset it
-    // knows. Until this runs it knows none, and therefore claims nothing.
-    setDeviceSoc(caps.soc);
+    // Tells the NPU backend what chipset it is on and whether its runtime
+    // works. Until this has run the backend knows neither, and therefore
+    // claims nothing. Cached per process, and free in a default build.
+    const npu = await prepareNpuBackend(caps.soc);
+
     set({
       installed,
       caps,
       freeBytes: Number.isFinite(caps.freeBytes) ? caps.freeBytes : null,
+      npu,
+      // Offered only where it can run. An NPU entry is several gigabytes that
+      // work on one chipset family and nowhere else, so showing it on the wrong
+      // phone is not a harmless extra option.
+      npuCatalog: npu.available ? npuCatalogFor(caps.soc, npu.chipsets) : [],
     });
+  },
+
+  // -- NPU bundle install -------------------------------------------------
+  //
+  // Nothing here shares code with the GGUF download path, and that is the
+  // point. A GGUF is one file Vesta fetches over HTTP into its own models
+  // directory. A context bundle is many files whose URLs are resolved from a
+  // chipset-keyed release manifest only the GenieX SDK can read, landing in the
+  // SDK's own cache under filesDir/geniex. The two never touch the same
+  // directory, so a failed NPU install cannot truncate, overwrite or delete a
+  // working GGUF -- see npu-bundle.bundleIsolatedFromGguf.
+  installNpuModel: async (model: NpuCatalogModel) => {
+    set({ error: null });
+
+    const npu = get().npu;
+    if (!npu.available) {
+      set({
+        error:
+          npu.reason ??
+          "There is no Qualcomm NPU runtime in this build, so an NPU model cannot be installed.",
+      });
+      return;
+    }
+
+    // The same refusal the backend would give at load time, applied BEFORE
+    // several gigabytes are spent rather than after.
+    const refusal = npuRefusalFor(
+      backendModelRef({
+        filePath: "",
+        artifact: model.artifact,
+        contextSize: 4096,
+        displayName: model.displayName,
+        targetSoc: model.targetSoc,
+        runtimeVersion: model.runtimeVersion,
+        quant: model.precision,
+      }),
+    );
+    if (refusal) {
+      set({ error: refusal });
+      return;
+    }
+
+    if (get().installed.some((m) => m.runtimeModelName === model.modelName)) {
+      set({ error: `${model.displayName} is already installed.` });
+      return;
+    }
+
+    // A placeholder row so the download is visible, cancellable and -- above
+    // all -- recoverable: a process killed mid-pull leaves a row in
+    // "downloading" that the user can see and cancel, rather than gigabytes in
+    // a cache directory nothing references.
+    const row = await insertModel({
+      displayName: `${model.displayName} (NPU)`,
+      filePath: "",
+      quant: model.precision,
+      sizeBytes: 0,
+      minRamMb: model.minRamMb,
+      contextSize: 4096,
+      role: model.role,
+      state: "downloading",
+      backend: "qualcomm_npu",
+      artifact: model.artifact,
+      targetSoc: model.targetSoc,
+      runtimeVersion: model.runtimeVersion,
+      runtimeModelName: model.modelName,
+      trust: "unverified",
+    });
+    await get().refresh();
+
+    const unsubscribe = onNpuPullProgress((p) => {
+      if (p.modelName !== model.modelName) return;
+      set((state) => ({
+        progress: {
+          ...state.progress,
+          [row.id]: {
+            modelId: row.id,
+            status: "downloading",
+            bytesWritten: p.downloaded,
+            bytesTotal: p.total,
+            bytesPerSec: 0,
+            etaSeconds: null,
+          },
+        },
+      }));
+    });
+
+    try {
+      const bundle = await npuPull({
+        modelName: model.modelName,
+        // The runtime's OWN name for this chip when it has one, and only the
+        // catalog's SoC id as a fallback. `listChipsets()` is the vocabulary
+        // the AI Hub release manifest is keyed by, so asking for assets in the
+        // runtime's own words is the request most likely to resolve; the
+        // canonical layer has already established the two name one chip.
+        chipset: npu.runtimeChipset ?? model.targetSoc,
+        precision: model.precision,
+        hub: model.hub,
+        displayName: model.displayName,
+      });
+
+      // Everything that could make this unloadable, decided from the file
+      // listing rather than from a load attempt that costs 20+ seconds and an
+      // out-of-memory risk to learn the same thing.
+      const check = checkBundle(bundle as MeasuredBundle);
+      if (!check.ok) {
+        // Removes the bundle, and only the bundle: this addresses the GenieX
+        // cache entry for this model name and nothing else on disk.
+        await npuRemoveBundle(model.modelName).catch(() => {});
+        await removeModel(row.id);
+        await get().refresh();
+        set({ error: `${model.displayName}: ${check.message}` });
+        return;
+      }
+
+      await finalizeBundle(row.id, {
+        filePath: bundle.modelPath,
+        tokenizerPath: bundle.tokenizerPath ?? null,
+        sizeBytes: bundle.totalBytes,
+        bundleFiles: toBundleFiles(bundle.files),
+      });
+      await get().refresh();
+
+      if (check.warnings.length > 0) set({ error: check.warnings.join(" ") });
+
+      const active = await getActiveModel();
+      if (!active) await get().activate(row.id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // A cancelled or failed pull leaves partial files in the SDK's cache,
+      // where a later pull resumes them. The ROW goes, because a row pointing
+      // at an incomplete bundle is what makes a later load fail confusingly.
+      await removeModel(row.id);
+      await get().refresh();
+      set({ error: `${model.displayName}: ${message}` });
+    } finally {
+      unsubscribe();
+      set((state) => {
+        const progress = { ...state.progress };
+        delete progress[row.id];
+        return { progress };
+      });
+    }
+  },
+
+  cancelNpuInstall: async (id: string) => {
+    npuCancelPull();
+    const model = await getModelById(id);
+    if (model?.runtimeModelName) {
+      await npuRemoveBundle(model.runtimeModelName).catch(() => {});
+    }
+    if (model) await removeModel(id);
+    set((s) => {
+      const progress = { ...s.progress };
+      delete progress[id];
+      return { progress };
+    });
+    await get().refresh();
+  },
+
+  // The NPU equivalent of Verify. It cannot appeal to an upstream digest --
+  // there is none -- so it compares what is on disk against the baseline
+  // recorded at install, and says plainly how much of the bundle that actually
+  // covered. See npu-bundle.verifyAgainstBaseline.
+  verifyNpuBundle: async (id: string) => {
+    set({ busy: true, error: null });
+    try {
+      const model = await getModelById(id);
+      if (!model?.runtimeModelName) return;
+
+      const bundle = await npuBundleInfo(model.runtimeModelName);
+      if (!bundle) {
+        await setModelState(id, "error");
+        await get().refresh();
+        set({ error: `${model.displayName}: the bundle is gone -- reinstall it.` });
+        return;
+      }
+
+      const structure = checkBundle(bundle as MeasuredBundle);
+      if (!structure.ok) {
+        await setModelState(id, "error");
+        await get().refresh();
+        set({ error: `${model.displayName}: ${structure.message}` });
+        return;
+      }
+
+      const result = verifyAgainstBaseline(model.bundleFiles, bundle.files);
+      if (!result.ok) {
+        await setModelState(id, "error");
+        await get().refresh();
+        set({
+          error: `${model.displayName} has changed since it was installed: ${result.problems.join(" ")}`,
+        });
+        return;
+      }
+      await setModelIntegrity(id, { state: "ready", sizeBytes: bundle.totalBytes });
+      await get().refresh();
+      set({
+        error:
+          `${model.displayName} still matches what was recorded at install ` +
+          `(${result.checked} file${result.checked === 1 ? "" : "s"} by checksum, ` +
+          `${result.unchecked} by size only -- Qualcomm publishes no checksums ` +
+          `for these bundles).`,
+      });
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      set({ busy: false });
+    }
   },
 
   downloadFromCatalog: async (model: CatalogModel) => {
@@ -427,24 +686,43 @@ export const useModelStore = create<ModelState>((set, get) => ({
       set({ error: check.message });
       return;
     }
-    const info = await FileSystem.getInfoAsync(model.filePath);
-    if (!info.exists) {
-      await setModelState(id, "error");
-      await get().refresh();
-      set({ error: "Model file is missing — re-download it." });
-      return;
-    }
-    // Cheap integrity gate on every load: the size must still be the size we
-    // recorded. Re-hashing a multi-GB file here would add seconds to every cold
-    // start, so the full check lives in verifyIntegrity(); this catches the
-    // common case (a file replaced or truncated under us) for free.
-    if (model.sizeBytes > 0 && (info.size ?? 0) !== model.sizeBytes) {
-      await setModelState(id, "error");
-      await get().refresh();
-      set({
-        error: `${model.displayName} changed on disk (${info.size ?? 0} bytes, expected ${model.sizeBytes}). Tap Verify to check it against its source.`,
-      });
-      return;
+    const npuModel = isNpuModel(model);
+
+    // A bundle is a DIRECTORY the GenieX model manager owns, so the single-file
+    // checks below do not describe it. Its equivalents are the structural check
+    // (metadata.json + shards + tokenizer, all non-empty) and the recorded
+    // per-file sizes, both of which Verify runs — asking the manager whether it
+    // still resolves the name is the cheap gate that belongs on every load.
+    if (npuModel) {
+      const stillThere = model.runtimeModelName
+        ? await npuBundleInfo(model.runtimeModelName)
+        : null;
+      if (!stillThere) {
+        await setModelState(id, "error");
+        await get().refresh();
+        set({ error: `${model.displayName}: the bundle is gone — reinstall it.` });
+        return;
+      }
+    } else {
+      const info = await FileSystem.getInfoAsync(model.filePath);
+      if (!info.exists) {
+        await setModelState(id, "error");
+        await get().refresh();
+        set({ error: "Model file is missing — re-download it." });
+        return;
+      }
+      // Cheap integrity gate on every load: the size must still be the size we
+      // recorded. Re-hashing a multi-GB file here would add seconds to every cold
+      // start, so the full check lives in verifyIntegrity(); this catches the
+      // common case (a file replaced or truncated under us) for free.
+      if (model.sizeBytes > 0 && (info.size ?? 0) !== model.sizeBytes) {
+        await setModelState(id, "error");
+        await get().refresh();
+        set({
+          error: `${model.displayName} changed on disk (${info.size ?? 0} bytes, expected ${model.sizeBytes}). Tap Verify to check it against its source.`,
+        });
+        return;
+      }
     }
     try {
       const perf = perfToLlmOptions(await getPerfSettings());
@@ -453,10 +731,26 @@ export const useModelStore = create<ModelState>((set, get) => ({
         contextSize: model.contextSize,
         gpuLayers: 0,
         chatTemplate: model.chatTemplate ?? undefined,
+        // What tells the engine WHICH runtime this row belongs to. Without it
+        // the engine does what it always did and loads a GGUF on llama.cpp,
+        // which is right for every caller that has only a path.
+        backendModel: backendModelRef({
+          filePath: model.filePath,
+          artifact: model.artifact,
+          contextSize: model.contextSize,
+          displayName: model.displayName,
+          chatTemplate: model.chatTemplate,
+          targetSoc: model.targetSoc,
+          runtimeVersion: model.runtimeVersion,
+          quant: model.quant,
+          tokenizerPath: model.tokenizerPath,
+          runtimeModelName: model.runtimeModelName,
+        }),
       });
       // Same as the app-start path (chat-store.init): restore this model's
       // persisted prefix KV before any completion. Switching back to a model
-      // whose session file is on disk skips the ~30s cold prefill.
+      // whose session file is on disk skips the ~30s cold prefill. A no-op on
+      // the Qualcomm path, which has no KV state to restore.
       await warmSessionCache();
       await setActiveModel(id);
       await get().refresh();
@@ -493,7 +787,15 @@ export const useModelStore = create<ModelState>((set, get) => ({
       await unloadModel().catch(() => {});
       useChatStore.getState().updateModelStatus();
     }
-    await deleteModelFile(model.filePath);
+    // Deleting a bundle means asking the runtime that owns it; the path in
+    // file_path points INTO the GenieX cache, and unlinking one file out of a
+    // multi-file bundle would leave the rest stranded and the manager still
+    // believing it has the model.
+    if (isNpuModel(model) && model.runtimeModelName) {
+      await npuRemoveBundle(model.runtimeModelName).catch(() => {});
+    } else {
+      await deleteModelFile(model.filePath);
+    }
     await removeModel(id);
 
     // Removing the active model: promote another ready model so the app isn't
@@ -508,8 +810,14 @@ export const useModelStore = create<ModelState>((set, get) => ({
   },
 
   cancel: async (id: string) => {
-    await cancelTask(id);
     const model = await getModelById(id);
+    // An NPU install is not an HTTP download task and has no file of its own to
+    // unlink; it is cancelled through the runtime that started it.
+    if (model && isNpuModel(model)) {
+      await get().cancelNpuInstall(id);
+      return;
+    }
+    await cancelTask(id);
     if (model) {
       await deleteModelFile(model.filePath);
       await removeModel(id);

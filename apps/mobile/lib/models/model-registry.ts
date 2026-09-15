@@ -35,6 +35,8 @@ interface ModelRow {
   artifact: ModelArtifact | null;
   target_soc: string | null;
   runtime_version: string | null;
+  runtime_model_name: string | null;
+  tokenizer_path: string | null;
   bundle_files: string | null;
   is_active: number;
   created_at: number;
@@ -64,6 +66,8 @@ function mapRow(r: ModelRow): InstalledModel {
     artifact: r.artifact ?? "gguf",
     targetSoc: r.target_soc,
     runtimeVersion: r.runtime_version,
+    runtimeModelName: r.runtime_model_name,
+    tokenizerPath: r.tokenizer_path,
     bundleFiles: parseBundleFiles(r.bundle_files),
     isActive: r.is_active === 1,
     createdAt: r.created_at,
@@ -74,7 +78,8 @@ const SELECT =
   `SELECT id, display_name, hf_repo, hf_file, file_path, quant, size_bytes,
           min_ram_mb, chat_template, context_size, role, state, resume_token,
           sha256, trust, backend, artifact, target_soc, runtime_version,
-          bundle_files, is_active, created_at FROM models`;
+          runtime_model_name, tokenizer_path, bundle_files, is_active,
+          created_at FROM models`;
 
 // Bundle manifests are stored as JSON. A corrupt value must not take the whole
 // model list down with it — an unreadable manifest reads as "no bundle", which
@@ -112,6 +117,8 @@ export interface NewModel {
   artifact?: ModelArtifact;
   targetSoc?: string | null;
   runtimeVersion?: string | null;
+  runtimeModelName?: string | null;
+  tokenizerPath?: string | null;
   bundleFiles?: BundleFile[];
 }
 
@@ -124,8 +131,8 @@ export async function insertModel(m: NewModel): Promise<InstalledModel> {
        (id, display_name, hf_repo, hf_file, file_path, quant, size_bytes,
         min_ram_mb, chat_template, context_size, role, state, resume_token,
         sha256, trust, backend, artifact, target_soc, runtime_version,
-        bundle_files, is_active, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+        runtime_model_name, tokenizer_path, bundle_files, is_active, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
     id,
     m.displayName,
     m.hfRepo ?? null,
@@ -145,6 +152,8 @@ export async function insertModel(m: NewModel): Promise<InstalledModel> {
     m.artifact ?? "gguf",
     m.targetSoc ?? null,
     m.runtimeVersion ?? null,
+    m.runtimeModelName ?? null,
+    m.tokenizerPath ?? null,
     m.bundleFiles && m.bundleFiles.length > 0
       ? JSON.stringify(m.bundleFiles)
       : null,
@@ -225,6 +234,44 @@ export async function finalizeModel(
     fields.sha256 ?? null,
     fields.chatTemplate ?? null,
     fields.trust ?? "unverified",
+    id,
+  );
+}
+
+/**
+ * Commits a downloaded NPU bundle: the paths the runtime resolved, the measured
+ * total size, and the per-file manifest.
+ *
+ * Separate from finalizeModel() rather than another optional argument on it,
+ * because the two record DIFFERENT things. finalizeModel writes one file's
+ * digest and a trust level derived from an upstream or user-supplied checksum.
+ * A bundle has neither: Qualcomm publishes no digest for these assets, so
+ * `sha256` stays null (there is no single file to have one) and `trust` is
+ * fixed at `user_supplied_baseline` — real sizes and digests for the small
+ * files, recorded at install, proving integrity from here onwards and nothing
+ * about provenance. Writing that constant here rather than accepting it as a
+ * parameter is deliberate: no caller should be able to claim more.
+ */
+export async function finalizeBundle(
+  id: string,
+  fields: {
+    filePath: string;
+    tokenizerPath: string | null;
+    sizeBytes: number;
+    bundleFiles: BundleFile[];
+  },
+): Promise<void> {
+  const d = await getDatabase();
+  await d.runAsync(
+    `UPDATE models
+       SET state = 'ready', resume_token = NULL,
+           file_path = ?, tokenizer_path = ?, size_bytes = ?,
+           bundle_files = ?, sha256 = NULL, trust = 'user_supplied_baseline'
+     WHERE id = ?`,
+    fields.filePath,
+    fields.tokenizerPath,
+    fields.sizeBytes,
+    fields.bundleFiles.length > 0 ? JSON.stringify(fields.bundleFiles) : null,
     id,
   );
 }

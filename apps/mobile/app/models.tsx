@@ -10,9 +10,11 @@ import {
   Alert,
 } from "react-native";
 import * as DocumentPicker from "expo-document-picker";
-import { useModelStore } from "../lib/store/model-store";
+import { useModelStore, type NpuStatus } from "../lib/store/model-store";
 import { CATALOG } from "../lib/models/catalog";
 import { listGgufFiles, type HfFile } from "../lib/models/hf-client";
+import type { NpuCatalogModel } from "../lib/models/npu-catalog";
+import { isNpuModel } from "../lib/models/npu-compat";
 import type { CatalogModel, InstalledModel, ModelTrust } from "../lib/models/types";
 import { formatBytes, formatDuration, percent, fitLabel, type FitLabel } from "../lib/models/format";
 import { canActivate, canVerify } from "../lib/models/activation";
@@ -34,6 +36,10 @@ export default function ModelsScreen() {
   const importLocalModel = useModelStore((s) => s.importLocalModel);
   const verifyIntegrity = useModelStore((s) => s.verifyIntegrity);
   const clearError = useModelStore((s) => s.clearError);
+  const npu = useModelStore((s) => s.npu);
+  const npuCatalog = useModelStore((s) => s.npuCatalog);
+  const installNpuModel = useModelStore((s) => s.installNpuModel);
+  const verifyNpuBundle = useModelStore((s) => s.verifyNpuBundle);
   // Optional: a SHA-256 the user has for the file they are about to import.
   // Left empty, the import still works — see importLocalModel's policy.
   const [importChecksum, setImportChecksum] = useState("");
@@ -45,6 +51,21 @@ export default function ModelsScreen() {
   const installedByRepo = useCallback(
     (repo: string): InstalledModel | undefined =>
       installed.find((m) => m.hfRepo === repo),
+    [installed],
+  );
+
+  // A bundle and a GGUF are verified against different things, so the row's
+  // Verify button dispatches on the artifact rather than the two sharing one
+  // handler that would have to re-derive it.
+  const verify = useCallback(
+    (m: InstalledModel) =>
+      isNpuModel(m) ? verifyNpuBundle(m.id) : verifyIntegrity(m.id),
+    [verifyIntegrity, verifyNpuBundle],
+  );
+
+  const installedNpu = useCallback(
+    (modelName: string): InstalledModel | undefined =>
+      installed.find((m) => m.runtimeModelName === modelName),
     [installed],
   );
 
@@ -104,16 +125,35 @@ export default function ModelsScreen() {
           onActivate={activate}
           onCancel={cancel}
           onRemove={confirmRemove}
-          onVerify={verifyIntegrity}
+          onVerify={verify}
         />
       ))}
 
+      {/* Qualcomm NPU.
+          A whole separate section rather than another row in Recommended, and
+          the reason is not cosmetic: the two Qwen3 4B entries are the same
+          model in two incompatible artifacts, and a user who cannot tell them
+          apart will delete the wrong one. This section states the backend, the
+          chipset and the quantization on every card, and appears at all only
+          on hardware that can run it. */}
+      <NpuSection
+        npu={npu}
+        catalog={npuCatalog}
+        installedFor={installedNpu}
+        progress={progress}
+        onInstall={installNpuModel}
+        onActivate={activate}
+        onCancel={cancel}
+        onRemove={confirmRemove}
+        onVerify={verify}
+      />
+
       {/* Installed (non-catalog, e.g. imported or ad-hoc HF) */}
-      {installed.filter((m) => !CATALOG.some((c) => c.hfRepo === m.hfRepo)).length > 0 && (
+      {installed.filter((m) => !CATALOG.some((c) => c.hfRepo === m.hfRepo) && !isNpuModel(m)).length > 0 && (
         <>
           <Text style={styles.sectionTitle}>Installed</Text>
           {installed
-            .filter((m) => !CATALOG.some((c) => c.hfRepo === m.hfRepo))
+            .filter((m) => !CATALOG.some((c) => c.hfRepo === m.hfRepo) && !isNpuModel(m))
             .map((m) => (
               <InstalledRow
                 key={m.id}
@@ -122,7 +162,7 @@ export default function ModelsScreen() {
                 onActivate={activate}
                 onCancel={cancel}
                 onRemove={confirmRemove}
-                onVerify={verifyIntegrity}
+                onVerify={verify}
               />
             ))}
         </>
@@ -217,7 +257,7 @@ function CatalogRow({
   onActivate: (id: string) => void;
   onCancel: (id: string) => void;
   onRemove: (m: InstalledModel) => void;
-  onVerify: (id: string) => void;
+  onVerify: (m: InstalledModel) => void;
 }) {
   const prog = installed ? progress[installed.id] : undefined;
   const downloading = prog?.status === "downloading";
@@ -272,7 +312,7 @@ function CatalogRow({
           </TouchableOpacity>
         )}
         {installed && !downloading && canVerify(installed) && (
-          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(installed.id)} activeOpacity={0.7}>
+          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(installed)} activeOpacity={0.7}>
             <Text style={styles.btnOutlineText}>Verify</Text>
           </TouchableOpacity>
         )}
@@ -315,7 +355,7 @@ function InstalledRow({
   onActivate: (id: string) => void;
   onCancel: (id: string) => void;
   onRemove: (m: InstalledModel) => void;
-  onVerify: (id: string) => void;
+  onVerify: (m: InstalledModel) => void;
 }) {
   const downloading = progress?.status === "downloading";
   const activation = canActivate(model);
@@ -352,7 +392,7 @@ function InstalledRow({
           </View>
         )}
         {!downloading && canVerify(model) && (
-          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(model.id)} activeOpacity={0.7}>
+          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(model)} activeOpacity={0.7}>
             <Text style={styles.btnOutlineText}>Verify</Text>
           </TouchableOpacity>
         )}
@@ -363,6 +403,177 @@ function InstalledRow({
         )}
       </View>
     </View>
+  );
+}
+
+/**
+ * The Qualcomm NPU section.
+ *
+ * Shows one of three things, never a blank space:
+ *   - nothing at all, on a build with no NPU bridge in it. There is no point
+ *     telling a user about hardware this APK cannot reach.
+ *   - a plain explanation, when the bridge is present but the runtime did not
+ *     start here — including the runtime's OWN words for why, because
+ *     "unavailable" is not a thing anyone can act on.
+ *   - the curated entries for this exact chipset.
+ */
+function NpuSection({
+  npu,
+  catalog,
+  installedFor,
+  progress,
+  onInstall,
+  onActivate,
+  onCancel,
+  onRemove,
+  onVerify,
+}: {
+  npu: NpuStatus;
+  catalog: NpuCatalogModel[];
+  installedFor: (modelName: string) => InstalledModel | undefined;
+  progress: Record<string, { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string }>;
+  onInstall: (m: NpuCatalogModel) => void;
+  onActivate: (id: string) => void;
+  onCancel: (id: string) => void;
+  onRemove: (m: InstalledModel) => void;
+  onVerify: (m: InstalledModel) => void;
+}) {
+  if (!npu.inBuild) return null;
+
+  return (
+    <>
+      <Text style={styles.sectionTitle}>Qualcomm NPU</Text>
+      {!npu.available ? (
+        <View style={styles.card}>
+          <Text style={styles.rowDesc}>
+            This build can use the Hexagon NPU, but the runtime did not start on
+            this device.
+          </Text>
+          {npu.reason && <Text style={styles.rowError}>{npu.reason}</Text>}
+          <Text style={styles.rowHint}>
+            Everything still runs on llama.cpp, exactly as before.
+          </Text>
+        </View>
+      ) : catalog.length === 0 ? (
+        <View style={styles.card}>
+          <Text style={styles.rowDesc}>
+            The Hexagon runtime is ready
+            {npu.runtimeVersion ? ` (QAIRT ${npu.runtimeVersion})` : ""}, but
+            Vesta has no NPU model compiled for{" "}
+            {npu.soc ?? "this device's chipset"} yet.
+          </Text>
+          <Text style={styles.rowHint}>
+            An NPU model is compiled ahead of time for one chipset. It is not
+            slower on another — it does not run at all, which is why one is
+            never offered speculatively.
+          </Text>
+        </View>
+      ) : (
+        catalog.map((m) => {
+          const row = installedFor(m.modelName);
+          const prog = row ? progress[row.id] : undefined;
+          const downloading = prog?.status === "downloading" || row?.state === "downloading";
+          const activation = row ? canActivate(row) : null;
+          return (
+            <View key={m.id} style={[styles.card, row?.isActive && styles.cardActive]}>
+              <View style={styles.rowHeader}>
+                <Text style={styles.rowTitle}>{m.displayName}</Text>
+                <Text style={styles.rowMeta}>
+                  {formatBytes(row && row.sizeBytes > 0 ? row.sizeBytes : m.sizeBytesApprox)}
+                  {row && row.sizeBytes > 0 ? "" : " approx."}
+                </Text>
+              </View>
+              {/* The three facts that distinguish this from the GGUF entry of
+                  the same model. Spelled out on the card rather than hidden
+                  behind a badge, because mixing them up is the expensive
+                  mistake here. */}
+              <Text style={styles.rowHint}>Backend: Qualcomm Hexagon NPU</Text>
+              <Text style={styles.rowHint}>
+                Target: {m.targetSoc} ({m.socName})
+              </Text>
+              <Text style={styles.rowHint}>
+                Quantization: {m.precision ?? "as published"}
+              </Text>
+              <Text style={styles.rowDesc}>{m.description}</Text>
+              <Text style={styles.rowHint}>
+                ~{Math.round(m.minRamMb / 1024)} GB RAM · {m.license}
+              </Text>
+
+              {row && !downloading && (
+                <Text style={styles.rowHint}>{TRUST_LABEL[row.trust]}</Text>
+              )}
+              {row && !downloading && activation && !activation.ok && (
+                <Text style={styles.rowError}>{activation.message}</Text>
+              )}
+
+              {downloading && prog && (
+                <ProgressBar
+                  written={prog.bytesWritten}
+                  total={prog.bytesTotal}
+                  etaSeconds={prog.etaSeconds}
+                />
+              )}
+              {downloading && !prog && (
+                <Text style={styles.rowHint}>Starting download…</Text>
+              )}
+
+              <View style={styles.btnRow}>
+                {!row && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnPrimary]}
+                    onPress={() => onInstall(m)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnPrimaryText}>Install</Text>
+                  </TouchableOpacity>
+                )}
+                {row && downloading && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnOutline]}
+                    onPress={() => onCancel(row.id)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnOutlineText}>Cancel</Text>
+                  </TouchableOpacity>
+                )}
+                {row && activation?.ok && !row.isActive && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnPrimary]}
+                    onPress={() => onActivate(row.id)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnPrimaryText}>Use this model</Text>
+                  </TouchableOpacity>
+                )}
+                {row?.isActive && (
+                  <View style={[styles.btn, styles.btnActive]}>
+                    <Text style={styles.btnActiveText}>● Active</Text>
+                  </View>
+                )}
+                {row && !downloading && canVerify(row) && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnOutline]}
+                    onPress={() => onVerify(row)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnOutlineText}>Verify</Text>
+                  </TouchableOpacity>
+                )}
+                {row && !downloading && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnGhost]}
+                    onPress={() => onRemove(row)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnGhostText}>Delete</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+          );
+        })
+      )}
+    </>
   );
 }
 

@@ -171,6 +171,29 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       UPDATE models SET artifact = 'gguf' WHERE artifact IS NULL;
     `,
   },
+  {
+    // How a runtime that owns its own files addresses a model.
+    //
+    // Every GGUF Vesta has ever had is a path: Vesta downloads it, Vesta stores
+    // it, Vesta hands llama.cpp the path. A Qualcomm bundle inverts that — the
+    // GenieX model manager downloads it, keeps it in its own cache, and is
+    // asked for it by NAME ("ai-hub-models/Qwen3-4B-Instruct-2507"); the paths
+    // come back from IT, together with the manifest's runtime id.
+    //
+    //   runtime_model_name  the name the runtime knows it by; NULL for a GGUF
+    //   tokenizer_path      where the tokenizer is, when it isn't beside the
+    //                       weights. NULL for a GGUF, which embeds its own.
+    //
+    // file_path still holds a path for these rows — the one the manager
+    // resolved — because everything from disk-usage display to the missing-file
+    // check reads it, and a row with no path at all would silently opt out of
+    // all of it.
+    version: 6,
+    sql: `
+      ALTER TABLE models ADD COLUMN runtime_model_name TEXT;
+      ALTER TABLE models ADD COLUMN tokenizer_path TEXT;
+    `,
+  },
 ];
 
 // Exported for testing. Applies every migration whose version exceeds the DB's

@@ -105,6 +105,13 @@ export interface InstalledModel {
   targetSoc: string | null;
   // The runtime version the artifact expects, when it declares one.
   runtimeVersion: string | null;
+  // How a runtime that owns its own files addresses this model — GenieX's
+  // "ai-hub-models/Qwen3-4B-Instruct-2507". Null for everything Vesta stores
+  // itself, which is every GGUF.
+  runtimeModelName: string | null;
+  // Where the tokenizer is, for a bundle that keeps it apart from the weights.
+  // Null for a GGUF, which embeds its own.
+  tokenizerPath: string | null;
   // Files that make up a bundle, verified together. Empty for single-file models.
   bundleFiles: BundleFile[];
   isActive: boolean;

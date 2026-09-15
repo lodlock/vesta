@@ -58,6 +58,11 @@ export function canActivate(model: InstalledModel): ActivationCheck {
 /** Whether the Models screen should offer a Verify action for this row. */
 export function canVerify(model: InstalledModel): boolean {
   if (model.state === "downloading" || model.state === "paused") return false;
+  // A bundle has something to check against as soon as it has a recorded
+  // manifest: per-file sizes, plus digests for the small files. That is a
+  // weaker claim than an upstream digest and is labelled as one, but it is a
+  // real check and the row should offer it.
+  if (model.bundleFiles.length > 0) return true;
   // Something to check against: a digest on record, or a repo to ask for one.
   return !!model.sha256 || (!!model.hfRepo && !!model.hfFile);
 }
