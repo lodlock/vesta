@@ -176,12 +176,14 @@ work around it by copying an SDK into the tree.
 
 Getting the model, two ways:
 
-- **Models → Qualcomm NPU → Install** pulls the precompiled
-  `ai-hub-models/Qwen3-4B-Instruct-2507` bundle on-device through the GenieX
-  model manager, into app-private storage. No Qualcomm account needed. The
-  chipset string is taken from the hub's own catalogue rather than guessed, and
-  **Check hub** shows what it currently lists — so "is this published for my
-  chip?" is answerable before a download starts, not after it 404s.
+- **Models → Qualcomm NPU → Check hub** lists Qualcomm's own catalogue, filtered
+  to this device's chipset, and installs any of it on-device into app-private
+  storage. No Qualcomm account needed. The list is never hard-coded — Qualcomm
+  publishes and unpublishes, so the hub is the source of truth and the button
+  becomes **Refresh hub** afterwards.
+  Vesta's preferred model is Qwen3 4B Instruct (2507); at the time of writing
+  Qualcomm does not list it (19 models returned, that one absent), so its card
+  says so with the time of the check and offers Import bundle instead.
 - **Models → Qualcomm NPU → Import bundle** registers a `.zip` you exported
   yourself with `qai-hub-models` (a free Qualcomm MyAccount, on a Linux/macOS
   host). Same chipset guard, same layout validation, same hashing as a

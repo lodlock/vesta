@@ -437,26 +437,79 @@ So the dry run is assembled from what is public. What is lost is the
 per-precision size. What is kept is the part that mattered: knowing whether an
 asset exists for this chip before spending gigabytes finding out.
 
-### Is the SM8850 asset published?
+### Is the SM8850 asset published? — answered: no
 
-**Still unresolved from outside, and the device is the only thing that can
-settle it.** What is known:
+**No, as of the on-device check.** `listHubModels()` returned **19 models** on a
+OnePlus 15, and `ai-hub-models/Qwen3-4B-Instruct-2507` was not among them. That
+closes the `-100010`: the model is genuinely not in the public catalogue, and no
+client-side change can conjure it. It is consistent with everything seen from
+outside — the `release-assets.yaml` entry exists, its `s3_key` still points under
+`pre_release_assets/`, and every URL shape returns S3 `403`.
 
-- `qai-hub-models`' own `release-assets.yaml` for this model lists a
-  `geniex_qairt` asset under
-  `precisions.w4a16.chipset_assets.qualcomm-snapdragon-8-elite-gen5`, built with
-  QAIRT 2.45.0 — the right chip, precision and runtime.
-- Its `s3_key` in every released tag still points under `pre_release_assets/`.
-- Every URL shape tried from outside returns S3 `403`, which is S3's answer for
-  both "not public" and "no such key", so it proves nothing either way.
-- The on-device pull returns `-100010`, an HTTP **404** from the hub — which is
-  consistent with "the manifest entry is not published yet", and also with
-  "Vesta asked for the wrong name". The instrumentation above exists to tell
-  those apart, and **Models → Qualcomm NPU → Check hub** is where the answer
-  appears: it prints what the hub lists, and the per-model resolution names the
-  chipsets it is actually offered for.
+It is **not** permanent, and nothing in the UI says it is. Qualcomm publishes on
+its own schedule, so the answer carries a timestamp everywhere it is shown and
+a refresh is always one tap away.
 
-Until that check is run on hardware, this document does not claim which it is.
+### The hub is the catalogue
+
+The consequence for the UI is larger than one model. A hard-coded list of one
+downloadable entry was going to be wrong the moment Qualcomm's list changed, and
+it was wrong already — offering an Install that could only 404 while 19 real,
+installable models went unmentioned.
+
+So **Models → Qualcomm NPU** now renders Qualcomm's own catalogue:
+
+- The list comes from `listHubModels()` and is never hard-coded.
+- It is filtered to this device through the same canonical chipset machinery the
+  load-time guard uses. Models for other chipsets are counted, not listed —
+  a count is informative, a row you cannot install is not.
+- Model types the app has no runtime for (VLM; the backend builds an
+  `LlmWrapper`) are excluded and counted separately. That is a compatibility
+  fact, not a judgement about the model.
+- Each card shows only what `HubModel` actually carries: the exact identifier
+  that gets pulled, the model type, the chipset, and the canonical target.
+  **No size and no precision** — the public API publishes neither, and a guessed
+  number is worse than a blank space.
+- No quality ranking is invented or implied. The only claim repeated from the
+  hub is "Available from Qualcomm Hub".
+- Installing uses the hub's own spelling of both the model name and the chipset.
+  Precision is left null so GenieX picks the bundle's own; the runtime-version
+  gate is skipped rather than given an invented bound; `minRamMb` is null, so
+  the fit label reads "unknown", which is true.
+
+An installed hub model is an ordinary registry row — `backend=qualcomm_npu`,
+`runtime=qairt`, `compute=npu` — and coexists with every GGUF and with a
+manually imported bundle. **Activation stays an explicit choice**: only a device
+with nothing active at all gets one picked for it.
+
+### Vesta's preferred model, when the hub does not have it
+
+The Qwen3 4B card stays. It is a recommendation, and a recommendation does not
+stop being one because the vendor is between releases. What changes is which
+actions can possibly work:
+
+| Hub state | Card shows |
+| --- | --- |
+| never checked | "Check hub" as the primary action; Install hidden, Import bundle offered |
+| listed for this chipset | Install, Import bundle |
+| answered, not listed | "Not currently available from Qualcomm Hub" with the time of the check, "Check again", Import bundle |
+
+A known-doomed Install is never left active after a successful check proves the
+model absent.
+
+### Caching
+
+The last successful catalogue is written to a JSON file in the cache directory —
+a disposable copy of someone else's data, not a setting, and the OS is welcome
+to evict it. On load it is marked `cached` and rendered with its age. A corrupt
+or unreadable cache degrades to "not checked yet", never to a half-populated
+list that would be read as the hub's answer. **A cached absence is never treated
+as permanent.**
+
+A failed refresh lands *beside* the last good snapshot rather than replacing it:
+losing a good answer because a later query timed out would be strictly worse
+than showing an older one. A failed install is recorded against that model
+alone, so one doomed download cannot make the whole catalogue look broken.
 
 ### Manual import: a bundle you already have
 
