@@ -30,6 +30,7 @@ import {
   getModelInfo,
   loadSessionFile,
   snapshotPrefixSession,
+  supportsKvSessionCache,
 } from "./llm-engine";
 
 const CACHE_DIR = FileSystem.documentDirectory + "session-cache/";
@@ -172,6 +173,9 @@ export async function restorePrefixSession(
 ): Promise<number | null> {
   const modelPath = getModelInfo().path;
   if (!modelPath) return null;
+  // Nothing to restore INTO on the Qualcomm path — and the stale cache from a
+  // previous llama.cpp model must survive, so this returns rather than clears.
+  if (!supportsKvSessionCache()) return null;
 
   // Create the dir here (every launch path goes through restore) so the
   // persist path never needs an await before reaching the engine lock.
@@ -255,6 +259,10 @@ export async function persistPrefixSession(
 ): Promise<number | null> {
   const modelPath = getModelInfo().path;
   if (!modelPath) return null;
+  // The Qualcomm path has no KV state to save. Asked rather than discovered as
+  // a thrown error per turn: the catch below deletes the cache files, which
+  // would quietly destroy a cache the next llama.cpp model still wants.
+  if (!supportsKvSessionCache()) return null;
   const hash = cacheKey(modelPath, stablePrefix);
   if (persistRunning) return null;
   if (knownDiskHash === hash) return null; // already cached

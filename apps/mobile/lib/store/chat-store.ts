@@ -35,7 +35,8 @@ import { warmSessionCache } from "../orchestrator/session-warmer";
 import { clearPrefixSessionCache } from "../llm/session-cache";
 import { persistFailureNotice, modelLoadFailureNotice } from "./notices";
 import { startVestaService } from "../native/vesta-service";
-import { probeNpuRuntime } from "../native/npu";
+import { prepareNpuBackend } from "../models/npu-ready";
+import { backendModelRef } from "../llm/backends/registry";
 import { timePhase, markSkippedModel } from "../dev/startup-trace";
 import * as FileSystem from "expo-file-system/legacy";
 import {
@@ -151,11 +152,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       await timePhase("model", () => get().ensureModelLoaded());
     }
 
-    // Ask once whether a Qualcomm runtime exists in this build. Cheap, and it
-    // has to happen before any backend answers supports() — an unprobed
-    // runtime reports unavailable, which is the safe direction but hides a
-    // working NPU.
-    probeNpuRuntime().catch(() => {});
+    // Ask once whether a Qualcomm runtime exists in this build, so the
+    // diagnostics and Models screens have an answer without waiting. The
+    // LOAD path does not depend on this call — ensureModelLoaded awaits its
+    // own, because a fire-and-forget probe that has not finished yet reports
+    // "unavailable", which would refuse a working NPU model on a cold start.
+    prepareNpuBackend().catch(() => {});
 
     // Run memory decay on startup (lightweight)
     runMemoryDecay().catch(() => {});
@@ -174,7 +176,21 @@ export const useChatStore = create<ChatState>((set, get) => {
       await ensureLegacyMigration();
       active = await getActiveModel();
       if (active && !isLoaded()) {
-        const fileInfo = await FileSystem.getInfoAsync(active.filePath);
+        // Before the load, not after, and awaited. The NPU backend refuses on
+        // every unknown — no chipset, no probe — so a cold start straight into
+        // the assistant would otherwise reach this line with neither and turn
+        // a working NPU model into "this device doesn't report its chipset".
+        // A no-op in a default build; cached for the process in an NPU one.
+        if (active.artifact !== "gguf") await prepareNpuBackend();
+        // An NPU bundle is a directory the GenieX model manager owns and
+        // resolves by name; `file_path` points inside it, so a plain
+        // file-exists check is the wrong question — the backend's own load
+        // does the right one, and a missing bundle surfaces as a load failure
+        // rather than as a silently errored row.
+        const isBundle = active.artifact !== "gguf";
+        const fileInfo = isBundle
+          ? { exists: true }
+          : await FileSystem.getInfoAsync(active.filePath);
         if (fileInfo.exists) {
           const perf = perfToLlmOptions(await getPerfSettings());
           await loadModel(active.filePath, {
@@ -182,6 +198,20 @@ export const useChatStore = create<ChatState>((set, get) => {
             contextSize: active.contextSize,
             gpuLayers: 0,
             chatTemplate: active.chatTemplate ?? undefined,
+            // Routes an NPU row to the Qualcomm backend. Absent for a GGUF,
+            // which is what keeps every other caller on llama.cpp.
+            backendModel: backendModelRef({
+              filePath: active.filePath,
+              artifact: active.artifact,
+              contextSize: active.contextSize,
+              displayName: active.displayName,
+              chatTemplate: active.chatTemplate,
+              targetSoc: active.targetSoc,
+              runtimeVersion: active.runtimeVersion,
+              quant: active.quant,
+              tokenizerPath: active.tokenizerPath,
+              runtimeModelName: active.runtimeModelName,
+            }),
           });
           // Cold-start prefix cache: restore the stable prefix's KV state from
           // disk BEFORE any completion, so the first turn skips the ~30s cold

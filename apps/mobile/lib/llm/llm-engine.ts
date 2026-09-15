@@ -10,6 +10,8 @@ import {
   type TokenData,
 } from "llama.rn";
 import type { LlmOptions, GenerateOptions, ModelInfo } from "./types";
+import { npuBackend } from "./backends/npu-instance";
+import { isNpuModel } from "../models/npu-compat";
 
 export interface CompletionMessage {
   role: "system" | "user" | "assistant";
@@ -80,6 +82,10 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 
 let context: LlamaContext | null = null;
 let currentModelPath: string | null = null;
+// The NPU session, when one is loaded. Mutually exclusive with `context` —
+// loading either releases the other, because both are multi-gigabyte
+// allocations and a phone that holds two of them holds neither for long.
+let npuModel: import("./backends/types").BackendModelRef | null = null;
 let currentContextSize: number = DEFAULT_OPTIONS.contextSize;
 // Set by stopGeneration(), read+cleared by the active generate(). Distinguishes a
 // user-initiated Stop from a natural finish (the native layer exposes no such flag).
@@ -102,6 +108,8 @@ let currentKvCacheType = "f16";
 export interface LastCompletionStats {
   promptMs: number;
   promptTokens: number; // tokens_evaluated — the prefill this turn
+  /** tokens the runtime reused from the KV cache; null when it didn't say. */
+  cachedTokens: number | null;
   predictedTokens: number;
   predictedPerSecond: number;
 }
@@ -126,13 +134,30 @@ export function estimatePromptTokens(messages: CompletionMessage[]): number {
 
 export function getModelInfo(): ModelInfo {
   return {
-    loaded: context !== null,
+    loaded: context !== null || npuModel !== null,
     path: currentModelPath ?? undefined,
   };
 }
 
 export function isLoaded(): boolean {
+  return context !== null || npuModel !== null;
+}
+
+/**
+ * Whether the loaded runtime can save and restore a prefix KV session.
+ *
+ * llama.cpp can; the Qualcomm path cannot — a QAIRT context binary has its KV
+ * layout compiled in and GenieX exposes no state save/load at all. The session
+ * cache asks this instead of discovering it as a thrown error per turn, which
+ * would delete the cache files a llama.cpp model still wants.
+ */
+export function supportsKvSessionCache(): boolean {
   return context !== null;
+}
+
+/** True when the loaded model is running on the Qualcomm NPU. */
+export function isNpuSession(): boolean {
+  return npuModel !== null;
 }
 
 // Context window (n_ctx) of the loaded model. Callers sizing optional
@@ -148,14 +173,33 @@ export function loadModel(
   onProgress?: (progress: number) => void,
 ): Promise<void> {
   return withLock(async () => {
+    const backendModel = options?.backendModel;
+
+    // An NPU bundle goes to the Qualcomm backend and nowhere else. The decision
+    // is made from the registry row's ARTIFACT, not from the path or the file
+    // name — a `.bin` could be anything, and guessing here is how a context
+    // binary ends up being handed to llama.cpp.
+    if (backendModel && isNpuModel(backendModel)) {
+      if (npuModel && npuModel.filePath === modelPath) return; // already loaded
+      await releaseAll();
+      // No fallback: if the NPU cannot take it, the caller hears why. Quietly
+      // loading it on the CPU instead would make every later "NPU" label a lie.
+      await npuBackend.load(backendModel);
+      npuModel = backendModel;
+      currentModelPath = modelPath;
+      currentContextSize = backendModel.contextSize;
+      // The Qualcomm path has no llama.cpp KV cache to describe, and saying
+      // "f16" about one that doesn't exist would be a made-up fact.
+      currentKvCacheType = "n/a";
+      kvStateDirty = false;
+      return;
+    }
+
     if (context && currentModelPath === modelPath) return; // already loaded
 
-    // Release previous model if any
-    if (context) {
-      await context.release();
-      context = null;
-      currentModelPath = null;
-    }
+    // Release whatever was loaded — including an NPU session, which a GGUF
+    // load must not leave sitting in memory beside it.
+    await releaseAll();
 
     const opts = { ...DEFAULT_OPTIONS, ...options };
     currentContextSize = opts.contextSize;
@@ -214,13 +258,26 @@ export async function validateGguf(
 }
 
 export function unloadModel(): Promise<void> {
-  return withLock(async () => {
-    if (context) {
-      await context.release();
-      context = null;
-      currentModelPath = null;
-    }
-  });
+  return withLock(releaseAll);
+}
+
+/**
+ * Releases whichever runtime is holding memory. Always called under the lock.
+ *
+ * Both branches run: the two are meant to be mutually exclusive, and if a
+ * previous failure ever left both set, "release the one I think is loaded"
+ * would strand gigabytes.
+ */
+async function releaseAll(): Promise<void> {
+  if (context) {
+    await context.release();
+    context = null;
+  }
+  if (npuModel) {
+    await npuBackend.unload().catch(() => {});
+    npuModel = null;
+  }
+  currentModelPath = null;
 }
 
 export function generate(
@@ -229,11 +286,58 @@ export function generate(
   onToken?: (token: string) => void,
 ): Promise<CompletionResult> {
   return withLock(async () => {
+    // Fresh turn: clear any stale stop request so it can't leak across turns.
+    stopRequested = false;
+
+    if (npuModel) {
+      const result = await npuBackend.generate(
+        messages,
+        {
+          maxTokens: options?.maxTokens,
+          temperature: options?.temperature,
+          ...(options?.enableThinking === false ? { enableThinking: false } : {}),
+        },
+        onToken,
+      );
+      // The runtime's own numbers, mapped onto the shape callers already read.
+      // Nothing is invented: GenieX reports decode speed and token counts but
+      // no separate prompt-eval wall time in this shape, so promptMs stays 0
+      // and the diagnostics screen reads TTFT from the run record instead.
+      lastCompletion = {
+        // GenieX reports TTFT and prefill SPEED but no prompt-eval wall time in
+        // this shape, so promptMs stays 0 and the diagnostics screen reads TTFT
+        // from the run record instead of deriving a number nobody measured.
+        promptMs: 0,
+        promptTokens: result.tokensEvaluated ?? 0,
+        // There is no KV prefix cache on this path at all — see
+        // supportsKvSessionCache. Null says "not applicable", which is what a
+        // reader needs; 0 would read as "reused nothing", a different claim.
+        cachedTokens: null,
+        predictedTokens: result.tokensPredicted,
+        predictedPerSecond: result.tokensPerSecond,
+      };
+      return {
+        text: result.text,
+        // GenieX's chat template suppresses reasoning at generation rather than
+        // separating it afterwards, so there is no second filtered string to
+        // hand back and `content` is the same text.
+        content: result.content,
+        reasoningContent: "",
+        tokensPredicted: result.tokensPredicted,
+        tokensEvaluated: result.tokensEvaluated ?? 0,
+        timings: {
+          promptMs: 0,
+          predictedMs: 0,
+          predictedPerSecond: result.tokensPerSecond,
+        },
+        stoppedByLimit: false,
+        stoppedByUser: result.stoppedByUser === true || stopRequested,
+      };
+    }
+
     if (!context) throw new Error("No model loaded");
 
     const opts = { ...DEFAULT_GENERATE, ...options };
-    // Fresh turn: clear any stale stop request so it can't leak across turns.
-    stopRequested = false;
     kvStateDirty = true;
 
     const llamaMessages: RNLlamaOAICompatibleMessage[] = messages.map((m) => ({
@@ -267,6 +371,10 @@ export function generate(
     lastCompletion = {
       promptMs: result.timings.prompt_ms,
       promptTokens: result.tokens_evaluated,
+      // Tokens the runtime got to reuse from the KV cache. The pair
+      // (evaluated, cached) is what distinguishes a warm append from a cold
+      // re-prefill of a prefix that changed underneath us.
+      cachedTokens: result.timings.cache_n ?? null,
       predictedTokens: result.tokens_predicted,
       predictedPerSecond: result.timings.predicted_per_second,
     };
@@ -410,6 +518,9 @@ export function stopGeneration(): Promise<void> {
   // wrap in Promise.resolve to guarantee callers always get a thenable.
   if (context) {
     return Promise.resolve(context.stopCompletion());
+  }
+  if (npuModel) {
+    npuBackend.stop();
   }
   return Promise.resolve();
 }

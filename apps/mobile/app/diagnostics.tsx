@@ -131,6 +131,12 @@ export default function DiagnosticsScreen() {
                 value={reportedOr(diag.run.decodeTokensPerSecond, "tok/s")}
               />
               <Row label="Total" value={reportedOr(diag.run.totalMs, "ms")} />
+              {/* Only rendered when the runtime named one. llama.cpp does not
+                  report a stop reason in this shape, so an empty row here is
+                  the absence of a fact, not a missing measurement. */}
+              {diag.run.stopReason && (
+                <Row label="Stop reason" value={diag.run.stopReason} />
+              )}
             </>
           ) : (
             <Text style={styles.hint}>
@@ -160,11 +166,72 @@ export default function DiagnosticsScreen() {
                 <Text style={styles.hint}>{backend.unavailableReason}</Text>
               )}
               {backend.id === "qualcomm_npu" && (
-                <Text style={styles.hint}>
-                  SoC {String(backend.details.soc)} · runtime{" "}
-                  {String(backend.details.runtimeVersion)} · compute{" "}
-                  {String(backend.details.computeUnit)}
-                </Text>
+                <>
+                  {/* Raw, raw, then the id compatibility is decided on. All
+                      three, because the raw pair is how a refusal gets
+                      diagnosed and the canonical one is how it gets decided. */}
+                  <Row label="SoC (device)" value={String(backend.details.soc)} />
+                  <Row
+                    label="Chipset (runtime)"
+                    value={String(backend.details.runtimeChipset)}
+                  />
+                  <Row
+                    label="Runtime aliases"
+                    value={String(backend.details.runtimeChipsetAliases)}
+                  />
+                  <Row
+                    label="Canonical target"
+                    value={String(backend.details.canonicalChipset)}
+                  />
+                  {String(backend.details.runtimeChipset) === "not recognised" && (
+                    <Row
+                      label="Runtime knows"
+                      value={String(backend.details.runtimeChipsetTable)}
+                    />
+                  )}
+                  <Row
+                    label="QAIRT plugin"
+                    value={String(backend.details.runtimeVersion)}
+                  />
+                  <Row
+                    label="Requested runtime"
+                    value={String(backend.details.requestedRuntime)}
+                  />
+                  <Row
+                    label="Requested compute"
+                    value={String(backend.details.requestedComputeUnit)}
+                  />
+                  <Row
+                    label="Manifest runtime"
+                    value={String(backend.details.manifestRuntime)}
+                  />
+                  {String(backend.details.lastError) !== "" && (
+                    <Text style={styles.hint}>
+                      Last error: {String(backend.details.lastError)}
+                    </Text>
+                  )}
+                  {/* The honesty note. It is here rather than in a doc comment
+                      because the screen above it says "Hexagon HTP / NPU", and
+                      a reader deserves to know exactly how strong that claim
+                      is. GenieX exposes no post-hoc attestation — nothing in
+                      its API reports which processor executed a generation —
+                      so what is actually known is that the session was created
+                      on the QAIRT plugin with compute_unit = npu and that this
+                      backend produced the tokens. The plugin itself refuses
+                      anything else ("qairt plugin only supports NPU
+                      inference"), which makes that a strong inference, but an
+                      inference is what it is. */}
+                  {backend.details.computeAttested === false && (
+                    <Text style={styles.hint}>
+                      &ldquo;NPU&rdquo; here is inferred from a successful
+                      QAIRT session created with compute_unit = npu, not
+                      attested by the runtime after the fact — GenieX reports no
+                      such thing. The QAIRT plugin runs on the Hexagon NPU only
+                      and refuses any other compute unit, so a session that
+                      exists at all is an NPU session.
+                    </Text>
+                  )}
+                </>
               )}
             </View>
           ))}

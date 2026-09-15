@@ -39,6 +39,9 @@ jest.mock("../llm-engine", () => ({
   getModelInfo: jest.fn(),
   loadSessionFile: jest.fn(),
   snapshotPrefixSession: jest.fn(),
+  // llama.cpp is loaded in every case here. The Qualcomm path has no KV state
+  // to save or restore and is covered separately, in npu-session-cache.test.ts.
+  supportsKvSessionCache: jest.fn(() => true),
 }));
 
 import {

@@ -9,6 +9,13 @@ export interface LlmOptions {
   // Optional per-model chat template (Jinja). When a GGUF ships a wrong/missing
   // template, pass the correct one so tool-call JSON stays parseable.
   chatTemplate?: string;
+  // WHICH runtime this model belongs to, when the caller knows.
+  //
+  // Present only for a caller that has a registry row — the Models screen
+  // activating a model. Without it the engine does what it always did and
+  // loads a GGUF on llama.cpp, which is right for every path that hands over a
+  // bare path (validation, the dev benchmark, the legacy migration).
+  backendModel?: import("./backends/types").BackendModelRef;
 }
 
 export interface GenerateOptions {

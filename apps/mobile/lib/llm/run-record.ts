@@ -37,6 +37,8 @@ export interface RunRecord {
   decodeTokensPerSecond?: number;
   totalMs?: number;
   unloadMs?: number;
+  /** Why generation stopped, when the runtime says ("eos", "max_tokens", …). */
+  stopReason?: string;
 }
 
 let lastRun: RunRecord | null = null;
