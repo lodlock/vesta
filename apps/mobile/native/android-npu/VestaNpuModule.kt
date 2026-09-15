@@ -161,7 +161,10 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
 
         /** Cache-report bounds. Metadata is small; the weights are not. */
         private const val MAX_CACHE_ENTRIES = 200
-        private const val MAX_JSON_BYTES = 128L * 1024L
+        // Small enough to read in a copied report; platform.json fits.
+        private const val MAX_JSON_BYTES = 8L * 1024L
+        private const val MAX_MANIFEST_MATCHES = 12
+        private const val MAX_MATCH_CHARS = 4000
 
         /** The plugin GenieX loads for the Hexagon path, as a file name. */
         private const val QAIRT_PLUGIN_LIB = "libgeniex_plugin_qairt.so"
@@ -427,6 +430,171 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
     }
 
     /**
+     * Finds the array of model entries in a manifest whose exact shape we have
+     * never seen.
+     *
+     * `models` first, because that is the field name the binary's own serde
+     * metadata lists for ReleaseManifest. Failing that, the first top-level
+     * array whose elements look like model entries — so a schema change
+     * degrades to "found it anyway" rather than to "no models", which would be
+     * indistinguishable from the answer we are actually testing for.
+     */
+    private fun findModelsArray(root: JSONObject): Pair<String, JSONArray>? {
+        root.optJSONArray("models")?.let { return "models" to it }
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val arr = root.optJSONArray(key) ?: continue
+            val first = arr.optJSONObject(0) ?: continue
+            if (first.has("id") || first.has("display_name")) return key to arr
+        }
+        return null
+    }
+
+    /**
+     * What a cached manifest says about one model, without shipping the
+     * manifest.
+     *
+     * The file is 311 KB; the question is three booleans and a handful of
+     * entries. Parsing here rather than in JavaScript keeps the whole thing off
+     * the bridge and out of logcat — and the last two rounds established that
+     * an abbreviated dump answers nothing, so the way to stay compact is to
+     * send less, not to truncate more.
+     */
+    private fun analyseManifest(
+        text: String,
+        needle: String,
+        wantDisplayName: String,
+        wantId: String,
+    ): WritableMap {
+        val out = Arguments.createMap()
+        val root =
+            try {
+                JSONObject(text)
+            } catch (e: Throwable) {
+                out.putString("parseError", e.message ?: e.toString())
+                return out
+            }
+
+        // Top-level version fields, whatever they are called. The release a
+        // manifest came from is the thing this whole report is chasing.
+        val versions = Arguments.createMap()
+        val topKeys = Arguments.createArray()
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            topKeys.pushString(key)
+            if (key.contains("version", ignoreCase = true)) {
+                versions.putString(key, root.opt(key)?.toString())
+            }
+        }
+        out.putArray("topLevelKeys", topKeys)
+        out.putMap("versionFields", versions)
+
+        val found = findModelsArray(root)
+        if (found == null) {
+            out.putString("modelsKey", null)
+            out.putInt("modelCount", 0)
+            return out
+        }
+        val (modelsKey, models) = found
+        out.putString("modelsKey", modelsKey)
+        out.putInt("modelCount", models.length())
+
+        var exactDisplayName = false
+        var exactId = false
+        val matches: WritableArray = Arguments.createArray()
+
+        for (i in 0 until models.length()) {
+            val entry = models.optJSONObject(i) ?: continue
+            val id = entry.optString("id", "")
+            val displayName = entry.optString("display_name", "")
+
+            if (displayName.equals(wantDisplayName, ignoreCase = true)) {
+                exactDisplayName = true
+            }
+            if (id.equals(wantId, ignoreCase = true)) exactId = true
+
+            if (
+                matches.size() < MAX_MANIFEST_MATCHES &&
+                    (id.contains(needle, ignoreCase = true) ||
+                        displayName.contains(needle, ignoreCase = true))
+            ) {
+                // The whole object: every field, including the ones we have
+                // not thought to ask about. That is the point of looking.
+                val raw = entry.toString()
+                matches.pushString(
+                    if (raw.length <= MAX_MATCH_CHARS) raw
+                    else raw.take(MAX_MATCH_CHARS) + "…(entry truncated)",
+                )
+            }
+        }
+
+        out.putBoolean("exactDisplayName", exactDisplayName)
+        out.putBoolean("exactId", exactId)
+        out.putArray("matches", matches)
+        return out
+    }
+
+    /**
+     * Lists hub models, with the manifest's mtime and size taken immediately
+     * before and after.
+     *
+     * If listHubModels() refreshes or replaces the file that pull() then reads,
+     * these two stats differ — and that would explain a catalogue and a
+     * download disagreeing about the same model without either being wrong.
+     */
+    @ReactMethod
+    fun hubListProbe(configJson: String, promise: Promise) {
+        scope.launch {
+            val out = Arguments.createMap()
+            try {
+                if (!ensureSdk()) {
+                    out.putString("error", initError ?: "runtime unavailable")
+                    promise.resolve(out)
+                    return@launch
+                }
+                val config = JSONObject(configJson)
+                val filter = config.optString("filter", "").ifBlank { null }
+                val relative =
+                    config.optString("manifestPath", "").ifBlank { "aihub/manifest.json" }
+                val manifest = File(File(reactApplicationContext.filesDir, "geniex"), relative)
+
+                out.putString("filter", filter)
+                out.putMap("before", statOf(manifest))
+                val models = ModelManagerWrapper.listHubModels(filter)
+                out.putMap("after", statOf(manifest))
+
+                out.putInt("count", models.size)
+                val entries: WritableArray = Arguments.createArray()
+                for (m in models) {
+                    val entry = Arguments.createMap()
+                    entry.putString("name", m.name)
+                    entry.putString("modelType", m.model_type.name)
+                    val chipsets = Arguments.createArray()
+                    m.chipsets.forEach { chipsets.pushString(it) }
+                    entry.putArray("chipsets", chipsets)
+                    entries.pushMap(entry)
+                }
+                out.putArray("models", entries)
+                promise.resolve(out)
+            } catch (e: Throwable) {
+                android.util.Log.w(TAG, "hubListProbe failed", e)
+                out.putString("error", e.message ?: e.toString())
+                promise.resolve(out)
+            }
+        }
+    }
+
+    private fun statOf(file: File): WritableMap {
+        val out = Arguments.createMap()
+        out.putBoolean("exists", file.isFile)
+        out.putDouble("sizeBytes", if (file.isFile) file.length().toDouble() else -1.0)
+        out.putDouble("modifiedAt", if (file.isFile) file.lastModified().toDouble() else -1.0)
+        return out
+    }
+
+    /**
      * Everything this app can see about where the AI Hub data came from.
      *
      * The runtime caches its hub metadata under OUR data directory — the
@@ -444,10 +612,15 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * else here is a credential.
      */
     @ReactMethod
-    fun hubCacheReport(promise: Promise) {
+    fun hubCacheReport(configJson: String, promise: Promise) {
         scope.launch {
             val out = Arguments.createMap()
             try {
+                val config = JSONObject(configJson)
+                val needle = config.optString("needle", "").ifBlank { "qwen3" }
+                val wantDisplayName = config.optString("displayName", "")
+                val wantId = config.optString("id", "")
+
                 // The endpoint and release the native side resolves from. Read
                 // through the public System.getenv rather than guessed: an
                 // unset value is itself the answer (the SDK's built-in default
@@ -484,10 +657,19 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                             // are not, and reading one into a bridge map would
                             // take the screen down.
                             if (f.name.endsWith(".json", ignoreCase = true)) {
+                                val text = f.readText()
+                                // A targeted answer instead of the file. The
+                                // real manifest is 311 KB and the question is
+                                // three booleans plus a few entries; shipping
+                                // the rest would bury the answer in logcat.
+                                entry.putMap(
+                                    "analysis",
+                                    analyseManifest(text, needle, wantDisplayName, wantId),
+                                )
+                                // Small files still go in whole — platform.json
+                                // is where aihm_version lives.
                                 if (f.length() <= MAX_JSON_BYTES) {
-                                    entry.putString("content", f.readText())
-                                } else {
-                                    entry.putString("content", "(too large to inline)")
+                                    entry.putString("content", text)
                                 }
                             }
                             files.pushMap(entry)

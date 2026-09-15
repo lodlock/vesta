@@ -14,6 +14,7 @@ import {
   probeHubIdentity,
   formatProbe,
   formatCacheReport,
+  formatListProbe,
   mentionsModel,
 } from "../npu-hub-probe";
 
@@ -256,5 +257,145 @@ describe("the cache report", () => {
     expect(formatCacheReport({ error: "boom" }, REPO)).toContain("error: boom");
     expect(formatCacheReport({}, REPO)).toContain("files: 0");
     expect(formatCacheReport({}, REPO)).toContain("dataDir: <none>");
+  });
+});
+
+// The manifest the runtime cached is 311 KB and reports no mention of the
+// friendly display name. That is not yet an answer: the model could be present
+// under its internal id. So the report states three things explicitly — an
+// exact display_name match, an exact id match, and every Qwen3-shaped entry in
+// full — rather than one substring verdict.
+describe("the targeted manifest analysis", () => {
+  const REPO = "Qwen3-4B-Instruct-2507";
+
+  const withAnalysis = (analysis: Record<string, unknown>) =>
+    formatCacheReport(
+      {
+        dataDir: "/data/geniex",
+        dataDirExists: true,
+        files: [
+          {
+            path: "aihub/manifest.json",
+            sizeBytes: 311319,
+            modifiedAt: 0,
+            analysis,
+          },
+        ],
+      },
+      REPO,
+    );
+
+  it("answers both exact-match questions separately", () => {
+    const text = withAnalysis({
+      modelCount: 19,
+      exactDisplayName: false,
+      exactId: true,
+      matches: [],
+    });
+    expect(text).toContain("exact display_name match: NO");
+    expect(text).toContain("exact id match: YES");
+  });
+
+  it("reports the model count and which key held them", () => {
+    const text = withAnalysis({ modelsKey: "models", modelCount: 19 });
+    expect(text).toContain("modelsKey: models");
+    expect(text).toContain("modelCount: 19");
+  });
+
+  it("surfaces top-level version fields, which identify the release", () => {
+    const text = withAnalysis({
+      versionFields: { aihm_version: "0.60.0", version: "2" },
+      modelCount: 19,
+    });
+    expect(text).toContain("aihm_version: 0.60.0");
+    expect(text).toContain("version: 2");
+  });
+
+  it("prints whole matching entries, not a summary of them", () => {
+    const entry =
+      '{"id":"qwen3_4b_instruct_2507","display_name":"Qwen3-4B-Instruct-2507",' +
+      '"domain":"qualcomm","supported_chipsets":["qualcomm-snapdragon-8-elite-gen5"]}';
+    const text = withAnalysis({ modelCount: 19, matches: [entry] });
+    expect(text).toContain(entry);
+    expect(text).toContain("entries matching needle: 1");
+  });
+
+  it("does not fall back to dumping the file when an analysis exists", () => {
+    // The whole point of parsing natively is that 311 KB never crosses the
+    // bridge or reaches logcat.
+    const text = formatCacheReport(
+      {
+        files: [
+          {
+            path: "aihub/manifest.json",
+            sizeBytes: 311319,
+            modifiedAt: 0,
+            content: "SHOULD-NOT-APPEAR",
+            analysis: { modelCount: 19 },
+          },
+        ],
+      },
+      REPO,
+    );
+    expect(text).not.toContain("SHOULD-NOT-APPEAR");
+  });
+
+  it("reports a parse failure rather than reading it as 'not present'", () => {
+    const text = withAnalysis({ parseError: "Unterminated object" });
+    expect(text).toContain("parseError: Unterminated object");
+  });
+});
+
+describe("the hub-list probe", () => {
+  const probe = (over: Record<string, unknown> = {}) => ({
+    filter: null,
+    before: { exists: true, sizeBytes: 311319, modifiedAt: 1000 },
+    after: { exists: true, sizeBytes: 311319, modifiedAt: 1000 },
+    count: 19,
+    models: [
+      { name: "qualcomm/Qwen3-4B-Instruct-2507", modelType: "LLM", chipsets: ["SM8850"] },
+      { name: "qualcomm/Other", modelType: "LLM", chipsets: ["SM8850"] },
+    ],
+    ...over,
+  });
+
+  it("prints only the matching entries, verbatim, with their chipsets", () => {
+    const text = formatListProbe(probe(), "qwen3");
+    expect(text).toContain("name: qualcomm/Qwen3-4B-Instruct-2507");
+    expect(text).toContain("chipsets: SM8850");
+    expect(text).toContain('entries matching "qwen3": 1');
+    // The other 18 are a count, not 18 rows.
+    expect(text).not.toContain("qualcomm/Other");
+    expect(text).toContain("count: 19");
+  });
+
+  it("says whether the call changed the manifest under it", () => {
+    // The tell: if listing rewrites the file the pull then reads, the two are
+    // not looking at the same bytes.
+    expect(formatListProbe(probe(), "qwen3")).toContain(
+      "manifest changed by this call: no",
+    );
+    const touched = probe({
+      after: { exists: true, sizeBytes: 400000, modifiedAt: 2000 },
+    });
+    expect(formatListProbe(touched, "qwen3")).toContain(
+      "manifest changed by this call: YES",
+    );
+  });
+
+  it("records which filter was passed, including none", () => {
+    expect(formatListProbe(probe(), "qwen3")).toContain("listHubModels(null)");
+    expect(formatListProbe(probe({ filter: "SM8850" }), "qwen3")).toContain(
+      "listHubModels(SM8850)",
+    );
+  });
+
+  it("survives a failed call and an absent manifest", () => {
+    const text = formatListProbe(
+      { error: "boom", before: undefined, after: undefined },
+      "qwen3",
+    );
+    expect(text).toContain("error: boom");
+    expect(text).toContain("manifest before: <absent>");
   });
 });

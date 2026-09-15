@@ -23,7 +23,8 @@ interface NpuNativeModule {
   hubModels(domain: string | null): Promise<NpuHubModelsResult>;
   resolveModelAlias(modelName: string): Promise<string | null>;
   logDiagnostic(message: string): void;
-  hubCacheReport(): Promise<NpuHubCacheReport>;
+  hubCacheReport(configJson: string): Promise<NpuHubCacheReport>;
+  hubListProbe(configJson: string): Promise<NpuHubListProbe>;
   cancelPull(): void;
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
   removeBundle(modelName: string): Promise<void>;
@@ -150,13 +151,48 @@ export interface NpuHubModelsResult {
   nativeMessage?: string | null;
 }
 
+/** What a cached manifest says about one model, without shipping the manifest. */
+export interface NpuManifestAnalysis {
+  parseError?: string | null;
+  topLevelKeys?: string[];
+  /** Every top-level key containing "version", with its value. */
+  versionFields?: Record<string, string | null>;
+  /** Which key held the model array, so a schema change is visible. */
+  modelsKey?: string | null;
+  modelCount?: number;
+  /** A model whose display_name matches exactly. */
+  exactDisplayName?: boolean;
+  /** A model whose id matches exactly. */
+  exactId?: boolean;
+  /** Whole entries whose id or display_name contains the needle. */
+  matches?: string[];
+}
+
+/**
+ * listHubModels(), with the manifest's stat taken either side of it.
+ *
+ * If the listing refreshes or replaces the file the pull then reads, these two
+ * differ — which would explain a catalogue and a download disagreeing about
+ * the same model without either being wrong.
+ */
+export interface NpuHubListProbe {
+  filter?: string | null;
+  before?: { exists: boolean; sizeBytes: number; modifiedAt: number };
+  after?: { exists: boolean; sizeBytes: number; modifiedAt: number };
+  count?: number;
+  models?: NpuHubModel[];
+  error?: string | null;
+}
+
 /** One file in the runtime's own hub-metadata cache. */
 export interface NpuCacheFile {
   path: string;
   sizeBytes: number;
   modifiedAt: number;
-  /** Present for .json only — the metadata, never the weights. */
+  /** Present only for small .json — platform.json fits, the manifest does not. */
   content?: string | null;
+  /** The targeted answer for any .json, however large. */
+  analysis?: NpuManifestAnalysis;
 }
 
 /**
@@ -389,10 +425,35 @@ export function npuLogDiagnostic(message: string): void {
  * Read-only, and it triggers no fetch: the point is to report what the app has
  * already acted on, not to go and get a fresh answer that nothing else saw.
  */
-export async function npuHubCacheReport(): Promise<NpuHubCacheReport | null> {
+export async function npuHubCacheReport(query: {
+  /** Substring to search ids and display names for, case-insensitively. */
+  needle: string;
+  /** An exact display_name to test for. */
+  displayName: string;
+  /** An exact id to test for. */
+  id: string;
+}): Promise<NpuHubCacheReport | null> {
   if (!moduleAvailable()) return null;
   try {
-    return await Npu!.hubCacheReport();
+    return await Npu!.hubCacheReport(JSON.stringify(query));
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Lists hub models and stats the manifest either side of the call.
+ *
+ * @param filter passed straight through to `listHubModels()`. Its meaning is
+ *   not verified — the SDK names the parameter for a domain, and calling it
+ *   with a chipset is part of what this is measuring.
+ */
+export async function npuHubListProbe(
+  filter: string | null,
+): Promise<NpuHubListProbe | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.hubListProbe(JSON.stringify({ filter }));
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }

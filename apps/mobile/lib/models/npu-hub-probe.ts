@@ -163,8 +163,21 @@ export interface CacheReportLike {
     sizeBytes: number;
     modifiedAt: number;
     content?: string | null;
+    analysis?: ManifestAnalysis;
   }[];
   error?: string | null;
+}
+
+/** What the native side found in one cached manifest. */
+export interface ManifestAnalysis {
+  parseError?: string | null;
+  topLevelKeys?: string[];
+  versionFields?: Record<string, string | null>;
+  modelsKey?: string | null;
+  modelCount?: number;
+  exactDisplayName?: boolean;
+  exactId?: boolean;
+  matches?: string[];
 }
 
 /**
@@ -227,7 +240,25 @@ export function formatCacheReport(
       `sizeBytes: ${file.sizeBytes}`,
       `modified: ${new Date(file.modifiedAt).toISOString()}`,
     );
-    if (file.content) {
+    const a = file.analysis;
+    if (a) {
+      if (a.parseError) lines.push(`parseError: ${a.parseError}`);
+      lines.push(
+        `topLevelKeys: ${(a.topLevelKeys ?? []).join(", ") || "<none>"}`,
+        `modelsKey: ${a.modelsKey ?? "<none>"}`,
+        `modelCount: ${a.modelCount ?? 0}`,
+      );
+      const versions = Object.entries(a.versionFields ?? {});
+      for (const [key, value] of versions) lines.push(`${key}: ${value}`);
+
+      // The three answers this report exists for.
+      lines.push(
+        `exact display_name match: ${a.exactDisplayName ? "YES" : "NO"}`,
+        `exact id match: ${a.exactId ? "YES" : "NO"}`,
+        `entries matching needle: ${a.matches?.length ?? 0}`,
+      );
+      for (const match of a.matches ?? []) lines.push(match);
+    } else if (file.content) {
       const hits = mentionsModel(file.content, repo);
       lines.push(
         `mentions ${repo}: ${hits.length > 0 ? hits.join(", ") : "NO"}`,
@@ -235,6 +266,66 @@ export function formatCacheReport(
         file.content,
       );
     }
+  }
+  return lines.join("\n");
+}
+
+/** Minimal shape of a hub-list probe, so this module stays testable. */
+export interface ListProbeLike {
+  filter?: string | null;
+  before?: { exists: boolean; sizeBytes: number; modifiedAt: number };
+  after?: { exists: boolean; sizeBytes: number; modifiedAt: number };
+  count?: number;
+  models?: { name: string; modelType: string; chipsets: string[] }[];
+  error?: string | null;
+}
+
+/**
+ * One listHubModels() call, reported against the manifest it may have touched.
+ *
+ * Only entries matching the needle are printed verbatim — the count covers the
+ * rest. The question is whether the listing returns a model the cached
+ * manifest does not contain, and 19 unrelated rows do not help answer it.
+ */
+export function formatListProbe(
+  probe: ListProbeLike,
+  needle: string,
+): string {
+  const lines = [`listHubModels(${probe.filter ?? "null"})`];
+  if (probe.error) lines.push(`error: ${probe.error}`);
+  lines.push(`count: ${probe.count ?? 0}`);
+
+  const stat = (
+    label: string,
+    v?: { exists: boolean; sizeBytes: number; modifiedAt: number },
+  ) =>
+    lines.push(
+      `${label}: ${
+        v?.exists
+          ? `${v.sizeBytes} bytes, ${new Date(v.modifiedAt).toISOString()}`
+          : "<absent>"
+      }`,
+    );
+  stat("manifest before", probe.before);
+  stat("manifest after", probe.after);
+  // The tell: if the listing rewrote the file the pull then reads, these
+  // differ, and the two are not looking at the same bytes.
+  const changed =
+    probe.before?.modifiedAt !== probe.after?.modifiedAt ||
+    probe.before?.sizeBytes !== probe.after?.sizeBytes;
+  lines.push(`manifest changed by this call: ${changed ? "YES" : "no"}`);
+
+  const hits = (probe.models ?? []).filter((m) =>
+    m.name.toLowerCase().includes(needle.toLowerCase()),
+  );
+  lines.push(`entries matching "${needle}": ${hits.length}`);
+  for (const m of hits) {
+    lines.push(
+      "",
+      `name: ${m.name}`,
+      `modelType: ${m.modelType}`,
+      `chipsets: ${m.chipsets.join(", ")}`,
+    );
   }
   return lines.join("\n");
 }

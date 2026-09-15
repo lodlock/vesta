@@ -43,12 +43,14 @@ import {
   probeHubIdentity,
   formatProbe,
   formatCacheReport,
+  formatListProbe,
   type HubIdentityProbe,
 } from "../lib/models/npu-hub-probe";
 import {
   npuResolveAlias,
   npuLogDiagnostic,
   npuHubCacheReport,
+  npuHubListProbe,
 } from "../lib/native/npu";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
@@ -191,7 +193,22 @@ export default function DiagnosticsScreen() {
       // data directory. Read-only, and it triggers no fetch — the point is to
       // report what the app already acted on.
       const repo = entry.modelName.slice(entry.modelName.lastIndexOf("/") + 1);
-      const cache = await npuHubCacheReport();
+
+      // The three questions, asked of the manifest rather than of a 311 KB
+      // dump: is there an exact display_name, an exact id, and what does the
+      // manifest hold for anything Qwen3-shaped at all.
+      const cache = await npuHubCacheReport({
+        needle: "qwen3",
+        displayName: repo,
+        id: repo.toLowerCase().replace(/-/g, "_"),
+      });
+
+      // And the listing, twice: unfiltered, then with the chipset. The
+      // parameter is named for a domain in the SDK, so passing a chipset is
+      // itself part of what this measures — and the manifest is stat-ed either
+      // side, in case the listing rewrites the file the pull then reads.
+      const listAll = await npuHubListProbe(null);
+      const listChip = await npuHubListProbe("SM8850");
 
       // Logged under the VestaNpu tag, not the JS one, so a single
       // `adb logcat -s VestaNpu` capture carries the probe, the cache, the
@@ -199,8 +216,14 @@ export default function DiagnosticsScreen() {
       // is where a default build (no native bridge) can still see it.
       const text = [
         formatProbe(result),
-        cache ? formatCacheReport(cache, repo) : "Hub cache report\nunavailable (no NPU bridge in this build)",
-      ].join("\n\n");
+        cache
+          ? formatCacheReport(cache, repo)
+          : "Hub cache report\nunavailable (no NPU bridge in this build)",
+        listAll ? formatListProbe(listAll, "qwen3") : "",
+        listChip ? formatListProbe(listChip, "qwen3") : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       setReport(text);
       npuLogDiagnostic(text);
       console.log(`[Diagnostics] ${text}`);
