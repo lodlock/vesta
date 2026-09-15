@@ -17,13 +17,33 @@ const Npu = NativeModules.VestaNpuModule as NpuNativeModule | undefined;
 interface NpuNativeModule {
   /** Runtime present AND usable here; resolves details or null. */
   probe(): Promise<NpuRuntimeInfo | null>;
-  load(path: string, contextSize: number): Promise<NpuRuntimeInfo>;
-  generate(
-    messagesJson: string,
-    optionsJson: string,
-  ): Promise<{ text: string; tokensPredicted: number; tokensPerSecond: number }>;
+  load(configJson: string): Promise<NpuRuntimeInfo>;
+  generate(messagesJson: string, optionsJson: string): Promise<NpuRawResult>;
   cancel(): void;
   unload(): Promise<void>;
+}
+
+// Exactly what the runtime reported, nothing more. A field the runtime did not
+// give us is ABSENT rather than defaulted — a diagnostics screen showing
+// "0 tok/s" that came from a missing measurement is worse than one saying the
+// runtime didn't report it.
+export interface NpuRawResult {
+  text: string;
+  ttftMs?: number;
+  promptTimeMs?: number;
+  decodeTimeMs?: number;
+  promptTokens?: number;
+  generatedTokens?: number;
+  prefillSpeed?: number;
+  decodeSpeed?: number;
+  stopReason?: string;
+}
+
+export interface NpuLoadConfig {
+  modelPath: string;
+  /** Where the tokenizer is, when it isn't beside the weights. */
+  tokenizerPath?: string | null;
+  contextSize: number;
 }
 
 export interface NpuRuntimeInfo {
@@ -79,12 +99,9 @@ export async function probeNpuRuntime(): Promise<NpuRuntimeInfo | null> {
   return probed;
 }
 
-export async function npuLoad(
-  path: string,
-  contextSize: number,
-): Promise<NpuRuntimeInfo> {
+export async function npuLoad(config: NpuLoadConfig): Promise<NpuRuntimeInfo> {
   if (!moduleAvailable()) throw new Error("No Qualcomm NPU runtime in this build.");
-  return Npu!.load(path, contextSize);
+  return Npu!.load(JSON.stringify(config));
 }
 
 export interface NpuGenerateOptions {
@@ -96,7 +113,7 @@ export interface NpuGenerateOptions {
 export async function npuGenerate(
   messages: { role: string; content: string }[],
   options: NpuGenerateOptions,
-): Promise<{ text: string; tokensPredicted: number; tokensPerSecond: number }> {
+): Promise<NpuRawResult> {
   if (!moduleAvailable()) throw new Error("No Qualcomm NPU runtime in this build.");
   // JSON across the bridge rather than a bespoke ReadableMap shape: the message
   // list is the only structured argument, and this keeps the native signature

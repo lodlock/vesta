@@ -23,6 +23,7 @@ import {
   npuGenerate,
   npuUnload,
   type NpuRuntimeInfo,
+  type NpuRawResult,
 } from "../../native/npu";
 import type {
   BackendDiagnostics,
@@ -40,6 +41,7 @@ export class QualcommNpuBackend implements ModelBackend {
   private runtime: NpuRuntimeInfo | null = null;
   private loadedPath: string | null = null;
   private lastError: string | null = null;
+  private lastProfile: NpuRawResult | null = null;
 
   /** The chipset this device reports, needed to match an artifact's target. */
   private soc: string | null = null;
@@ -100,7 +102,11 @@ export class QualcommNpuBackend implements ModelBackend {
       throw new Error(reason);
     }
     try {
-      this.runtime = await npuLoad(model.filePath, model.contextSize);
+      this.runtime = await npuLoad({
+        modelPath: model.filePath,
+        tokenizerPath: model.tokenizerPath ?? null,
+        contextSize: model.contextSize,
+      });
       this.loadedPath = model.filePath;
       this.lastError = null;
     } catch (err) {
@@ -124,11 +130,13 @@ export class QualcommNpuBackend implements ModelBackend {
         enableThinking: options?.enableThinking,
       });
       this.lastError = null;
+      this.lastProfile = result;
       return {
         text: result.text,
         content: result.text,
-        tokensPredicted: result.tokensPredicted,
-        tokensPerSecond: result.tokensPerSecond,
+        // Absent when the runtime didn't report it — see NpuRawResult.
+        tokensPredicted: result.generatedTokens ?? 0,
+        tokensPerSecond: result.decodeSpeed ?? 0,
       };
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
@@ -160,8 +168,13 @@ export class QualcommNpuBackend implements ModelBackend {
       details: {
         soc: this.soc ?? "unknown",
         runtimeVersion: info?.version ?? "n/a",
+        computeUnit: info?.computeUnit ?? "n/a",
         modelPath: this.loadedPath ?? "",
         lastError: this.lastError ?? "",
+        // The runtime's own numbers from the last turn, or absent.
+        ttftMs: this.lastProfile?.ttftMs ?? -1,
+        prefillTokensPerSecond: this.lastProfile?.prefillSpeed ?? -1,
+        decodeTokensPerSecond: this.lastProfile?.decodeSpeed ?? -1,
       },
     };
   }

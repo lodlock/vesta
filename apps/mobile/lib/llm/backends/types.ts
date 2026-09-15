@@ -26,6 +26,8 @@ export interface BackendModelRef {
   targetSoc?: string | null;
   runtimeVersion?: string | null;
   chatTemplate?: string | null;
+  // Where the tokenizer is, for bundles that don't keep it beside the weights.
+  tokenizerPath?: string | null;
 }
 
 export interface BackendGenerateOptions {

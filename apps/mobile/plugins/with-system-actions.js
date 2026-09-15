@@ -27,6 +27,81 @@ function withNanoHttpd(config) {
   });
 }
 
+// Qualcomm NPU support, off unless explicitly built in.
+//
+//   VESTA_ENABLE_NPU=1 npx expo prebuild --platform android --clean
+//
+// Two halves that must move together: the Maven dependency and the native
+// bridge that references it. Neither exists in a default build, so a normal
+// prebuild fetches nothing from Qualcomm and cannot fail on an SDK it never
+// asked for. See docs/NPU-BACKEND.md for the licensing position — the binaries
+// are resolved from Maven at build time and never committed.
+function npuEnabled() {
+  const flag = process.env.VESTA_ENABLE_NPU;
+  return flag === "1" || flag === "true";
+}
+
+// Pinned: the native bridge is written against this exact API surface (read out
+// of the AAR, not inferred), so a floating version could silently break it.
+const GENIEX_VERSION = "0.4.0";
+
+// The AAR declares minSdkVersion 27; the Expo template is lower, and the
+// manifest merger fails rather than warns on that.
+const GENIEX_MIN_SDK = 27;
+
+function withGenieX(config) {
+  if (!npuEnabled()) return config;
+
+  config = withAppBuildGradle(config, (cfg) => {
+    const dep = `    implementation("com.qualcomm.qti:geniex-android:${GENIEX_VERSION}")`;
+    if (!cfg.modResults.contents.includes("geniex-android")) {
+      cfg.modResults.contents = cfg.modResults.contents.replace(
+        /dependencies\s*\{/,
+        (m) => `${m}\n${dep}`,
+      );
+    }
+    // Raise minSdk for this build only. Written as an override inside
+    // defaultConfig so it wins over the template's value.
+    if (!cfg.modResults.contents.includes("// vesta-npu-minsdk")) {
+      cfg.modResults.contents = cfg.modResults.contents.replace(
+        /defaultConfig\s*\{/,
+        (m) => `${m}\n        minSdkVersion ${GENIEX_MIN_SDK} // vesta-npu-minsdk`,
+      );
+    }
+    return cfg;
+  });
+
+  // Copy the bridge next to the other Kotlin sources. It lives in
+  // native/android-npu/ precisely so the unconditional copy below never
+  // picks it up.
+  config = withDangerousMod(config, [
+    "android",
+    (cfg) => {
+      const srcDir = path.join(cfg.modRequest.projectRoot, "native/android-npu");
+      const destDir = path.join(
+        cfg.modRequest.platformProjectRoot,
+        "app/src/main/java/com/cosmico/vesta",
+      );
+      if (!fs.existsSync(srcDir)) {
+        console.warn("[with-system-actions] VESTA_ENABLE_NPU set but native/android-npu is missing");
+        return cfg;
+      }
+      fs.mkdirSync(destDir, { recursive: true });
+      for (const file of fs.readdirSync(srcDir)) {
+        if (file.endsWith(".kt")) {
+          fs.copyFileSync(path.join(srcDir, file), path.join(destDir, file));
+        }
+      }
+      console.log(
+        `[with-system-actions] NPU enabled: geniex-android:${GENIEX_VERSION} + native bridge`,
+      );
+      return cfg;
+    },
+  ]);
+
+  return config;
+}
+
 function withSystemActions(config) {
   // Copy Kotlin source files into the generated android project
   config = withDangerousMod(config, [
@@ -305,6 +380,7 @@ function withSystemActions(config) {
   });
 
   config = withNanoHttpd(config);
+  config = withGenieX(config);
 
   return config;
 }
