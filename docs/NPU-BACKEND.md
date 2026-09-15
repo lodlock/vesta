@@ -355,41 +355,196 @@ Against the acquisition questions:
 | Where the files go | `filesDir/geniex/…` — app-private, and nowhere near the `.gguf` directory. |
 | Credentials in git? | None involved. `.gitignore` already covers `.qai-hub/`, `qai_hub_token*` and the artifact extensions. |
 
-### If the pull says the chipset isn't available
+### What Vesta actually asks for, and how to see it
 
-The runtime answers precisely: `chipset <X> not available for this model;
-supported: …`, or, for a model whose weights Qualcomm may not redistribute:
+The chipset guard passing moved the failure one layer out, to
+`rc=-100010` — `GENIEX_ERROR_COMMON_HUB_MODEL_NOT_FOUND`, an HTTP 404 from the
+remote hub. A bare code is unactionable, so the request is now logged in full
+before a byte moves (`adb logcat -s VestaNpu`):
 
-> `No pre-compiled assets available for <X> due to licensing restrictions.
-> Please use the qai-hub-models Python package to manually export the model.`
+```
+VestaNpu  I  pull: model=ai-hub-models/Qwen3-4B-Instruct-2507 \
+               chipset=<resolved> precision=w4a16 hub=AIHUB \
+               runtime=qairt compute=npu
+```
 
-Qwen3 is Apache-2.0, so the second should not apply. If the first does, the
-fallback is an off-device export on a Linux/macOS host with a free Qualcomm
-MyAccount:
+Nothing there is a credential and nothing ever will be: `ModelPullInput.hf_token`
+is pinned to null in `pullInputFrom()` and is never read from the config, so
+there is no path by which one reaches a log line.
+
+### Ask the hub, do not re-derive its catalogue
+
+The 404 was diagnosed with three strings in flight — model name, chipset,
+precision — all three supplied from Vesta's own catalog. A hand-maintained copy
+of someone else's catalogue is wrong the moment they change it, and cannot say
+which of the three is wrong when it is.
+
+GenieX carries the answer, and `javap` on `com.geniex.sdk.jni.ModelManager`
+shows rather more of it than the Kotlin wrapper re-exports:
+
+| Native call | Re-exported by `ModelManagerWrapper`? | What it answers |
+| --- | --- | --- |
+| `listHubModels(domain)` → `HubModel[]` | yes | every model the hub offers, and **the chipsets it offers each one for** |
+| `query(ModelPullInput)` → `ModelQuery` | **no** | what a pull WOULD resolve to — resolved name, runtime, and one `PrecisionCandidate{precision, size}` per available precision. No download. |
+| `lastErrorMessage()` | **no** | the runtime's own text behind a code — e.g. `AI Hub model <name> not found on hub` |
+| `resolveAlias(name)` | yes | what a model name resolves to |
+| `listChipsets()` → `ChipsetInfo[]` | yes | the chipset equivalence table (see §5's chipset identity note) |
+
+Vesta now uses all five. The consequences:
+
+- **The chipset string comes from `HubModel.chipsets`**, matched to this device
+  through the runtime's own chipset table, not from `Build.SOC_MODEL` and not
+  from the catalog's `targetSoc`. Three vocabularies name this silicon —
+  Android's `SM8850`, GenieX's device name, AI Hub's
+  `qualcomm-snapdragon-8-elite-gen5` — and only one of them resolves an asset.
+  Asking removes the guess.
+- **`query()` runs before every pull.** It costs one request, leaves nothing on
+  disk, and answers the question a failed download answers far more expensively.
+  Its `PrecisionCandidate.size` is also the only published size figure for these
+  bundles, which is what lets the UI stop saying "approx. 3 GB".
+- **"Not offered for this chipset" and "no such model" are told apart**, because
+  they have different next steps and `-100010` flattens them into one number.
+
+`query()` and `lastErrorMessage()` are reached through a separately constructed
+`com.geniex.sdk.jni.ModelManager`. That is safe rather than lucky: the class has
+**no instance fields** (verified with `javap`), and `ModelManagerWrapper`'s own
+static initializer does nothing but `ModelManager()` — every method is a proxy
+onto process-global native state that `ensureSdk()` has already initialized.
+Both calls are wrapped in `try/catch`, so an SDK release that drops or renames
+either degrades to "not reported" rather than taking a screen down.
+
+### Is the SM8850 asset published?
+
+**Still unresolved from outside, and the device is the only thing that can
+settle it.** What is known:
+
+- `qai-hub-models`' own `release-assets.yaml` for this model lists a
+  `geniex_qairt` asset under
+  `precisions.w4a16.chipset_assets.qualcomm-snapdragon-8-elite-gen5`, built with
+  QAIRT 2.45.0 — the right chip, precision and runtime.
+- Its `s3_key` in every released tag still points under `pre_release_assets/`.
+- Every URL shape tried from outside returns S3 `403`, which is S3's answer for
+  both "not public" and "no such key", so it proves nothing either way.
+- The on-device pull returns `-100010`, an HTTP **404** from the hub — which is
+  consistent with "the manifest entry is not published yet", and also with
+  "Vesta asked for the wrong name". The instrumentation above exists to tell
+  those apart, and **Models → Qualcomm NPU → Check hub** is where the answer
+  appears: it prints what the hub lists, and the per-model resolution names the
+  chipsets it is actually offered for.
+
+Until that check is run on hardware, this document does not claim which it is.
+
+### Manual import: a bundle you already have
+
+Not a workaround for the compatibility guard — the identical refusal runs first,
+against the identical catalog entry, so an imported bundle still has to be for
+this silicon. What it skips is Qualcomm's release schedule.
+
+**Models → Qualcomm NPU → Import bundle**, then pick the `.zip`. A `.zip`
+because it is one of the three layouts the runtime accepts and the only one an
+Android file picker can return — the picker hands back a single document, never
+a directory.
+
+The import goes through the manager's own `HubSource.LOCALFS` path, which means
+it is the same code as a download, differing only in `hub` and `local_path`:
+
+| | Hub pull | Manual import |
+| --- | --- | --- |
+| Chipset compatibility guard | runs | **runs, identically** |
+| Layout validation (`metadata.json`, `*.bin`, tokenizer) | manager | **manager, identically** |
+| `runtime_id` must be `qairt` | enforced | **enforced** |
+| Per-file size measured from disk | yes | **yes** |
+| SHA-256 for files ≤ 8 MB | yes | **yes** |
+| Storage | `filesDir/geniex/…`, app-private | **same** |
+| Registry row | `backend=qualcomm_npu`, `trust=user_supplied_baseline` | **same** |
+| GGUF import | untouched, separate path | **untouched, separate path** |
+
+One cost worth knowing: the picker returns a `content://` URI, which the native
+side cannot open as a file, so the archive is staged into app storage first and
+deleted as soon as the manager has unpacked it. That means a second copy of a
+multi-gigabyte file exists for the duration of the import.
+
+### Public precompiled asset vs. an export you generate
+
+These are different artifacts with different provenance, and the distinction
+matters for both licensing and support:
+
+| | Public precompiled | Your own AI Hub export |
+| --- | --- | --- |
+| Who built it | Qualcomm, published to the AI Hub asset bucket | you, on your own machine |
+| How it arrives | GenieX model manager pulls it on-device | you export, then Import bundle |
+| Account needed | none | a free Qualcomm MyAccount and an API token |
+| Availability | whatever the hub lists today | whenever you run the export |
+| Licence | the model's own (Qwen3: Apache-2.0) | unchanged — the weights are still Apache-2.0 |
+
+The export, on a Linux or macOS host (it does not run on the phone, and does not
+run on Windows):
 
 ```bash
 pip install "qai-hub-models[qwen3-4b-instruct-2507]"
-qai-hub configure --api_token <token>       # from aihub.qualcomm.com, never committed
+qai-hub configure --api_token <token>     # from aihub.qualcomm.com — never committed
 python -m qai_hub_models.models.qwen3_4b_instruct_2507.export \
   --chipset qualcomm-snapdragon-8-elite-gen5 \
   --skip-profiling --output-dir genie_bundle
 ```
 
-The module path `qai_hub_models.models.qwen3_4b_instruct_2507` is verified
-against the repository tree; the `--chipset` value is the manifest's own key for
-this silicon (AI Hub spells it `qualcomm-snapdragon-8-elite-gen5`, GenieX spells
-the same chip by a device name and carries `SM8850` among its aliases, and
-Android reports `SM8850` — the runtime's `listChipsets()` table is what declares
-those to be one chip, and `lib/models/chipset-identity.ts` is the only place
-that reads it). Export runs off-device and
-needs a Linux or macOS host. The result is the same
-`metadata.json + *.bin + tokenizer` layout, placeable under the GenieX data
-directory or pullable with `HubSource.LOCALFS`.
+The module path is verified against the `qai-hub-models` repository tree, and
+`--chipset` takes AI Hub's own manifest key for this silicon. Expected output,
+which is what the importer validates:
 
-Two spellings of the same idea are worth keeping apart: the `genie` asset in the
+| File | Required | Why |
+| --- | --- | --- |
+| `metadata.json` | **yes** | carries the `model_id` that selects the model family |
+| `*.bin` (one or more) | **yes** | the compiled w4a16 context binaries |
+| `tokenizer.json` | **yes** | `tokenizer.json not found in: {}` otherwise |
+| `tokenizer_config.json` | for chat | without it, `apply_chat_template` has no template |
+| `embed_tokens.npy` / `embedding_weights.raw` | model-dependent | recorded as a warning, not a rejection |
+
+Zip that directory and import it. `genie_bundle/` and `*.bin` are in
+`.gitignore`; the token never belongs anywhere near the tree.
+
+### Error codes
+
+`rc` is never obscured. The native side formats every failure as
+`rc=<n>: <message>[: <lastErrorMessage>]` — code first and always, because it is
+the only token that can be looked up against Qualcomm's definitions — and
+`lib/models/npu-errors.ts` turns it into a sentence while keeping the number in
+the text the user sees.
+
+That table is deliberately short. Only codes with a source are in it:
+
+| Code | Constant | Source |
+| --- | --- | --- |
+| `0` | `GENIEX_SUCCESS` | `javap -constants` on `ModelManagerWrapper` |
+| `-100006` | `GENIEX_ERROR_CANCELLED` | same |
+| `-100008` | `GENIEX_ERROR_ALREADY_INITIALIZED` | same |
+| `-100010` | `GENIEX_ERROR_COMMON_HUB_MODEL_NOT_FOUND` | Qualcomm's published error definitions |
+
+Anything else is reported as "the Qualcomm runtime refused this install with
+code `<n>`". Inventing an explanation for an unverified code is worse than
+offering none — it sends the reader somewhere that is not the problem.
+
+### Other refusals the runtime can give
+
+Two more, distinguishable from `-100010` by their text rather than their code:
+
+> `Requested chipset not available for this model; supported: …`
+
+The model resolved but this chipset did not — and the runtime names the ones
+that did. `listHubModels()` now answers the same question before the pull, so
+this should be reached only when the hub list and the asset manifest disagree.
+
+> `No pre-compiled assets available for <X> due to licensing restrictions.
+> Please use the qai-hub-models Python package to manually export the model.`
+
+For a model whose weights Qualcomm may not redistribute. Qwen3 is Apache-2.0, so
+this should not apply to the catalog entry — and if it ever does, the export
+above is exactly what it is asking for.
+
+One naming trap worth keeping straight: the `genie` asset in the release
 manifest is for the older Genie CLI workflow, and `geniex_qairt` is the one this
-SDK consumes. Vesta asks for the latter by asking GenieX, which is the point of
-not hand-rolling the URL.
+SDK consumes. Vesta asks for the latter by asking GenieX rather than by
+hand-rolling a URL, which is the point.
 
 ### What must never be committed
 

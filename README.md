@@ -174,13 +174,20 @@ QAIRT/QNN SDK drop. The same goes for NPU model bundles (gigabytes, and not ours
 to redistribute) and for AI Hub API tokens. `.gitignore` covers all of it; don't
 work around it by copying an SDK into the tree.
 
-Getting the model: the GenieX model manager pulls the precompiled
-`ai-hub-models/Qwen3-4B-Instruct-2507` bundle (`w4a16`, chipset `SM8850`)
-on-device from **Models → Qualcomm NPU → Install**, into app-private storage. No
-Qualcomm account is needed for that path. If the chipset asset turns out not to
-be published, the documented fallback is an off-device export with
-`qai-hub-models` on a Linux/macOS host, which does need a free Qualcomm
-MyAccount. Full procedure, including the exact export command:
+Getting the model, two ways:
+
+- **Models → Qualcomm NPU → Install** pulls the precompiled
+  `ai-hub-models/Qwen3-4B-Instruct-2507` bundle on-device through the GenieX
+  model manager, into app-private storage. No Qualcomm account needed. The
+  chipset string is taken from the hub's own catalogue rather than guessed, and
+  **Check hub** shows what it currently lists — so "is this published for my
+  chip?" is answerable before a download starts, not after it 404s.
+- **Models → Qualcomm NPU → Import bundle** registers a `.zip` you exported
+  yourself with `qai-hub-models` (a free Qualcomm MyAccount, on a Linux/macOS
+  host). Same chipset guard, same layout validation, same hashing as a
+  download — it skips Qualcomm's release schedule, not the safety checks.
+
+Full procedure, the exact export command, and the GenieX error-code table:
 **[docs/NPU-BACKEND.md](docs/NPU-BACKEND.md)**.
 
 **The GGUF route is unchanged and is not going away.** Every device still runs
