@@ -37,6 +37,13 @@ import { getActiveModel } from "../lib/models/model-registry";
 import type { InstalledModel } from "../lib/models/types";
 import { useModelStore } from "../lib/store/model-store";
 import { breakDownHubModels } from "../lib/models/npu-hub";
+import {
+  probeHubIdentity,
+  formatProbe,
+  type HubIdentityProbe,
+} from "../lib/models/npu-hub-probe";
+import { npuResolveAlias } from "../lib/native/npu";
+import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
 import { colors, spacing, typography, radii } from "../lib/theme";
@@ -138,6 +145,40 @@ function Row({ label, value }: { label: string; value: string }) {
 }
 
 export default function DiagnosticsScreen() {
+  const [probe, setProbe] = useState<HubIdentityProbe | null>(null);
+  const [probing, setProbing] = useState(false);
+
+  // Explicitly triggered, never on render: this calls into the runtime, and a
+  // diagnostics screen that fetched on its own would report a state the rest
+  // of the app was never in.
+  const runProbe = useCallback(async () => {
+    const entry = NPU_CATALOG[0];
+    if (!entry) return;
+    setProbing(true);
+    try {
+      const hubName =
+        useModelStore
+          .getState()
+          .npuHub.snapshot?.models.find((m) =>
+            m.name.toLowerCase().endsWith(
+              entry.modelName.slice(entry.modelName.lastIndexOf("/") + 1).toLowerCase(),
+            ),
+          )?.name ?? null;
+      const result = await probeHubIdentity(
+        entry.modelName,
+        hubName,
+        npuResolveAlias,
+        hubName ?? entry.modelName,
+        "AIHUB",
+      );
+      setProbe(result);
+      // Logged as well, so it lands in the same logcat capture as the pull.
+      console.log(`[Diagnostics] ${formatProbe(result)}`);
+    } finally {
+      setProbing(false);
+    }
+  }, []);
+
   const [diag, setDiag] = useState<Diag | null>(null);
 
   const refresh = useCallback(() => {
@@ -245,6 +286,46 @@ export default function DiagnosticsScreen() {
                 of the check above, not permanently — Qualcomm publishes on its
                 own schedule.
               </Text>
+            </View>
+
+            {/* An identity probe, on demand.
+                Three -100010s have now come from three different wrong strings,
+                so the useful question is no longer "what should we send" but
+                "what does the SDK say about each thing we could send".
+                resolveAlias() is the only public call that answers it. This
+                asks once per candidate spelling and prints every answer —
+                it decides nothing and changes nothing about what is pulled. */}
+            <View style={styles.card}>
+              <Text style={styles.probeTitle}>Hub identity probe</Text>
+              {probe ? (
+                <>
+                  <Text style={styles.hint}>
+                    Pull would use {probe.pullName} via {probe.hub}
+                  </Text>
+                  {probe.rows.map((r) => (
+                    <Row
+                      key={r.candidate}
+                      label={r.candidate}
+                      value={r.resolved ?? "(no answer)"}
+                    />
+                  ))}
+                </>
+              ) : (
+                <Text style={styles.hint}>
+                  Asks the runtime what it makes of each spelling of the model
+                  name. Run it, then read the answers beside the pull log.
+                </Text>
+              )}
+              <TouchableOpacity
+                style={styles.probeBtn}
+                onPress={runProbe}
+                disabled={probing}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.probeBtnText}>
+                  {probing ? "Probing…" : probe ? "Run again" : "Run identity probe"}
+                </Text>
+              </TouchableOpacity>
             </View>
           </>
         )}
@@ -493,6 +574,17 @@ export default function DiagnosticsScreen() {
 }
 
 const styles = StyleSheet.create({
+  probeBtn: {
+    marginTop: spacing.md,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    alignSelf: "flex-start",
+  },
+  probeBtnText: { ...typography.bodySmall, color: colors.textPrimary },
+  probeTitle: { ...typography.body, color: colors.textPrimary },
   backendBlock: { paddingVertical: 4 },
   container: { flex: 1, backgroundColor: colors.bg },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },

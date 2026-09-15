@@ -96,13 +96,43 @@ export function readGenieXFailure(err: unknown): GenieXFailure {
 }
 
 /**
- * The one-line form for the Models screen: the readable sentence, with the raw
- * code kept on the end so a screenshot is still diagnosable.
+ * The one-line form for the Models screen: the readable sentence, the raw code,
+ * and THE RUNTIME'S OWN WORDS.
+ *
+ * That last part was missing and it cost a diagnostic round trip. For -100010
+ * the runtime composes its message as `"AI Hub model " + <name> + " not found
+ * on hub"` — the two halves are visible as separate string constants in
+ * libgeniex.so — so it names THE EXACT KEY IT LOOKED UP, after whatever
+ * internal normalization it applied. Replacing that with a friendly sentence
+ * threw away the one fact that distinguishes "the asset is absent" from "we
+ * asked under the wrong name".
+ *
+ * So the sentence explains and the runtime's text substantiates. Only added
+ * when it says something the sentence does not.
  */
 export function describeGenieXFailure(err: unknown): string {
   const failure = readGenieXFailure(err);
   if (failure.rc === null) return failure.message;
-  return `${failure.message} (${failure.name ?? "code"} ${failure.rc})`;
+  const head = `${failure.message} (${failure.name ?? "code"} ${failure.rc})`;
+  const detail = runtimeDetail(failure);
+  return detail ? `${head} — runtime said: ${detail}` : head;
+}
+
+/**
+ * The runtime's message with our own `rc=` prefix stripped back off.
+ *
+ * The native side formats failures as `rc=<n>: <message>`, so the raw string
+ * carries both. Null when nothing survives the strip — an empty quote adds
+ * noise, not evidence.
+ */
+function runtimeDetail(failure: GenieXFailure): string | null {
+  const withoutRc = failure.raw.replace(/^\s*rc=-?\d+\s*:?\s*/, "").trim();
+  if (!withoutRc) return null;
+  // The native wrapper repeats the code inside its own text; one mention is
+  // enough and the head already carries it.
+  return withoutRc === failure.raw.trim() && /^rc=-?\d+$/.test(failure.raw.trim())
+    ? null
+    : withoutRc;
 }
 
 /** True when the hub simply does not carry this asset — the manual-import case. */

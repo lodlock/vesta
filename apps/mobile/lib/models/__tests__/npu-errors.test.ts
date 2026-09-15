@@ -46,6 +46,32 @@ describe("the code that prompted all this", () => {
   it("preserves the runtime's original text untouched", () => {
     expect(readGenieXFailure(new Error(raw)).raw).toBe(raw);
   });
+
+  // This omission cost a diagnostic round trip. libgeniex.so builds the
+  // -100010 message from two string constants — "AI Hub model " and " not
+  // found on hub" — so the runtime NAMES THE KEY IT LOOKED UP, after whatever
+  // normalization it applied internally. Replacing that with a friendly
+  // sentence threw away the one fact that separates "the asset is absent" from
+  // "we asked under the wrong name".
+  it("quotes the runtime, so the looked-up key survives to the user", () => {
+    const line = describeGenieXFailure(
+      new Error(
+        "rc=-100010: AI Hub model qualcomm/Qwen3-4B-Instruct-2507 not found on hub",
+      ),
+    );
+    expect(line).toContain("AI Hub model qualcomm/Qwen3-4B-Instruct-2507");
+    expect(line).toContain("not found on hub");
+    // …without losing the explanation or the code.
+    expect(line).toContain("-100010");
+    expect(line).toMatch(/hub/i);
+  });
+
+  it("does not quote the runtime when it only repeated the code", () => {
+    // `rc=-100010` alone adds nothing the head does not already say.
+    expect(describeGenieXFailure(new Error("rc=-100010"))).not.toContain(
+      "runtime said",
+    );
+  });
 });
 
 describe("codes read out of the SDK's own bytecode", () => {
