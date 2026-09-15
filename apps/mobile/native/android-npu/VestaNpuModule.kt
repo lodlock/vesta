@@ -50,6 +50,13 @@ import java.io.File
  *   applyChatTemplate(messages, tools, enableThinking, addGenerationPrompt)
  *   stopStream() / destroy()
  *
+ * GenieX is Kotlin, so everything it exposes as `getX()` in the bytecode is a
+ * PROPERTY, not a callable getter: `profile.ttftMs`, not `profile.getTtftMs()`.
+ * The names below are the ones in the AAR's Kotlin metadata, verified with
+ * javap, including the two that do not follow from the Java signature —
+ * ProfilingData.decodingSpeed (not decodeSpeed) and the snake_case
+ * LlmCreateInput(model_path, tokenizer_path, config, runtime_id, compute_unit).
+ *
  * The profiling numbers reported back are the runtime's own (ProfilingData:
  * TTFT, prefill/decode speed, token counts). Nothing here invents a metric —
  * a field the runtime does not give us is absent, not guessed.
@@ -159,8 +166,8 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     stripScheme(modelPath),
                     stripScheme(tokenizerPath),
                     ModelConfig(nCtx = config.optInt("contextSize", 4096)),
-                    RuntimeIdValue.QAIRT.getValue(),
-                    ComputeUnitValue.NPU.getValue(),
+                    RuntimeIdValue.QAIRT.value,
+                    ComputeUnitValue.NPU.value,
                 )
 
                 val built = LlmWrapper.builder().llmCreateInput(input).build()
@@ -169,7 +176,7 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
                 llm = wrapper
-                computeUnit = ComputeUnitValue.NPU.getValue()
+                computeUnit = ComputeUnitValue.NPU.value
 
                 val info = Arguments.createMap()
                 info.putString("version", pluginVersion)
@@ -203,7 +210,7 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                 val prompt = templated.getOrElse { error ->
                     promise.reject("NPU_TEMPLATE_FAILED", error.message ?: "chat template failed", error)
                     return@launch
-                }.getFormattedText()
+                }.formattedText
 
                 val sampler = SamplerConfig(
                     temperature = options.optDouble("temperature", 0.3).toFloat(),
@@ -219,9 +226,9 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
 
                 wrapper.generateStreamFlow(prompt, generation).collect { result ->
                     when (result) {
-                        is LlmStreamResult.Token -> text.append(result.getText())
-                        is LlmStreamResult.Completed -> profile = result.getProfile()
-                        is LlmStreamResult.Error -> failure = result.getThrowable()
+                        is LlmStreamResult.Token -> text.append(result.text)
+                        is LlmStreamResult.Completed -> profile = result.profile
+                        is LlmStreamResult.Error -> failure = result.throwable
                         else -> {}
                     }
                 }
@@ -249,14 +256,14 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         // Only what the runtime actually reported. A caller that sees a missing
         // field must say "not reported", never substitute a plausible number.
         if (profile != null) {
-            map.putDouble("ttftMs", profile.getTtftMs())
-            map.putDouble("promptTimeMs", profile.getPromptTimeMs())
-            map.putDouble("decodeTimeMs", profile.getDecodeTimeMs())
-            map.putDouble("promptTokens", profile.getPromptTokens().toDouble())
-            map.putDouble("generatedTokens", profile.getGeneratedTokens().toDouble())
-            map.putDouble("prefillSpeed", profile.getPrefillSpeed())
-            map.putDouble("decodeSpeed", profile.getDecodingSpeed())
-            map.putString("stopReason", profile.getStopReason())
+            map.putDouble("ttftMs", profile.ttftMs)
+            map.putDouble("promptTimeMs", profile.promptTimeMs)
+            map.putDouble("decodeTimeMs", profile.decodeTimeMs)
+            map.putDouble("promptTokens", profile.promptTokens.toDouble())
+            map.putDouble("generatedTokens", profile.generatedTokens.toDouble())
+            map.putDouble("prefillSpeed", profile.prefillSpeed)
+            map.putDouble("decodeSpeed", profile.decodingSpeed)
+            map.putString("stopReason", profile.stopReason)
         }
         return map
     }
