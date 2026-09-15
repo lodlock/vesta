@@ -198,6 +198,15 @@ const ARTICLES: Record<Language, string[]> = {
   it: ["un", "una", "uno"],
 };
 
+// Words that introduce an explicit name for a timer or alarm: "a 30 second
+// timer CALLED brandon time". They are not stopwords — stripping "called" or
+// "named" everywhere would mangle a reminder like "call the man named Brandon"
+// — so they are only consumed here, where they are doing this one job.
+const LABEL_INTRODUCERS: Record<Language, string[]> = {
+  en: ["called", "named", "labeled", "labelled", "titled"],
+  it: ["chiamato", "chiamata", "chiamati", "chiamate", "denominato", "nome"],
+};
+
 // The noun a timer request ends on. Used to tell "a second timer" (another one)
 // from "a 30 second timer" (a duration) — see scanDurationRaw.
 const TIMER_NOUNS: Record<Language, string[]> = {
@@ -855,6 +864,40 @@ function leftoverPhrase(
   return rest.join(" ");
 }
 
+/**
+ * The name the user gave a timer or alarm.
+ *
+ * Usually just what is left over once the duration, the trigger words and the
+ * filler are gone — "set a PIZZA timer for 30 seconds" leaves "pizza". But an
+ * explicit introducer changes where the name starts: in "a 30 second timer
+ * called brandon time" the leftover is "called brandon time", and the label is
+ * what follows the introducer, not the phrase including it.
+ *
+ * The LAST introducer in the phrase wins ("called pizza called bread" is
+ * "bread"). A correction that opens a new segment ("…called pizza, no, called
+ * bread") keeps the first: the label travels with the segment the DURATION was
+ * found in, which is the segment the timer itself came from. Rare enough to
+ * leave alone rather than complicate value resolution for.
+ */
+function labelPhrase(
+  tokens: string[],
+  spans: Span[],
+  lang: Language,
+): string | null {
+  const leftover = leftoverPhrase(tokens, spans, lang);
+  if (!leftover) return null;
+  const words = leftover.split(" ");
+  const introducers = LABEL_INTRODUCERS[lang];
+  let start = -1;
+  for (let i = 0; i < words.length; i++) {
+    if (introducers.includes(words[i])) start = i;
+  }
+  if (start === -1) return leftover;
+  const named = words.slice(start + 1);
+  // "set a timer called" — an introducer with nothing after it names nothing.
+  return named.length > 0 ? named.join(" ") : null;
+}
+
 // Leading/trailing filler only — internal words are the user's phrasing and
 // must survive ("take the bread out" is not "take bread out").
 function trimPhrase(tokens: string[], lang: Language): string | null {
@@ -1122,7 +1165,7 @@ export function parseSchedulingCommand(
     if (duration.hit.seconds <= 0 || duration.hit.seconds > MAX_TIMER_SECONDS) {
       return { status: "ambiguous", reason: "out-of-range", normalized: text };
     }
-    const label = leftoverPhrase(duration.tokens, duration.hit.spans, lang);
+    const label = labelPhrase(duration.tokens, duration.hit.spans, lang);
     return {
       status: "resolved",
       normalized: text,
@@ -1155,7 +1198,7 @@ export function parseSchedulingCommand(
       };
     }
     const time = `${pad2(settled.at.getHours())}:${pad2(settled.at.getMinutes())}`;
-    const label = leftoverPhrase(clock.tokens, clock.hit.spans, lang);
+    const label = labelPhrase(clock.tokens, clock.hit.spans, lang);
     return {
       status: "resolved",
       normalized: text,

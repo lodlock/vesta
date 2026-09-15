@@ -617,3 +617,60 @@ describe("the warning question names the piece that is missing", () => {
     expect(reasonFor("warn me before the timer")).toBe("missing-duration");
   });
 });
+
+describe("explicit timer names", () => {
+  const labelOf = (text: string) => {
+    const intent = resolved(parse(text));
+    if (intent.kind !== "timer") throw new Error(`expected timer, got ${intent.kind}`);
+    return intent.label;
+  };
+
+  it("drops the introducer and keeps the name", () => {
+    // These used to come out as "called brandon time" — the introducer read as
+    // part of the name.
+    expect(labelOf("set a 30 second timer called brandon time")).toBe("brandon time");
+    expect(labelOf("set a 30 second timer named brandon time")).toBe("brandon time");
+    expect(labelOf("set a 30 second timer labeled brandon time")).toBe("brandon time");
+    expect(labelOf("set a 30 second timer labelled brandon time")).toBe("brandon time");
+  });
+
+  it("keeps the duration right alongside the name", () => {
+    const intent = resolved(parse("set a 30 second timer called brandon time"));
+    if (intent.kind !== "timer") throw new Error("expected timer");
+    expect(intent.durationSeconds).toBe(30);
+  });
+
+  it("still reads a name given without an introducer", () => {
+    expect(labelOf("set a pizza timer for 30 seconds")).toBe("pizza");
+  });
+
+  it("leaves an unnamed timer unnamed", () => {
+    expect(labelOf("set a 10 minute timer")).toBeUndefined();
+    // An introducer with nothing after it names nothing.
+    expect(labelOf("set a 10 minute timer called")).toBeUndefined();
+  });
+
+  it("takes the last name when two are given in one breath", () => {
+    expect(labelOf("set a 30 second timer called pizza called bread")).toBe("bread");
+  });
+
+  it("names an alarm the same way", () => {
+    const intent = resolved(parse("set an alarm for 7 am called gym"));
+    if (intent.kind !== "alarm") throw new Error("expected alarm");
+    expect(intent.label).toBe("gym");
+  });
+
+  it("does NOT strip these words anywhere else", () => {
+    // The whole reason they are not stopwords: "named" is part of what the
+    // user wants to be reminded about here.
+    const intent = resolved(parse("remind me to call the man named brandon at six"));
+    if (intent.kind !== "reminder") throw new Error("expected reminder");
+    expect(intent.text).toBe("call the man named brandon");
+  });
+
+  it("names a timer in Italian too", () => {
+    const intent = resolved(parse("metti un timer di 30 secondi chiamato pizza", "it"));
+    if (intent.kind !== "timer") throw new Error("expected timer");
+    expect(intent.label).toBe("pizza");
+  });
+});

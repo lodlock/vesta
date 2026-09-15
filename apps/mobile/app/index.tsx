@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useLayoutEffect } from "react";
+import React, { useRef, useEffect, useState, useLayoutEffect, useCallback } from "react";
 import {
   View,
   FlatList,
@@ -11,7 +11,7 @@ import {
   Platform,
   Linking,
 } from "react-native";
-import { useRouter, useNavigation } from "expo-router";
+import { useRouter, useNavigation, useFocusEffect } from "expo-router";
 import { useChatStore } from "../lib/store/chat-store";
 import { ChatBubble, StreamingBubble } from "../components/ChatBubble";
 import { ChatInput } from "../components/ChatInput";
@@ -179,6 +179,25 @@ export default function ChatScreen() {
       setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
     }
   }, [keyboardHeight]);
+
+  // `modelLoaded` is a MIRROR of the engine's own state, refreshed at only a
+  // few call sites — so it can lag behind reality, and the banner then tells
+  // the user they have no model while inference is plainly working. The engine
+  // (getModelInfo, via updateModelStatus) is the authority; this re-reads it
+  // whenever the screen is shown rather than adding a second cache.
+  //
+  // It also loads the active model if one is selected but not loaded, which is
+  // the case after an assistant-only launch (that boots with loadModel: false).
+  // Telling someone to download a model they already have, and have chosen, is
+  // worse than spending the load on the screen that needs it. Both calls are
+  // no-ops when a model is already loaded.
+  useFocusEffect(
+    useCallback(() => {
+      const chat = useChatStore.getState();
+      chat.updateModelStatus();
+      chat.ensureModelLoaded().catch(() => {});
+    }, []),
+  );
 
   const chatContent = (
     <>
