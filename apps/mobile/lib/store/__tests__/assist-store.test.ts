@@ -27,7 +27,16 @@ jest.mock("../../native/speech", () => ({
 }));
 jest.mock("../../storage/database", () => ({
   getConfig: jest.fn(async () => null), // unset → both assistant settings ON
+  createConversation: jest.fn(async () => {}),
+  saveMessage: jest.fn(async () => {}),
+  updateConversationTitle: jest.fn(async () => {}),
+  touchConversation: jest.fn(async () => {}),
 }));
+// uuid ships ESM that jest-expo does not transform.
+jest.mock("uuid", () => {
+  let n = 0;
+  return { v4: () => `id-${++n}` };
+});
 
 // `mock`-prefixed so the factory may close over it (jest hoists these).
 const mockEnsureModelLoaded = jest.fn(async () => {});

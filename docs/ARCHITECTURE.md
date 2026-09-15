@@ -566,6 +566,21 @@ La verifica **fallisce chiusa**: quando un digest atteso esiste, il commit avvie
 
 **Conseguenza**: i due backend convivono per costruzione. Il dettaglio operativo sta in `docs/NPU-BACKEND.md`.
 
+### ADR-023: Un turno dell'assistente si salva solo se vale la pena riaprirlo
+
+**Contesto**: l'overlay assistente si chiude da solo. Questo è giusto — è un ospite, non un'app — ma rende la persistenza una decisione esplicita: quello che non è stato scritto prima che l'overlay sparisca è perso, e quello che viene scritto sempre seppellisce le conversazioni vere sotto una riga per ogni "metti un timer".
+
+**Decisione**: la politica dipende da COSA è stato il turno, non da come è finito.
+- *Deterministico* (timer, sveglia, promemoria risolti dal parser): **non si salva mai** da solo. Il timer È il risultato; non c'è niente a cui tornare. Una conversazione nasce solo se l'utente tocca **Apri chat**.
+- *Model-backed* (una risposta generata): **si salva subito**, nel momento in cui la risposta finale è visibile — prima della TTS e quindi prima che la finestra di auto-chiusura possa aprirsi. L'utente ha aspettato un caricamento da GB per quella risposta: un timeout o un processo ucciso non devono poterla far sparire.
+- *Chiarimento*: segue il ramo su cui finisce. "Alle quattro" → "AM o PM?" → "PM" resta deterministico; se invece il parser cede al modello, vale la politica del modello.
+
+**Forma**: lo stato vive in `lib/store/assist-session.ts` (`prompt`, `response`, `kind`, `complete`, `persistedChatId`) invece di essere ri-dedotto dalla fase, che dopo il fatto non sa più distinguere una conferma deterministica da una risposta del modello. Si scrivono solo `role` e `content`: niente reasoning, niente JSON di tool call: la cronologia contiene ciò che l'utente ha visto, che è anche ciò che un turno successivo rigioca al modello.
+
+**Idempotenza**: una sessione che ha un id di conversazione lo tiene, e ogni chiamante passa dalla stessa guardia con una sola scrittura in volo. Così il salvataggio automatico di una risposta e un tocco su Apri chat nello stesso istante producono una conversazione, non due.
+
+**Apri chat apre QUESTO turno**: `openChat()` restituisce l'id della conversazione appena scritta e il layout ci fa sopra `loadConversation`. Senza, la schermata mostrerebbe la chat che era aperta prima dell'invocazione — che non ha niente a che vedere con quello che l'utente ha appena chiesto.
+
 ---
 
 ## 8. Sicurezza

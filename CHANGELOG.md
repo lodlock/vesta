@@ -68,6 +68,16 @@ loopback-only MCP server, and a smaller permission set.
   alarms and reminders speak their confirmation and then dismiss the overlay,
   returning you to whatever you were doing; failures, questions and model
   answers stay on screen.
+- **Assistant turns are kept only when they are worth reopening** — a
+  deterministic action (timer, alarm, reminder) writes no conversation: the
+  timer is the outcome, and Done or the auto-dismiss leave nothing behind.
+  A model-backed answer is saved the moment it appears — before it is spoken,
+  and therefore before the overlay can close itself — so a timeout or a killed
+  process cannot lose it. A clarification follows whichever path it ends on.
+  **Open Chat** saves the turn if it is not already saved and opens *that*
+  conversation, never the one that happened to be open in the app beforehand,
+  and a tap that races the automatic save produces one chat, not two. Only the
+  visible text is stored: no reasoning, no tool-call JSON. See ADR-023.
 - **No reasoning on screen or out loud** — assistant turns disable the model's
   thinking pass at generation time, use llama.rn's reasoning-filtered output,
   and sanitize whatever is left. Leaked tool-call JSON is stripped too. Ordinary

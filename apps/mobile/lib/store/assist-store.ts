@@ -19,6 +19,13 @@ import { startAssistCapture, finishAssistantActivity } from "../native/assist";
 import { speak, stopSpeaking } from "../native/speech";
 import { visibleAnswer, spokenAnswer } from "../assist/response-text";
 import { getConfig } from "../storage/database";
+import {
+  emptySession,
+  persistAssistSession,
+  shouldPersistAutomatically,
+  type AssistInteractionKind,
+  type AssistSession,
+} from "./assist-session";
 import { useChatStore } from "./chat-store";
 
 export type AssistPhase =
@@ -60,13 +67,24 @@ interface AssistState {
   // "<original> <answer>" so "4 PM" can complete "alarm tomorrow at four"
   // deterministically, without a model and without the parser needing state.
   clarifying: string | null;
+  // What this turn was and whether it has been written down. Everything the
+  // persistence policy needs lives here rather than being re-derived from the
+  // phase, which cannot distinguish a deterministic confirmation from a model
+  // answer after the fact.
+  session: AssistSession;
+  /** True while a timeout is waiting to close the assistant. */
+  autoFinishPending: boolean;
 
   handle: (transcript: string) => Promise<void>;
   confirm: (approved: boolean) => Promise<void>;
   listenAgain: () => Promise<void>;
   askModel: () => Promise<void>;
-  /** Hand over to the full app; cancels the auto-finish. */
-  openChat: () => void;
+  /**
+   * Hand over to the full app. Persists this turn if it isn't already, and
+   * resolves the conversation to open — never the one that happened to be
+   * active before the assistant was invoked.
+   */
+  openChat: () => Promise<string | null>;
   /** Leave the assistant and return to the previous app. */
   close: () => void;
   dismiss: () => void;
@@ -96,6 +114,7 @@ export const useAssistStore = create<AssistState>((set, get) => {
       clearTimeout(autoFinish);
       autoFinish = null;
     }
+    set({ autoFinishPending: false });
   };
 
   // Leaves the screen entirely, returning the user to the app they came from.
@@ -112,11 +131,58 @@ export const useAssistStore = create<AssistState>((set, get) => {
     cancelAutoFinish();
     autoFinish = setTimeout(() => {
       autoFinish = null;
+      set({ autoFinishPending: false });
       // Only if the turn is still where it was left — a new invocation or an
       // opened chat has taken over otherwise.
       const phase = get().phase;
       if (phase === "answer" || phase === "done") leave();
     }, afterMs);
+    set({ autoFinishPending: true });
+  };
+
+  // One in-flight write at a time, shared by the automatic path and the Open
+  // Chat tap. Without this a model answer that persists itself while the user
+  // reaches for Open Chat would produce two conversations for one turn.
+  let persistInFlight: Promise<string | null> | null = null;
+
+  const persistSession = async (): Promise<string | null> => {
+    const existing = get().session.persistedChatId;
+    if (existing) return existing;
+    if (persistInFlight) return persistInFlight;
+
+    persistInFlight = persistAssistSession(get().session)
+      .then((id) => {
+        if (id) {
+          set((state) => ({ session: { ...state.session, persistedChatId: id } }));
+        }
+        return id;
+      })
+      .catch((err) => {
+        console.warn("[assist] could not persist the session:", err);
+        return null;
+      })
+      .finally(() => {
+        persistInFlight = null;
+      });
+    return persistInFlight;
+  };
+
+  // Records the outcome of a turn, and writes it now if the policy says so.
+  // Called at every point a turn reaches its final response.
+  const completeSession = async (
+    kind: AssistInteractionKind,
+    prompt: string,
+    response: string,
+  ) => {
+    set((state) => ({
+      session: { ...state.session, kind, prompt, response, complete: true },
+    }));
+    if (shouldPersistAutomatically(get().session)) {
+      // Awaited deliberately: the answer must be on disk before TTS finishes
+      // and the auto-finish window opens, so a timeout or a killed process
+      // cannot lose something the user already has.
+      await persistSession();
+    }
   };
 
   // Speaks `text` and resolves when it has actually been heard (or the engine
@@ -159,6 +225,10 @@ export const useAssistStore = create<AssistState>((set, get) => {
           return;
         }
         set({ phase: "answer", failed: false, message: answer });
+        // Written BEFORE it is spoken: speech takes seconds and the
+        // auto-finish follows it, so persisting afterwards would leave a
+        // window where an answer exists on screen but nowhere else.
+        await completeSession("model", text, answer);
         await say(answer);
         // Spoken and on screen. Give the user a window to read it or tap Open
         // Chat, then get out of the way on their behalf.
@@ -175,6 +245,7 @@ export const useAssistStore = create<AssistState>((set, get) => {
       } else {
         const failed = !res.result.success;
         set({ phase: "done", failed, message: res.message });
+        if (!failed) await completeSession("model", text, res.message);
         if (failed) await say(res.message);
         else await finishAndDismiss(res.message);
       }
@@ -195,6 +266,8 @@ export const useAssistStore = create<AssistState>((set, get) => {
     failed: false,
     pending: null,
     clarifying: null,
+    session: { ...emptySession },
+    autoFinishPending: false,
 
     handle: async (transcript: string) => {
       // A new invocation silences the previous answer rather than talking over
@@ -206,7 +279,7 @@ export const useAssistStore = create<AssistState>((set, get) => {
       // A follow-up completes the earlier utterance rather than replacing it.
       const text = previous ? `${previous} ${transcript}` : transcript;
 
-      set({
+      set((state) => ({
         active: true,
         phase: "working",
         transcript,
@@ -214,7 +287,10 @@ export const useAssistStore = create<AssistState>((set, get) => {
         failed: false,
         pending: null,
         clarifying: null,
-      });
+        // A follow-up continues the same session (it is one interaction the
+        // user is having); a fresh invocation starts a new one.
+        session: previous ? state.session : { ...emptySession },
+      }));
 
       try {
         const res = await processMessage(text, [], language());
@@ -222,17 +298,32 @@ export const useAssistStore = create<AssistState>((set, get) => {
           case "tool_call": {
             const failed = !res.result.success;
             set({ phase: "done", message: res.message, failed });
+            if (!failed) {
+              // Recorded, not written: the timer IS the outcome, and a
+              // conversation only appears if the user asks for one.
+              await completeSession(
+                previous ? "clarification" : "deterministic",
+                text,
+                res.message,
+              );
+            }
             // A failure stays on screen to be read; a success speaks and goes.
             if (failed) await say(res.message);
             else await finishAndDismiss(res.message);
             return;
           }
           case "pending_tool_call":
-            set({
+            set((state) => ({
               phase: "confirm",
               message: res.message,
               pending: { tool: res.tool, parameters: res.parameters },
-            });
+              // Remember the request now; confirm() supplies the outcome.
+              session: {
+                ...state.session,
+                prompt: text,
+                kind: previous ? "clarification" : "deterministic",
+              },
+            }));
             await say(res.message);
             return;
           case "text":
@@ -281,6 +372,14 @@ export const useAssistStore = create<AssistState>((set, get) => {
       }
       const failed = !result.success;
       set({ phase: "done", message: result.message, failed });
+      if (!failed) {
+        const session = get().session;
+        await completeSession(
+          session.kind ?? "deterministic",
+          session.prompt ?? get().transcript,
+          result.message,
+        );
+      }
       if (failed) await say(result.message);
       else await finishAndDismiss(result.message);
     },
@@ -301,11 +400,15 @@ export const useAssistStore = create<AssistState>((set, get) => {
       await runModel(get().message);
     },
 
-    /** The user is taking over: keep Vesta open and stop the auto-finish. */
-    openChat: () => {
+    // The user is taking over. This turn gets written down if it hasn't been,
+    // and the id that comes back is the conversation to open — THIS
+    // interaction, never whatever chat happened to be active beforehand.
+    openChat: async () => {
       cancelAutoFinish();
       stopSpeaking();
+      const chatId = await persistSession();
       set({ active: false, phase: "idle" });
+      return chatId;
     },
 
     /** Done — leave and hand the screen back to whatever came before. */
@@ -322,6 +425,10 @@ export const useAssistStore = create<AssistState>((set, get) => {
         failed: false,
         pending: null,
         clarifying: null,
+        // The session goes with it. A model answer that was written down stays
+        // in history; a deterministic turn was never written and now never
+        // will be, which is the point.
+        session: { ...emptySession },
       });
     },
   };

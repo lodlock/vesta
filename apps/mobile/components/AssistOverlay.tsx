@@ -9,7 +9,14 @@ import { View, Text, TouchableOpacity, ActivityIndicator, StyleSheet } from "rea
 import { useAssistStore } from "../lib/store/assist-store";
 import { colors, spacing, radii, typography } from "../lib/theme";
 
-export function AssistOverlay({ onOpenChat }: { onOpenChat: () => void }) {
+export function AssistOverlay({
+  onOpenChat,
+}: {
+  // Receives the conversation THIS turn was written to, so the app opens the
+  // interaction the user was just having rather than the last chat they had.
+  // Null when there was nothing worth writing.
+  onOpenChat: (chatId: string | null) => void;
+}) {
   const phase = useAssistStore((s) => s.phase);
   const transcript = useAssistStore((s) => s.transcript);
   const message = useAssistStore((s) => s.message);
@@ -20,11 +27,11 @@ export function AssistOverlay({ onOpenChat }: { onOpenChat: () => void }) {
   const closeAssist = useAssistStore((s) => s.close);
   const takeOver = useAssistStore((s) => s.openChat);
 
-  // Done leaves entirely; Open Chat keeps Vesta up and stops the auto-finish.
+  // Done leaves entirely; Open Chat keeps Vesta up, stops the auto-finish and
+  // persists the turn before handing over its conversation id.
   const close = () => closeAssist();
   const openChat = () => {
-    takeOver();
-    onOpenChat();
+    takeOver().then(onOpenChat).catch(() => onOpenChat(null));
   };
 
   return (

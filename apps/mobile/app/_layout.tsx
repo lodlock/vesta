@@ -107,8 +107,16 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <StatusBar style="dark" />
         <AssistOverlay
-          onOpenChat={() => {
-            useChatStore.getState().ensureModelLoaded().catch(() => {});
+          onOpenChat={(chatId) => {
+            const chat = useChatStore.getState();
+            // Open the conversation this assistant turn produced. Without this
+            // the chat screen would show whatever was open before the
+            // assistant was invoked, which has nothing to do with what the
+            // user just asked.
+            if (chatId) {
+              chat.loadConversation(chatId, null).catch(() => {});
+            }
+            chat.ensureModelLoaded().catch(() => {});
           }}
         />
       </SafeAreaProvider>
