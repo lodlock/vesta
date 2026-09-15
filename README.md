@@ -147,6 +147,54 @@ Vesta ships with **no model bundled** — you choose what to download and keep.
 
 All Apache-2.0. On Adreno (Snapdragon) devices, llama.cpp's GPU backend only accepts `Q4_0`/`Q6_K` quants; on CPU-bound SoCs (e.g. Pixel's Tensor G5), `Q4_K_M` is ideal.
 
+### Optional: Qualcomm NPU (experimental)
+
+**Off by default.** A normal build contains no Qualcomm code at all — no
+GenieX, no QAIRT, no Maven dependency — reports the NPU unavailable, and runs
+every model on llama.cpp. You only get the NPU path if you ask for it:
+
+```bash
+VESTA_ENABLE_NPU=1 npx expo prebuild --platform android --clean
+cd android && ./gradlew assembleRelease
+```
+
+An NPU build currently requires:
+
+| | |
+|---|---|
+| Android `minSdk` | **27** (Android 8.1) — the GenieX AAR's own manifest floor |
+| ABI | **`arm64-v8a` only** — the AAR ships arm64 natives and no others |
+| Hardware | a compatible Qualcomm SoC with a Hexagon NPU |
+| **Validated target** | **SM8850 / Snapdragon 8 Elite Gen 5** (tested on a OnePlus 15) |
+
+The Qualcomm runtime is resolved by Gradle from **Maven Central**
+(`com.qualcomm.qti:geniex-android`) at build time. It is **not committed to this
+repository, and must never be** — neither the AAR, nor `libQnn*.so`, nor any
+QAIRT/QNN SDK drop. The same goes for NPU model bundles (gigabytes, and not ours
+to redistribute) and for AI Hub API tokens. `.gitignore` covers all of it; don't
+work around it by copying an SDK into the tree.
+
+Getting the model: the GenieX model manager pulls the precompiled
+`ai-hub-models/Qwen3-4B-Instruct-2507` bundle (`w4a16`, chipset `SM8850`)
+on-device from **Models → Qualcomm NPU → Install**, into app-private storage. No
+Qualcomm account is needed for that path. If the chipset asset turns out not to
+be published, the documented fallback is an off-device export with
+`qai-hub-models` on a Linux/macOS host, which does need a free Qualcomm
+MyAccount. Full procedure, including the exact export command:
+**[docs/NPU-BACKEND.md](docs/NPU-BACKEND.md)**.
+
+**The GGUF route is unchanged and is not going away.** Every device still runs
+GGUF on llama.cpp, the curated catalog and "Add from HuggingFace" still work,
+and your own merged or self-quantized `.gguf` files still import. An NPU bundle
+and the equivalent GGUF can be installed side by side — separate registry rows
+in separate directories, one active at a time — because an NPU bundle is
+compiled for one chipset and does not run anywhere else, while a GGUF runs
+everywhere.
+
+Licensing, in short: Vesta is MIT; `geniex-android` is BSD-3-Clause **and**
+Qualcomm's Terms of Use; the Qwen3 weights are Apache-2.0. Integrating with them
+does not relicense them — see [Licensing](#license).
+
 ### Try it
 
 With a model active, type (English or Italian):
@@ -282,7 +330,23 @@ Found a security issue? Please follow [SECURITY.md](SECURITY.md) — don't open 
 
 ## License
 
-[MIT](LICENSE) © 2026 Rinaldo Festa.
+[MIT](LICENSE) © 2026 Rinaldo Festa. That covers **the contents of this
+repository** and nothing else.
+
+Vesta integrates with third-party components that keep their own licences, and
+integration does not relicense them:
+
+| Component | Licence | Obtained |
+|---|---|---|
+| Vesta (this repo) | [MIT](LICENSE) | here |
+| llama.cpp / llama.rn | MIT | npm, at build time |
+| `com.qualcomm.qti:geniex-android` (optional NPU build) | BSD-3-Clause **and** [Qualcomm Terms of Use](https://www.qualcomm.com/site/terms-of-use), both declared in the artifact's POM | Maven Central, at build time — **never committed here** |
+| Qwen3-4B-Instruct-2507 weights (GGUF or NPU bundle) | [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) | downloaded by you, at runtime — **never committed here** |
+
+No proprietary Qualcomm binary and no model artifact is present in this
+repository, and none becomes an MIT work by virtue of Vesta calling into it.
+Details, including which clause permits what and which questions remain open:
+[docs/NPU-BACKEND.md](docs/NPU-BACKEND.md). None of it is legal advice.
 
 ---
 

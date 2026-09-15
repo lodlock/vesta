@@ -42,16 +42,36 @@ ios/build/
 # checked-in .aar/.so would be standalone redistribution — and would fold
 # proprietary code into an MIT repository. Gradle resolves it from Maven at
 # build time instead. See docs/NPU-BACKEND.md.
+# Generated NPU context bundles (metadata.json + *.bin shards + tokenizer, or
+# the AI Hub .zip). Gigabytes each, and not ours to redistribute.
 *.bin
 *.pte
 *.serialized
+*.dlc
+genie_bundle/
+genie_bundle*/
+**/npu-artifacts/
+**/npu-bundles/
+
+# Qualcomm SDK / runtime binary drops. The build resolves geniex-android from
+# Maven Central; nothing here looks for a hand-copied SDK, and a manually
+# dropped binary is exactly the standalone redistribution the licence excludes.
 qairt/
 qnn-sdk/
+qnn-runtime/
 geniex-sdk/
-**/npu-artifacts/
+GenieX/
+**/libQnn*.so
+**/libgeniex*.so
+*.aar
+
+# AI Hub credentials. Never commit a token.
 .qai-hub/
+.qai_hub/
+**/.qai_hub/client.ini
 qai_hub_token*
 *.aihub-token
+QAI_HUB_API_TOKEN*
 
 # IDE
 .idea/
