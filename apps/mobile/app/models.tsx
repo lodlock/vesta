@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   View,
   Text,
@@ -14,7 +14,15 @@ import { useModelStore, type NpuStatus } from "../lib/store/model-store";
 import { CATALOG } from "../lib/models/catalog";
 import { listGgufFiles, type HfFile } from "../lib/models/hf-client";
 import type { NpuCatalogModel } from "../lib/models/npu-catalog";
-import type { HubCatalog } from "../lib/models/npu-hub";
+import {
+  breakDownHubModels,
+  hubAvailability,
+  hubModelLabel,
+  type HubState,
+  type HubAvailability,
+  type CompatibleHubModel,
+} from "../lib/models/npu-hub";
+import type { RuntimeChipset } from "../lib/models/chipset-identity";
 import { isNpuModel } from "../lib/models/npu-compat";
 import type { CatalogModel, InstalledModel, ModelTrust } from "../lib/models/types";
 import { formatBytes, formatDuration, percent, fitLabel, type FitLabel } from "../lib/models/format";
@@ -43,6 +51,8 @@ export default function ModelsScreen() {
   const importNpuBundle = useModelStore((s) => s.importNpuBundle);
   const npuHub = useModelStore((s) => s.npuHub);
   const loadNpuHub = useModelStore((s) => s.loadNpuHub);
+  const installHubModel = useModelStore((s) => s.installHubModel);
+  const npuInstallErrors = useModelStore((s) => s.npuInstallErrors);
   const verifyNpuBundle = useModelStore((s) => s.verifyNpuBundle);
   // Optional: a SHA-256 the user has for the file they are about to import.
   // Left empty, the import still works — see importLocalModel's policy.
@@ -95,6 +105,23 @@ export default function ModelsScreen() {
     await importLocalModel(asset.uri, name, importChecksum.trim() || null);
     setImportChecksum("");
   };
+
+  // Where Vesta's preferred model stands against the last hub answer. One
+  // curated entry today, so the first is the one the card describes.
+  const preferred = npuCatalog[0];
+  const qwenAvailability = useMemo(
+    () =>
+      preferred
+        ? hubAvailability(npuHub, preferred.modelName, npu.soc, npu.chipsets)
+        : ({ status: "unchecked" } as HubAvailability),
+    [npuHub, preferred, npu.soc, npu.chipsets],
+  );
+
+  // Always a fresh query when the user asks for one: the whole point of the
+  // button is that Qualcomm's answer can have changed since last time.
+  const refreshHub = useCallback(() => {
+    void loadNpuHub(true);
+  }, [loadNpuHub]);
 
   // An AI Hub bundle the user exported themselves. A .zip because that is one
   // of the three layouts the runtime accepts and the only one a file picker can
@@ -160,7 +187,9 @@ export default function ModelsScreen() {
       <NpuSection
         npu={npu}
         hub={npuHub}
-        onCheckHub={loadNpuHub}
+        availability={qwenAvailability}
+        errors={npuInstallErrors}
+        onCheckHub={refreshHub}
         onImport={pickNpuBundle}
         catalog={npuCatalog}
         installedFor={installedNpu}
@@ -171,6 +200,25 @@ export default function ModelsScreen() {
         onRemove={confirmRemove}
         onVerify={verify}
       />
+
+      {/* Qualcomm's own catalogue. Rendered only where the runtime works,
+          because a list of NPU bundles is meaningless on a device that cannot
+          load one. */}
+      {npu.inBuild && npu.available && (
+        <HubCatalogSection
+          hub={npuHub}
+          soc={npu.soc}
+          chipsets={npu.chipsets}
+          installed={installedNpu}
+          progress={progress}
+          errors={npuInstallErrors}
+          onRefresh={refreshHub}
+          onInstall={installHubModel}
+          onActivate={activate}
+          onCancel={cancel}
+          onRemove={confirmRemove}
+        />
+      )}
 
       {/* Installed (non-catalog, e.g. imported or ad-hoc HF) */}
       {installed.filter((m) => !CATALOG.some((c) => c.hfRepo === m.hfRepo) && !isNpuModel(m)).length > 0 && (
@@ -444,6 +492,8 @@ function InstalledRow({
 function NpuSection({
   npu,
   hub,
+  availability,
+  errors,
   catalog,
   installedFor,
   progress,
@@ -456,7 +506,9 @@ function NpuSection({
   onVerify,
 }: {
   npu: NpuStatus;
-  hub: HubCatalog | null;
+  hub: HubState;
+  availability: HubAvailability;
+  errors: Record<string, string>;
   catalog: NpuCatalogModel[];
   installedFor: (modelName: string) => InstalledModel | undefined;
   progress: Record<string, { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string }>;
@@ -500,27 +552,9 @@ function NpuSection({
         </View>
       ) : (
         <>
-          {/* What the hub itself says, before anyone presses Install. An
-              install that fails after a progress bar has been moving is the
-              worst way to learn that an asset was never published. */}
-          <View style={styles.card}>
-            <Text style={styles.rowHint}>
-              {hub === null
-                ? "Qualcomm's model hub has not been checked yet."
-                : hub.ok
-                  ? `Qualcomm's hub is reachable and lists ${hub.models.length} model(s).`
-                  : `Qualcomm's hub could not be reached: ${hub.error}`}
-            </Text>
-            {hub === null && (
-              <TouchableOpacity
-                style={[styles.btn, styles.btnOutline, { marginTop: spacing.sm }]}
-                onPress={onCheckHub}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.btnOutlineText}>Check hub</Text>
-              </TouchableOpacity>
-            )}
-          </View>
+          {/* Vesta's preferred model keeps its card whatever the hub says —
+              it is a recommendation, not an offer, and the hub answer only
+              decides which actions on it can possibly work. */}
           {catalog.map((m) => {
           const row = installedFor(m.modelName);
           const prog = row ? progress[row.id] : undefined;
@@ -551,12 +585,34 @@ function NpuSection({
                 ~{Math.round(m.minRamMb / 1024)} GB RAM · {m.license}
               </Text>
 
+              {/* Vesta's recommendation, stated as one. It stays on the card
+                  whether or not Qualcomm currently ships it. */}
+              <Text style={styles.rowHint}>Vesta&rsquo;s preferred NPU model</Text>
+
               {row && !downloading && (
                 <Text style={styles.rowHint}>{TRUST_LABEL[row.trust]}</Text>
               )}
               {row && !downloading && activation && !activation.ok && (
                 <Text style={styles.rowError}>{activation.message}</Text>
               )}
+
+              {/* The hub's verdict on THIS model, in words. `absent` carries a
+                  timestamp because it is a claim about a moment, never about
+                  the future — Qualcomm can publish at any time. */}
+              {!row && availability.status === "absent" && (
+                <Text style={styles.rowError}>
+                  Not currently available from Qualcomm Hub
+                  {availability.cached ? " (as of a cached check" : " (checked"}{" "}
+                  {new Date(availability.checkedAt).toLocaleString()})
+                </Text>
+              )}
+              {!row && availability.status === "unchecked" && (
+                <Text style={styles.rowHint}>
+                  Check the hub to see whether Qualcomm is publishing this model
+                  for {m.targetSoc} right now.
+                </Text>
+              )}
+              {errors[m.id] && <Text style={styles.rowError}>{errors[m.id]}</Text>}
 
               {downloading && prog && (
                 <ProgressBar
@@ -570,7 +626,11 @@ function NpuSection({
               )}
 
               <View style={styles.btnRow}>
-                {!row && (
+                {/* Install appears only when the hub has SAID it can work.
+                    Leaving a known-doomed button active after a successful
+                    check is how a user spends a progress bar to learn what the
+                    app already knew. */}
+                {!row && availability.status === "listed" && (
                   <TouchableOpacity
                     style={[styles.btn, styles.btnPrimary]}
                     onPress={() => onInstall(m)}
@@ -579,9 +639,29 @@ function NpuSection({
                     <Text style={styles.btnPrimaryText}>Install</Text>
                   </TouchableOpacity>
                 )}
-                {/* Always offered, not only after a failed download. Whether
-                    Qualcomm has published this asset is not something the user
-                    should have to discover by waiting for a 404. */}
+                {/* Before any answer exists, checking IS the primary action. */}
+                {!row && availability.status === "unchecked" && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnPrimary]}
+                    onPress={onCheckHub}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnPrimaryText}>Check hub</Text>
+                  </TouchableOpacity>
+                )}
+                {!row && availability.status === "absent" && (
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnOutline]}
+                    onPress={onCheckHub}
+                    disabled={hub.checking}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.btnOutlineText}>Check again</Text>
+                  </TouchableOpacity>
+                )}
+                {/* Always offered. Whether Qualcomm has published this asset is
+                    not something the user should have to discover by waiting
+                    for a 404, and an exported bundle needs no hub at all. */}
                 {!row && (
                   <TouchableOpacity
                     style={[styles.btn, styles.btnOutline]}
@@ -592,6 +672,7 @@ function NpuSection({
                   </TouchableOpacity>
                 )}
                 {row && downloading && (
+
                   <TouchableOpacity
                     style={[styles.btn, styles.btnOutline]}
                     onPress={() => onCancel(row.id)}
@@ -638,6 +719,216 @@ function NpuSection({
           })}
         </>
       )}
+    </>
+  );
+}
+
+/**
+ * Qualcomm's own catalogue, rendered.
+ *
+ * The list is NOT hard-coded and must never become so: it is whatever
+ * `listHubModels()` returned, filtered to this device through the same
+ * canonical chipset machinery the load-time guard uses. Qualcomm publishes and
+ * unpublishes; a copy of their list kept here would be wrong on a schedule we
+ * do not control, which is exactly how the Qwen card ended up promising a
+ * download that could only 404.
+ *
+ * Only facts the PUBLIC GenieX API actually returns are shown. `HubModel`
+ * carries a name, a model type and a chipset list — so there is no size and no
+ * precision on these cards, because inventing either would be worse than the
+ * blank space.
+ */
+function HubCatalogSection({
+  hub,
+  soc,
+  chipsets,
+  installed,
+  progress,
+  errors,
+  onRefresh,
+  onInstall,
+  onActivate,
+  onCancel,
+  onRemove,
+}: {
+  hub: HubState;
+  soc: string | null;
+  chipsets: RuntimeChipset[] | undefined;
+  installed: (modelName: string) => InstalledModel | undefined;
+  progress: Record<string, { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string }>;
+  errors: Record<string, string>;
+  onRefresh: () => void;
+  onInstall: (m: CompatibleHubModel) => void;
+  onActivate: (id: string) => void;
+  onCancel: (id: string) => void;
+  onRemove: (m: InstalledModel) => void;
+}) {
+  const snapshot = hub.snapshot;
+  const breakdown = useMemo(
+    () => (snapshot ? breakDownHubModels(snapshot.models, soc, chipsets) : null),
+    [snapshot, soc, chipsets],
+  );
+
+  return (
+    <>
+      <View style={styles.card}>
+        <View style={styles.rowHeader}>
+          <Text style={styles.rowTitle}>Qualcomm Hub</Text>
+          <Text style={styles.rowMeta}>
+            {hub.checking
+              ? "checking…"
+              : snapshot
+                ? `${snapshot.models.length} models`
+                : "not checked"}
+          </Text>
+        </View>
+
+        {snapshot && breakdown && (
+          <Text style={styles.rowHint}>
+            {breakdown.compatible.length} compatible with {soc ?? "this chipset"}
+            {breakdown.otherChipsets > 0
+              ? ` · ${breakdown.otherChipsets} for other chipsets`
+              : ""}
+            {breakdown.unsupportedType > 0
+              ? ` · ${breakdown.unsupportedType} unsupported type`
+              : ""}
+          </Text>
+        )}
+
+        {/* The age of the answer, always. "Not listed" is a claim about a
+            moment, never about the future — Qualcomm can publish at any time
+            and the refresh below is how that gets noticed. */}
+        {snapshot && (
+          <Text style={styles.rowHint}>
+            {snapshot.cached ? "Cached from " : "Checked "}
+            {new Date(snapshot.checkedAt).toLocaleString()}
+          </Text>
+        )}
+
+        {/* Kept beside the catalogue, not instead of it: a failed refresh must
+            not cost the user the answer they already had. */}
+        {hub.error && <Text style={styles.rowError}>{hub.error}</Text>}
+
+        <TouchableOpacity
+          style={[styles.btn, styles.btnOutline, { marginTop: spacing.sm }]}
+          onPress={onRefresh}
+          disabled={hub.checking}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.btnOutlineText}>
+            {snapshot ? "Refresh hub" : "Check hub"}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {breakdown && breakdown.compatible.length === 0 && (
+        <View style={styles.card}>
+          <Text style={styles.rowDesc}>
+            Qualcomm&rsquo;s hub lists nothing for {soc ?? "this chipset"} right now.
+          </Text>
+          <Text style={styles.rowHint}>
+            This changes as Qualcomm publishes. You can also import a bundle you
+            exported yourself.
+          </Text>
+        </View>
+      )}
+
+      {breakdown?.compatible.map((m) => {
+        const row = installed(m.entry.name);
+        const prog = row ? progress[row.id] : undefined;
+        const downloading =
+          prog?.status === "downloading" || row?.state === "downloading";
+        const activation = row ? canActivate(row) : null;
+        const error = errors[m.entry.name];
+        return (
+          <View
+            key={m.entry.name}
+            style={[styles.card, row?.isActive && styles.cardActive]}
+          >
+            <View style={styles.rowHeader}>
+              <Text style={styles.rowTitle}>{hubModelLabel(m.entry.name)}</Text>
+              <Text style={styles.rowMeta}>
+                {row && row.sizeBytes > 0 ? formatBytes(row.sizeBytes) : ""}
+              </Text>
+            </View>
+            {/* The identifier that actually gets pulled, verbatim. The pretty
+                name above is for reading; this is the fact. */}
+            <Text style={styles.rowHint}>{m.entry.name}</Text>
+            <Text style={styles.rowHint}>
+              {m.entry.modelType} · Qualcomm Hexagon NPU
+            </Text>
+            <Text style={styles.rowHint}>
+              Target: {m.canonicalSoc} (hub: {m.chipset})
+            </Text>
+            {/* No quality ranking is offered or implied. Availability is the
+                only claim the hub makes, so availability is the only claim
+                repeated here. */}
+            <Text style={styles.rowHint}>Available from Qualcomm Hub</Text>
+
+            {error && <Text style={styles.rowError}>{error}</Text>}
+            {row && !downloading && activation && !activation.ok && (
+              <Text style={styles.rowError}>{activation.message}</Text>
+            )}
+
+            {downloading && prog && (
+              <ProgressBar
+                written={prog.bytesWritten}
+                total={prog.bytesTotal}
+                etaSeconds={prog.etaSeconds}
+              />
+            )}
+            {downloading && !prog && (
+              <Text style={styles.rowHint}>Starting download…</Text>
+            )}
+
+            <View style={styles.btnRow}>
+              {!row && (
+                <TouchableOpacity
+                  style={[styles.btn, styles.btnPrimary]}
+                  onPress={() => onInstall(m)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.btnPrimaryText}>Install</Text>
+                </TouchableOpacity>
+              )}
+              {row && downloading && (
+                <TouchableOpacity
+                  style={[styles.btn, styles.btnOutline]}
+                  onPress={() => onCancel(row.id)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.btnOutlineText}>Cancel</Text>
+                </TouchableOpacity>
+              )}
+              {/* Activation is always the user's explicit choice. Nothing here
+                  promotes a hub model over the one they are already using. */}
+              {row && activation?.ok && !row.isActive && (
+                <TouchableOpacity
+                  style={[styles.btn, styles.btnPrimary]}
+                  onPress={() => onActivate(row.id)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.btnPrimaryText}>Use this model</Text>
+                </TouchableOpacity>
+              )}
+              {row?.isActive && (
+                <View style={[styles.btn, styles.btnActive]}>
+                  <Text style={styles.btnActiveText}>● Active</Text>
+                </View>
+              )}
+              {row && !downloading && (
+                <TouchableOpacity
+                  style={[styles.btn, styles.btnGhost]}
+                  onPress={() => onRemove(row)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.btnGhostText}>Delete</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+        );
+      })}
     </>
   );
 }

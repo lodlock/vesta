@@ -161,3 +161,212 @@ export function explainResolution(
       );
   }
 }
+
+// ── The catalogue as state ────────────────────────────────────────────────
+//
+// On device, the hub answered with 19 models and Qwen3-4B-Instruct-2507 was not
+// among them. That settles the -100010: the asset is not published, and no
+// amount of client code will conjure it. It also says something about the
+// shape of this feature — a hard-coded list of one downloadable model was
+// always going to be wrong whenever Qualcomm's list changed, and it is wrong
+// now. So the hub becomes the catalogue, and Vesta's own entry becomes a
+// preference expressed against it rather than a promise made instead of it.
+
+/** A catalogue as of one successful query. */
+export interface HubSnapshot {
+  models: HubModel[];
+  /** Epoch ms of the query that produced these rows. */
+  checkedAt: number;
+  /**
+   * True when these rows were restored from disk rather than fetched in this
+   * session. Shown, because "the hub did not list it" is a claim with an age,
+   * and a stale absence must never read as a permanent one.
+   */
+  cached: boolean;
+}
+
+export interface HubState {
+  /**
+   * The last SUCCESSFUL catalogue, or null if none has ever been obtained.
+   * A failed refresh does not clear it — losing a good answer because a later
+   * query timed out would be strictly worse than showing an older one.
+   */
+  snapshot: HubSnapshot | null;
+  /** The most recent failure, kept BESIDE the snapshot rather than replacing it. */
+  error: string | null;
+  checking: boolean;
+}
+
+export const EMPTY_HUB: HubState = {
+  snapshot: null,
+  error: null,
+  checking: false,
+};
+
+/** A hub model this device can actually install, with the string to pull it by. */
+export interface CompatibleHubModel {
+  entry: HubModel;
+  /** The hub's OWN chipset spelling for this device. Never ours. */
+  chipset: string;
+  /** The canonical id that spelling belongs to — what the row records. */
+  canonicalSoc: string;
+}
+
+/** What the hub offers, split by whether Vesta can do anything with it. */
+export interface HubBreakdown {
+  /** Installable here: right chipset class, and a model type Vesta can run. */
+  compatible: CompatibleHubModel[];
+  /** Right type, wrong silicon. Counted, not listed — it is not actionable. */
+  otherChipsets: number;
+  /** Right silicon, a type this app has no runtime for (VLM). */
+  unsupportedType: number;
+}
+
+// Vesta's NPU backend creates an LlmWrapper. A VLM bundle handed to it does not
+// degrade, it fails — so model type is a compatibility fact here, in the same
+// sense the chipset is, and not a judgement about the model.
+const RUNNABLE_TYPES = new Set(["LLM"]);
+
+/**
+ * Splits the hub's catalogue against this device.
+ *
+ * Chipset compatibility goes through the runtime's own equivalence table, the
+ * same canonical machinery the load-time guard uses — so a model is offered
+ * only when Qualcomm's list and this phone agree on the silicon, and never
+ * because two names looked similar.
+ */
+export function breakDownHubModels(
+  models: HubModel[],
+  deviceSoc: string | null,
+  table: RuntimeChipset[] | undefined,
+): HubBreakdown {
+  const compatible: CompatibleHubModel[] = [];
+  let otherChipsets = 0;
+  let unsupportedType = 0;
+
+  const device = canonicalChipset(deviceSoc, table);
+  for (const entry of models) {
+    const chipset = device ? hubChipsetFor(entry, deviceSoc, table) : null;
+    if (!chipset) {
+      otherChipsets += 1;
+      continue;
+    }
+    if (!RUNNABLE_TYPES.has(entry.modelType.toUpperCase())) {
+      unsupportedType += 1;
+      continue;
+    }
+    compatible.push({
+      entry,
+      chipset,
+      // The row records the CANONICAL id, not the hub's spelling: it is what
+      // the load-time guard compares against Build.SOC_MODEL on every later
+      // boot, long after this catalogue is gone.
+      canonicalSoc: canonicalChipset(chipset, table)?.canonical ?? chipset,
+    });
+  }
+  return { compatible, otherChipsets, unsupportedType };
+}
+
+/** Where a curated catalog entry stands against the last hub answer. */
+export type HubAvailability =
+  /** No successful query yet — nothing is known, and nothing is claimed. */
+  | { status: "unchecked" }
+  /** Listed, for this silicon. `chipset` is the string to pull with. */
+  | { status: "listed"; chipset: string; canonicalSoc: string }
+  /** The hub answered, and this model was not in it for this device. */
+  | { status: "absent"; checkedAt: number; cached: boolean };
+
+/**
+ * Whether Vesta's own preferred model can be pulled right now.
+ *
+ * `absent` carries the timestamp on purpose. It is the difference between "not
+ * published" and "was not published when we last looked", and only the second
+ * is ever true — Qualcomm can publish at any time, so the UI that renders this
+ * must always offer another look.
+ */
+export function hubAvailability(
+  state: HubState,
+  modelName: string,
+  deviceSoc: string | null,
+  table: RuntimeChipset[] | undefined,
+  aliasName?: string | null,
+): HubAvailability {
+  const snapshot = state.snapshot;
+  if (!snapshot) return { status: "unchecked" };
+
+  const resolution = resolveAgainstHub(
+    { ok: true, models: snapshot.models },
+    modelName,
+    deviceSoc,
+    table,
+    aliasName,
+  );
+  if (resolution.status === "available") {
+    return {
+      status: "listed",
+      chipset: resolution.chipset,
+      canonicalSoc:
+        canonicalChipset(resolution.chipset, table)?.canonical ?? resolution.chipset,
+    };
+  }
+  return {
+    status: "absent",
+    checkedAt: snapshot.checkedAt,
+    cached: snapshot.cached,
+  };
+}
+
+/**
+ * A display name for a hub model, from its `org/repo` identifier.
+ *
+ * The repo segment with separators relaxed, and nothing else. No prettifying
+ * that could imply a claim the hub did not make — the full identifier stays
+ * visible on the card beside it, because that is what gets pulled.
+ */
+export function hubModelLabel(name: string): string {
+  const repo = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+  return repo.replace(/[_-]+/g, " ").trim() || name;
+}
+
+// ── Persistence ───────────────────────────────────────────────────────────
+//
+// A catalogue survives a restart so the Models screen has something to show
+// before the network answers. It is never authoritative: every rendering of a
+// cached snapshot says so and offers a refresh, and an absence read from cache
+// is presented with its age rather than as a fact about today.
+
+export function serializeSnapshot(snapshot: HubSnapshot): string {
+  return JSON.stringify({ models: snapshot.models, checkedAt: snapshot.checkedAt });
+}
+
+/**
+ * Reads a cached catalogue back. Returns null for anything it cannot fully
+ * trust — a corrupt cache must degrade to "not checked yet", never to a
+ * half-populated list that would be read as the hub's answer.
+ */
+export function parseSnapshot(raw: string | null): HubSnapshot | null {
+  if (!raw) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const { models, checkedAt } = parsed as {
+      models?: unknown;
+      checkedAt?: unknown;
+    };
+    if (!Array.isArray(models) || typeof checkedAt !== "number") return null;
+
+    const clean: HubModel[] = [];
+    for (const m of models) {
+      if (typeof m !== "object" || m === null) return null;
+      const { name, modelType, chipsets } = m as Record<string, unknown>;
+      if (typeof name !== "string" || typeof modelType !== "string") return null;
+      if (!Array.isArray(chipsets) || chipsets.some((c) => typeof c !== "string")) {
+        return null;
+      }
+      clean.push({ name, modelType, chipsets: chipsets as string[] });
+    }
+    return { models: clean, checkedAt, cached: true };
+  } catch {
+    return null;
+  }
+}
