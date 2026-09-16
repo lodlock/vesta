@@ -956,6 +956,86 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
     }
 
     /**
+     * Which models the hub actually distributes a pre-compiled bundle for.
+     *
+     * ## Why this cannot come from listHubModels()
+     *
+     * `HubModel` carries three fields — `name`, `model_type`, `chipsets` — and
+     * `list_hub_models()` filters on the last two plus the supported runtime.
+     * It never looks at whether an asset exists. So a model with no
+     * distributable bundle is returned as compatible, Vesta offers Download,
+     * and the pull fails at the first thing `AiHubSource::plan()` does:
+     *
+     *     let release_assets_url = &entry.manifest_urls.release_assets;
+     *     if release_assets_url.is_empty() {
+     *         return Err(Error::Hub("No pre-compiled assets available … due to
+     *             licensing restrictions … manually export the model"));
+     *     }
+     *
+     * That error crosses the FFI as GENIEX_ERROR_COMMON_UNKNOWN (-100000) with
+     * the sentence dropped, which is why a real Falcon3-7B-Instruct install
+     * showed a bare code. There is no license-acceptance step to offer — the
+     * asset is not distributed at all.
+     *
+     * ## Why it CAN come from here
+     *
+     * `manifest_urls` is a field of `ManifestModelEntry` in the release
+     * manifest, and the runtime caches that manifest under OUR data directory.
+     * It is a file we may simply read — no reflection, no internal classes, no
+     * network, and no pull attempt. The emptiness of one string is the whole
+     * classification, so that is all this returns.
+     */
+    @ReactMethod
+    fun hubPullability(promise: Promise) {
+        scope.launch {
+            val out = Arguments.createMap()
+            try {
+                val manifest =
+                    File(File(reactApplicationContext.filesDir, "geniex"), "aihub/manifest.json")
+                out.putBoolean("manifestExists", manifest.isFile)
+                if (!manifest.isFile) {
+                    // Not an error: the manifest arrives with the first hub
+                    // query. "We do not know yet" is a real answer and the
+                    // caller must be able to tell it from "not distributed".
+                    out.putString("error", "no cached manifest yet")
+                    promise.resolve(out)
+                    return@launch
+                }
+
+                val root = JSONObject(manifest.readText())
+                val found = findModelsArray(root)
+                if (found == null) {
+                    out.putString("error", "no models array in the manifest")
+                    promise.resolve(out)
+                    return@launch
+                }
+                val (_, models) = found
+
+                val entries: WritableArray = Arguments.createArray()
+                for (i in 0 until models.length()) {
+                    val entry = models.optJSONObject(i) ?: continue
+                    val urls = entry.optJSONObject("manifest_urls")
+                    val releaseAssets = urls?.optString("release_assets", "") ?: ""
+                    val row = Arguments.createMap()
+                    row.putString("id", entry.optString("id", ""))
+                    row.putString("displayName", entry.optString("display_name", ""))
+                    // The rule, and nothing around it. Non-empty means the hub
+                    // publishes a bundle; empty means export it yourself.
+                    row.putBoolean("hasReleaseAssets", releaseAssets.isNotBlank())
+                    entries.pushMap(row)
+                }
+                out.putArray("models", entries)
+                out.putInt("modelCount", models.length())
+                promise.resolve(out)
+            } catch (e: Throwable) {
+                android.util.Log.w(TAG, "hubPullability failed", e)
+                out.putString("error", e.message ?: e.toString())
+                promise.resolve(out)
+            }
+        }
+    }
+
+    /**
      * Lists hub models, with the manifest's mtime and size taken immediately
      * before and after.
      *

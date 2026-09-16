@@ -54,8 +54,15 @@ import {
 } from "../models/npu-bundle";
 import { isNpuModel } from "../models/npu-compat";
 import {
+  pullabilityIndex,
+  pullabilityOf,
+  MANUAL_EXPORT_EXPLANATION,
+  type PullabilityReport,
+} from "../models/npu-pullability";
+import {
   npuPull,
   npuPullRequest,
+  npuHubPullability,
   npuLogDiagnostic,
   npuImportBundle,
   npuHubModels,
@@ -186,6 +193,23 @@ interface ModelState {
    * stays on screen.
    */
   npuInstallErrors: Record<string, string>;
+  /**
+   * Installs whose cancel has been requested but whose pull has not yet
+   * stopped.
+   *
+   * Keyed by registry row id. It exists because those are two different moments
+   * and the UI was pretending they were one: GenieX can take ~30 seconds to
+   * unwind a pull, and for all of that time the screen said "Starting
+   * download…" while the user tapped Cancel again and again.
+   */
+  npuCanceling: Record<string, true>;
+  /**
+   * Which hub models Qualcomm actually distributes a bundle for.
+   *
+   * Null until the cached manifest has been read. Absent is "unknown", never
+   * "not distributed" — see npu-pullability.ts.
+   */
+  npuPullability: PullabilityReport | null;
   /**
    * The model whose activation is running right now, or null.
    *
@@ -358,11 +382,49 @@ function failActivation(set: Setter, id: string, message: string): void {
  * level for the same reason runNpuInstall is: the store action decides whether
  * an install may start, this is the state one install has while it runs.
  */
-const installAborts = new Map<string, AbortController>();
+interface LiveInstall {
+  abort: AbortController;
+  /** Carried so a cancel can name the model without a database round trip. */
+  modelName: string;
+}
+
+const installAborts = new Map<string, LiveInstall>();
+
+/**
+ * Models whose cancel has been requested and whose pull has not yet stopped.
+ *
+ * By MODEL NAME, not row id, because that is what a second Download press
+ * would ask for. Starting a new pull for a bundle GenieX is still unwinding is
+ * how a cancel and an install end up fighting over the same `.inflight`
+ * directory, and the native side would answer the race with NPU_PULL_BUSY.
+ */
+const cancelingModels = new Set<string>();
 
 /** Cancels the wait as well as the pull. No-op for an install already gone. */
 function abortInstall(id: string): void {
-  installAborts.get(id)?.abort();
+  installAborts.get(id)?.abort.abort();
+}
+
+/** Whether a runNpuInstall is currently running for this row. */
+function installIsLive(id: string): boolean {
+  return installAborts.has(id);
+}
+
+/** The model a live install is pulling, or null when there is no live install. */
+function liveInstallModel(id: string): string | null {
+  return installAborts.get(id)?.modelName ?? null;
+}
+
+/**
+ * Clears the module-level install bookkeeping.
+ *
+ * These maps outlive a Zustand `setState`, which is the point — an install is
+ * not screen state — but it also means one test's half-finished cancel would
+ * block the next test's install. Same reason npu-ready has one.
+ */
+export function resetNpuInstallStateForTests(): void {
+  installAborts.clear();
+  cancelingModels.clear();
 }
 
 /**
@@ -523,6 +585,33 @@ async function runNpuInstall(
     return;
   }
 
+  // A cancel that has been asked for but not yet finished. Starting here would
+  // hand GenieX a pull for a bundle it is still tearing down — the native side
+  // would answer NPU_PULL_BUSY, and the user would read that as a new fault
+  // rather than as the old one still finishing.
+  // The hub lists models it does not distribute. `AiHubSource::plan()` refuses
+  // them on the first line it runs — an empty `manifest_urls.release_assets` —
+  // and the refusal reaches us as a bare rc=-100000 with the reason dropped.
+  // There is nothing to retry and nothing to accept: the asset is not
+  // published. So the download is not attempted, and the card says why.
+  if (
+    pullabilityOf(spec.modelName, pullabilityIndex(get().npuPullability)) ===
+    "manual-export"
+  ) {
+    failInstall(set, spec.errorKey, `${spec.displayName}: ${MANUAL_EXPORT_EXPLANATION}`);
+    return;
+  }
+
+  if (cancelingModels.has(spec.modelName)) {
+    failInstall(
+      set,
+      spec.errorKey,
+      `${spec.displayName} is still being canceled. The Qualcomm runtime can ` +
+        "take up to a minute to stop a download; try again once it has.",
+    );
+    return;
+  }
+
   // A placeholder row so the download is visible, cancellable and -- above
   // all -- recoverable: a process killed mid-pull leaves a row in
   // "downloading" that the user can see and cancel, rather than gigabytes in
@@ -577,7 +666,7 @@ async function runNpuInstall(
   // a no-op — and a user who has decided to stop should not sit through ten
   // seconds of countdown for a download that is already over.
   const abort = new AbortController();
-  installAborts.set(row.id, abort);
+  installAborts.set(row.id, { abort, modelName: spec.modelName });
 
   try {
     // The same request, asked again. Byte for byte the same: the identity a
@@ -657,10 +746,20 @@ async function runNpuInstall(
   } catch (err) {
     // A cancelled or failed pull leaves partial files in the SDK's cache,
     // where a later pull resumes them — and automatic retry is built on
-    // exactly that, so nothing here removes a bundle, calls remove() or calls
-    // clean(). The ROW goes, because a row pointing at an incomplete bundle is
-    // what makes a later load fail confusingly; pressing Download again starts
-    // a fresh retry cycle on top of the bytes this attempt left behind.
+    // exactly that, so a FAILURE removes no bundle, calls no remove() and
+    // calls no clean(). The ROW goes, because a row pointing at an incomplete
+    // bundle is what makes a later load fail confusingly; pressing Download
+    // again starts a fresh retry cycle on top of the bytes left behind.
+    //
+    // An explicit CANCEL is the exception, and this is the only correct place
+    // for it. The user asked for the bytes to go, but `remove()` cannot take a
+    // bundle GenieX is still writing — it blocks until the pull lets go. Doing
+    // it from the Cancel handler meant awaiting that unwind before the screen
+    // was touched at all, which is why a tap produced no visible response for
+    // thirty seconds. Here, the pull has already exited.
+    if (get().npuCanceling[row.id]) {
+      await npuRemoveBundle(spec.modelName).catch(() => {});
+    }
     await removeModel(row.id);
     await get().refresh();
     // Readable, with the runtime's own code kept on the end — see npu-errors.
@@ -679,10 +778,16 @@ async function runNpuInstall(
   } finally {
     unsubscribe();
     installAborts.delete(row.id);
+    cancelingModels.delete(spec.modelName);
     set((state) => {
       const progress = { ...state.progress };
       delete progress[row.id];
-      return { progress };
+      // Cleared only now. "Canceling" ends when the pull has actually stopped,
+      // not when the request was made — anything else is the screen claiming
+      // something it does not know.
+      const npuCanceling = { ...state.npuCanceling };
+      delete npuCanceling[row.id];
+      return { progress, npuCanceling };
     });
   }
 }
@@ -827,6 +932,8 @@ export const useModelStore = create<ModelState>((set, get) => ({
   npuCatalog: [],
   npuHub: EMPTY_HUB,
   npuInstallErrors: {},
+  npuCanceling: {},
+  npuPullability: null,
   activating: null,
   activationErrors: {},
 
@@ -871,8 +978,15 @@ export const useModelStore = create<ModelState>((set, get) => ({
       return get().npuHub;
     }
 
+    // Read in the same breath as the catalogue, because it is the same
+    // question half-answered: listHubModels() says which models fit this
+    // silicon, and the manifest says which of those the hub will actually hand
+    // over. A failure here leaves it null, which means "unknown" and changes
+    // no behaviour.
+    const pullability = await npuHubPullability();
+
     const snapshot = { models, checkedAt: Date.now(), cached: false };
-    set({ npuHub: { snapshot, error: null, checking: false } });
+    set({ npuHub: { snapshot, error: null, checking: false }, npuPullability: pullability });
     await writeHubCache(serializeSnapshot(snapshot));
     return get().npuHub;
   },
@@ -1197,23 +1311,68 @@ export const useModelStore = create<ModelState>((set, get) => ({
     }
   },
 
+  /**
+   * Asks for a download to stop, and says so at once.
+   *
+   * ## Why this used to look broken
+   *
+   * On device: tap Cancel, nothing happens, tap it four more times, and about
+   * thirty seconds later "Download canceled" appears. Two separate faults,
+   * and only one of them was GenieX's.
+   *
+   * GenieX's half: `pullJob.cancel()` cancels a Kotlin coroutine, and
+   * coroutine cancellation is cooperative. The pull is a blocking native call
+   * collecting a Flow, so the runtime unwinds at its own pace — finishing or
+   * aborting in-flight range requests, flushing `.progress`, releasing the
+   * `.lock`. Thirty seconds is that, and nothing here can make it faster.
+   *
+   * Ours: this function used to `await npuRemoveBundle(...)` — which is
+   * `ModelManagerWrapper.remove()`, and cannot take a bundle the pull still
+   * holds — BEFORE it touched a single piece of state. So the whole unwind
+   * elapsed before the screen changed, and every extra tap fired another
+   * native cancel and another remove() at a bundle mid-unwind.
+   *
+   * Now: the flag goes up synchronously, the native cancel is sent exactly
+   * once, and the teardown moved into the install's own unwind path where the
+   * pull has already exited. The screen says "Canceling…" for as long as that
+   * takes, which is the truth.
+   */
   cancelNpuInstall: async (id: string) => {
-    // The wait first, then the pull. During a backoff there is nothing for
-    // npuCancelPull() to stop, and without this the loop would sit out the
-    // countdown and then start an attempt the user had already cancelled.
+    // Idempotent by design: the button is disabled the moment this runs, but a
+    // double-tap can still land two calls, and two cancels are one cancel.
+    if (get().npuCanceling[id]) return;
+
+    if (!installIsLive(id)) {
+      // No install running for this row — a leftover "downloading" row from a
+      // process that was killed mid-pull. There is nothing to unwind, so the
+      // teardown happens here, as it always did.
+      const model = await getModelById(id);
+      if (model?.runtimeModelName) {
+        await npuRemoveBundle(model.runtimeModelName).catch(() => {});
+      }
+      if (model) await removeModel(id);
+      set((s) => {
+        const progress = { ...s.progress };
+        delete progress[id];
+        return { progress };
+      });
+      await get().refresh();
+      return;
+    }
+
+    // Synchronous, and first: this is the frame the user sees.
+    const modelName = liveInstallModel(id);
+    if (modelName) cancelingModels.add(modelName);
+    set((s) => ({ npuCanceling: { ...s.npuCanceling, [id]: true } }));
+
+    // The wait before the pull. During a retry backoff there is nothing for
+    // npuCancelPull() to stop, and without the abort the loop would sit out
+    // the countdown and then start an attempt already cancelled.
     abortInstall(id);
     npuCancelPull();
-    const model = await getModelById(id);
-    if (model?.runtimeModelName) {
-      await npuRemoveBundle(model.runtimeModelName).catch(() => {});
-    }
-    if (model) await removeModel(id);
-    set((s) => {
-      const progress = { ...s.progress };
-      delete progress[id];
-      return { progress };
-    });
-    await get().refresh();
+    // Nothing is awaited here. runNpuInstall's catch removes the bundle and
+    // the row once pullFlow has actually exited, and its finally clears the
+    // canceling flag — so the state reaches "canceled" when it is true.
   },
 
   // The NPU equivalent of Verify. It cannot appeal to an upstream digest --
@@ -1665,6 +1824,14 @@ export const useModelStore = create<ModelState>((set, get) => ({
   },
 
   cancel: async (id: string) => {
+    // Asked synchronously, before any database round trip: a live NPU install
+    // is the case where the first frame after the tap has to say "Canceling",
+    // and a read on the way there is a frame the user spends looking at a
+    // button that appears to have done nothing.
+    if (installIsLive(id)) {
+      await get().cancelNpuInstall(id);
+      return;
+    }
     const model = await getModelById(id);
     // An NPU install is not an HTTP download task and has no file of its own to
     // unlink; it is cancelled through the runtime that started it.

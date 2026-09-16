@@ -16,7 +16,7 @@
 // These cases cannot tell us what -100000 means. They can rule the wrapper out,
 // which is worth doing first and cheaply.
 
-import { useModelStore } from "../model-store";
+import { useModelStore, resetNpuInstallStateForTests } from "../model-store";
 import { npuPull, npuPullRequest, npuCancelPull } from "../../native/npu";
 import { getConfig } from "../../storage/database";
 import { getPullTrace, resetPullTrace } from "../../models/npu-pull-trace";
@@ -149,6 +149,7 @@ const install = () => useModelStore.getState().installHubModel(HUB_ROW);
 
 beforeEach(() => {
   jest.clearAllMocks();
+  resetNpuInstallStateForTests();
   resetPullTrace();
   mockConfig.mockResolvedValue(null); // auto-retry on, cap 3 — the defaults
   useModelStore.setState({
@@ -156,6 +157,7 @@ beforeEach(() => {
     busy: false,
     installed: [],
     npuInstallErrors: {},
+    npuCanceling: {},
     progress: {},
     npu: { inBuild: true, available: true, soc: "SM8850" } as never,
   });

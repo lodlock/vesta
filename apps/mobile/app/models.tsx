@@ -35,6 +35,14 @@ import type {
   RetryState,
 } from "../lib/models/types";
 import { describeRetry } from "../lib/models/download-retry";
+import {
+  pullabilityIndex,
+  pullabilityOf,
+  countPullability,
+  describePullabilityCounts,
+  MANUAL_EXPORT_LABEL,
+  MANUAL_EXPORT_EXPLANATION,
+} from "../lib/models/npu-pullability";
 import { formatBytes, formatDuration, percent, fitLabel, type FitLabel } from "../lib/models/format";
 import { canActivate, canVerify } from "../lib/models/activation";
 import { colors, spacing, radii, typography } from "../lib/theme";
@@ -306,6 +314,37 @@ function fitStyle(level: FitLabel["level"]) {
 }
 
 /**
+ * The one control that stops a download, and the one place that says a stop has
+ * been ASKED FOR but not yet finished.
+ *
+ * Those are two different moments and the screen used to show only the first
+ * one — which is to say, neither. On device: tap Cancel, nothing changes, tap
+ * it four more times, and about thirty seconds later "Download canceled"
+ * appears. GenieX unwinds a pull at its own pace and cannot be hurried; what it
+ * cannot do is stay silent about it.
+ *
+ * Reads `npuCanceling` from the store rather than taking a prop, for the same
+ * reason ActivateControl reads `activating`: every card that can start a
+ * download can cancel one, and a flag threaded through four call sites is four
+ * chances to forget it.
+ */
+function CancelControl({ id, onCancel }: { id: string; onCancel: (id: string) => void }) {
+  const canceling = useModelStore((s) => s.npuCanceling[id] === true);
+  return (
+    <TouchableOpacity
+      style={[styles.btn, styles.btnOutline, canceling && styles.btnDisabled]}
+      onPress={() => onCancel(id)}
+      disabled={canceling}
+      activeOpacity={0.7}
+    >
+      <Text style={styles.btnOutlineText}>
+        {canceling ? "Canceling…" : "Cancel"}
+      </Text>
+    </TouchableOpacity>
+  );
+}
+
+/**
  * Download progress, or — while an automatic retry is waiting — the retry
  * instead of it.
  *
@@ -321,12 +360,31 @@ function ProgressBar({
   total,
   etaSeconds,
   retry,
+  rowId,
 }: {
   written: number;
   total: number;
   etaSeconds: number | null;
   retry?: RetryState;
+  /** The registry row, so this can ask the store whether it is being canceled. */
+  rowId?: string;
 }) {
+  // Read here rather than threaded through four call sites, same reasoning as
+  // CancelControl. A `useModelStore` selector with no row id is a constant.
+  const canceling = useModelStore((s) => (rowId ? s.npuCanceling[rowId] === true : false));
+  if (canceling) {
+    // No bar, and no byte count. Nothing is being written any more, and a bar
+    // sitting still is exactly what made the first tap look ignored.
+    return (
+      <View style={styles.progressContainer}>
+        <Text style={styles.retryText}>Canceling…</Text>
+        <Text style={styles.retryReason}>
+          Waiting for the Qualcomm runtime to stop the download. This can take
+          up to a minute.
+        </Text>
+      </View>
+    );
+  }
   if (retry) {
     return (
       <View style={styles.progressContainer}>
@@ -479,6 +537,7 @@ function CatalogRow({
           total={prog.bytesTotal}
           etaSeconds={prog.etaSeconds}
           retry={prog.retry}
+          rowId={installed?.id}
         />
       )}
 
@@ -489,9 +548,7 @@ function CatalogRow({
           </TouchableOpacity>
         )}
         {downloading && installed && (
-          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onCancel(installed.id)} activeOpacity={0.7}>
-            <Text style={styles.btnOutlineText}>Cancel</Text>
-          </TouchableOpacity>
+          <CancelControl id={installed.id} onCancel={onCancel} />
         )}
         {installed && <ActivateControl model={installed} onActivate={onActivate} />}
         {installed && !downloading && !loading && canVerify(installed) && (
@@ -562,9 +619,7 @@ function InstalledRow({
 
       <View style={styles.btnRow}>
         {downloading && (
-          <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onCancel(model.id)} activeOpacity={0.7}>
-            <Text style={styles.btnOutlineText}>Cancel</Text>
-          </TouchableOpacity>
+          <CancelControl id={model.id} onCancel={onCancel} />
         )}
         <ActivateControl model={model} onActivate={onActivate} />
         {!downloading && !loading && canVerify(model) && (
@@ -732,6 +787,7 @@ function NpuSection({
                   total={prog.bytesTotal}
                   etaSeconds={prog.etaSeconds}
                   retry={prog.retry}
+                  rowId={row?.id}
                 />
               )}
               {downloading && !prog && (
@@ -786,13 +842,7 @@ function NpuSection({
                 )}
                 {row && downloading && (
 
-                  <TouchableOpacity
-                    style={[styles.btn, styles.btnOutline]}
-                    onPress={() => onCancel(row.id)}
-                    activeOpacity={0.7}
-                  >
-                    <Text style={styles.btnOutlineText}>Cancel</Text>
-                  </TouchableOpacity>
+                  <CancelControl id={row.id} onCancel={onCancel} />
                 )}
                 {row && <ActivateControl model={row} onActivate={onActivate} />}
                 {row && !downloading && !loading && canVerify(row) && (
@@ -869,6 +919,12 @@ function HubCatalogSection({
     () => (snapshot ? breakDownHubModels(snapshot.models, soc, chipsets) : null),
     [snapshot, soc, chipsets],
   );
+  // Which of those the hub will actually hand over. Null until the cached
+  // manifest has been read, and null means "unknown" — every card then behaves
+  // exactly as it did before, rather than being declared undownloadable on no
+  // evidence. See npu-pullability.ts.
+  const pullReport = useModelStore((s) => s.npuPullability);
+  const pullIndex = useMemo(() => pullabilityIndex(pullReport), [pullReport]);
 
   return (
     <>
@@ -885,15 +941,29 @@ function HubCatalogSection({
         </View>
 
         {snapshot && breakdown && (
-          <Text style={styles.rowHint}>
-            {breakdown.compatible.length} compatible with {soc ?? "this chipset"}
-            {breakdown.otherChipsets > 0
-              ? ` · ${breakdown.otherChipsets} for other chipsets`
-              : ""}
-            {breakdown.unsupportedType > 0
-              ? ` · ${breakdown.unsupportedType} unsupported type`
-              : ""}
-          </Text>
+          <>
+            <Text style={styles.rowHint}>
+              {breakdown.compatible.length} compatible with {soc ?? "this chipset"}
+              {breakdown.otherChipsets > 0
+                ? ` · ${breakdown.otherChipsets} for other chipsets`
+                : ""}
+              {breakdown.unsupportedType > 0
+                ? ` · ${breakdown.unsupportedType} unsupported type`
+                : ""}
+            </Text>
+            {/* "14 compatible" alone was a claim this screen could not support:
+                four of those fourteen cannot be downloaded by anybody, because
+                Qualcomm publishes no bundle for them. Split out rather than
+                folded in, and only when the manifest has actually been read. */}
+            <Text style={styles.rowHint}>
+              {describePullabilityCounts(
+                countPullability(
+                  breakdown.compatible.map((c) => c.entry.name),
+                  pullIndex,
+                ),
+              )}
+            </Text>
+          </>
         )}
 
         {/* The age of the answer, always. "Not listed" is a claim about a
@@ -983,14 +1053,28 @@ function HubCatalogSection({
                 total={prog.bytesTotal}
                 etaSeconds={prog.etaSeconds}
                 retry={prog.retry}
+                rowId={row?.id}
               />
             )}
             {downloading && !prog && (
               <Text style={styles.rowHint}>Starting download…</Text>
             )}
 
+            {/* Not hidden. It is compatible, the user may export it
+                themselves, and Import bundle is right there. It just cannot be
+                downloaded from here, and saying so beats an Install button
+                that can only fail. */}
+            {!row && pullabilityOf(m.entry.name, pullIndex) === "manual-export" && (
+              <Text style={styles.rowHint}>{MANUAL_EXPORT_EXPLANATION}</Text>
+            )}
+
             <View style={styles.btnRow}>
-              {!row && (
+              {!row && pullabilityOf(m.entry.name, pullIndex) === "manual-export" && (
+                <View style={[styles.btn, styles.btnDisabledSolid]}>
+                  <Text style={styles.btnDisabledText}>{MANUAL_EXPORT_LABEL}</Text>
+                </View>
+              )}
+              {!row && pullabilityOf(m.entry.name, pullIndex) !== "manual-export" && (
                 <TouchableOpacity
                   style={[styles.btn, styles.btnPrimary]}
                   onPress={() => onInstall(m)}
@@ -1000,13 +1084,7 @@ function HubCatalogSection({
                 </TouchableOpacity>
               )}
               {row && downloading && (
-                <TouchableOpacity
-                  style={[styles.btn, styles.btnOutline]}
-                  onPress={() => onCancel(row.id)}
-                  activeOpacity={0.7}
-                >
-                  <Text style={styles.btnOutlineText}>Cancel</Text>
-                </TouchableOpacity>
+                <CancelControl id={row.id} onCancel={onCancel} />
               )}
               {/* Activation is always the user's explicit choice. Nothing here
                   promotes a hub model over the one they are already using. */}
@@ -1139,6 +1217,13 @@ const styles = StyleSheet.create({
   btnPrimaryText: { color: "#fff", ...typography.button },
   btnOutline: { backgroundColor: "transparent", borderWidth: 1, borderColor: colors.accent },
   btnOutlineText: { color: colors.accent, ...typography.button },
+  // A cancel already asked for. Dimmed and inert rather than gone: the button
+  // disappearing would read as "it worked", and it has not finished yet.
+  btnDisabled: { opacity: 0.5 },
+  // Not a button. A model with no published bundle has nothing to press, and a
+  // greyed-out TouchableOpacity invites the press anyway.
+  btnDisabledSolid: { backgroundColor: colors.borderLight },
+  btnDisabledText: { color: colors.textMuted, ...typography.button },
   btnGhost: { backgroundColor: "transparent", borderWidth: 1, borderColor: colors.error },
   btnGhostText: { color: colors.error, ...typography.button },
   // The activation in progress: the spinner sits beside the label, so the

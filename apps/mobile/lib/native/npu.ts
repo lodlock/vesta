@@ -13,6 +13,7 @@
 import { NativeEventEmitter, NativeModules, Platform } from "react-native";
 
 import { aiHubDisplayName } from "../models/npu-hub";
+import type { PullabilityReport } from "../models/npu-pullability";
 
 const Npu = NativeModules.VestaNpuModule as NpuNativeModule | undefined;
 
@@ -23,6 +24,7 @@ interface NpuNativeModule {
   pull(configJson: string): Promise<NpuBundleInfo>;
   importBundle(configJson: string): Promise<NpuBundleInfo>;
   hubModels(chipset: string | null): Promise<NpuHubModelsResult>;
+  hubPullability(): Promise<PullabilityReport>;
   resolveModelAlias(modelName: string): Promise<string | null>;
   logDiagnostic(message: string): void;
   hubCacheReport(configJson: string): Promise<NpuHubCacheReport>;
@@ -605,6 +607,27 @@ export async function npuHubModels(
   if (!moduleAvailable()) return null;
   try {
     return await Npu!.hubModels(chipset);
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Which hub models Qualcomm actually distributes a bundle for.
+ *
+ * Read out of the cached release manifest in our own data directory — no
+ * network, no pull attempt, no internal SDK class. `listHubModels()` cannot
+ * answer this: it filters on runtime and chipset only, so it returns models
+ * whose `manifest_urls.release_assets` is empty and which no pull can ever
+ * fetch. See npu-pullability.ts for the rule and where it comes from.
+ *
+ * Null when there is no bridge; a report with no models when the manifest has
+ * not been fetched yet. Both mean "unknown", never "not distributed".
+ */
+export async function npuHubPullability(): Promise<PullabilityReport | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.hubPullability();
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }

@@ -14,7 +14,7 @@
 //   - Cancel works during the wait, not only during a transfer
 //   - two pullFlows can never overlap
 
-import { useModelStore } from "../model-store";
+import { useModelStore, resetNpuInstallStateForTests } from "../model-store";
 import { npuPull, npuRemoveBundle, npuCancelPull } from "../../native/npu";
 import { removeModel } from "../../models/model-registry";
 import { getConfig } from "../../storage/database";
@@ -178,6 +178,7 @@ async function settle<T>(promise: Promise<T>): Promise<T> {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  resetNpuInstallStateForTests();
   jest.useFakeTimers();
   mockConfig.mockResolvedValue(null); // defaults: auto-retry on, cap 3
   useModelStore.setState({
@@ -185,6 +186,8 @@ beforeEach(() => {
     busy: false,
     installed: [],
     npuInstallErrors: {},
+    npuCanceling: {},
+    npuPullability: null,
     progress: {},
     npu: { inBuild: true, available: true, soc: "SM8850" } as never,
   });
