@@ -313,6 +313,69 @@ function ProgressBar({ written, total, etaSeconds }: { written: number; total: n
   );
 }
 
+/**
+ * The one control that starts a model activation, and the one place that says
+ * what an activation is doing.
+ *
+ * It reads `activating` from the store rather than taking it as a prop, and
+ * that is the point rather than a shortcut: the load belongs to the store, not
+ * to this screen. A card unmounted mid-load — the user leaves Models and comes
+ * back during the ~14 s a QAIRT session takes to build — re-renders straight
+ * back into "Loading model…", because none of the pending state was ever held
+ * in a component.
+ */
+function ActivateControl({
+  model,
+  onActivate,
+}: {
+  model: InstalledModel;
+  onActivate: (id: string) => void;
+}) {
+  const activating = useModelStore((s) => s.activating);
+
+  // This model is loading. Its own state is the only thing worth saying, even
+  // on a row that is already active.
+  if (activating === model.id) {
+    return (
+      <View style={[styles.btn, styles.btnPrimary, styles.btnBusy]}>
+        <ActivityIndicator size="small" color="#fff" />
+        {/* A spinner, never a percentage. GenieX reports no progress at all
+            while it creates a model, so a bar here would be a number Vesta
+            made up — and a made-up bar that sits still reads as a hang. */}
+        <Text style={styles.btnPrimaryText}>Loading model…</Text>
+      </View>
+    );
+  }
+  if (model.isActive) {
+    return (
+      <View style={[styles.btn, styles.btnActive]}>
+        <Text style={styles.btnActiveText}>● Active</Text>
+      </View>
+    );
+  }
+  if (!canActivate(model).ok) return null;
+  // Another model is loading: the store would refuse this tap anyway, so the
+  // button says so before it is pressed instead of after.
+  const blocked = activating !== null;
+  return (
+    <TouchableOpacity
+      style={[styles.btn, styles.btnPrimary, blocked && styles.btnBlocked]}
+      onPress={() => onActivate(model.id)}
+      disabled={blocked}
+      activeOpacity={0.7}
+    >
+      <Text style={styles.btnPrimaryText}>Use this model</Text>
+    </TouchableOpacity>
+  );
+}
+
+/** Why the last activation of this row failed, in the backend's own words. */
+function ActivationError({ modelId }: { modelId: string }) {
+  const message = useModelStore((s) => s.activationErrors[modelId]);
+  if (!message) return null;
+  return <Text style={styles.rowError}>{message}</Text>;
+}
+
 function CatalogRow({
   model,
   installed,
@@ -337,6 +400,9 @@ function CatalogRow({
   const prog = installed ? progress[installed.id] : undefined;
   const downloading = prog?.status === "downloading";
   const activation = installed ? canActivate(installed) : null;
+  // Verify and Delete both move or re-read the file a load is using. They go
+  // away for as long as that load is running rather than failing underneath it.
+  const loading = useModelStore((s) => s.activating) === installed?.id;
 
   return (
     <View style={[styles.card, installed?.isActive && styles.cardActive]}>
@@ -365,6 +431,7 @@ function CatalogRow({
       {installed && !downloading && activation && !activation.ok && (
         <Text style={styles.rowError}>{activation.message}</Text>
       )}
+      {installed && <ActivationError modelId={installed.id} />}
 
       {downloading && prog && (
         <ProgressBar written={prog.bytesWritten} total={prog.bytesTotal} etaSeconds={prog.etaSeconds} />
@@ -381,22 +448,13 @@ function CatalogRow({
             <Text style={styles.btnOutlineText}>Cancel</Text>
           </TouchableOpacity>
         )}
-        {installed && activation?.ok && !installed.isActive && (
-          <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={() => onActivate(installed.id)} activeOpacity={0.7}>
-            <Text style={styles.btnPrimaryText}>Use this model</Text>
-          </TouchableOpacity>
-        )}
-        {installed && !downloading && canVerify(installed) && (
+        {installed && <ActivateControl model={installed} onActivate={onActivate} />}
+        {installed && !downloading && !loading && canVerify(installed) && (
           <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(installed)} activeOpacity={0.7}>
             <Text style={styles.btnOutlineText}>Verify</Text>
           </TouchableOpacity>
         )}
-        {installed?.isActive && (
-          <View style={[styles.btn, styles.btnActive]}>
-            <Text style={styles.btnActiveText}>● Active</Text>
-          </View>
-        )}
-        {installed && !downloading && (
+        {installed && !downloading && !loading && (
           <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={() => onRemove(installed)} activeOpacity={0.7}>
             <Text style={styles.btnGhostText}>Delete</Text>
           </TouchableOpacity>
@@ -434,6 +492,7 @@ function InstalledRow({
 }) {
   const downloading = progress?.status === "downloading";
   const activation = canActivate(model);
+  const loading = useModelStore((s) => s.activating) === model.id;
   return (
     <View style={[styles.card, model.isActive && styles.cardActive]}>
       <View style={styles.rowHeader}>
@@ -445,6 +504,7 @@ function InstalledRow({
       {!downloading && !activation.ok && (
         <Text style={styles.rowError}>{activation.message}</Text>
       )}
+      <ActivationError modelId={model.id} />
 
       {downloading && progress && (
         <ProgressBar written={progress.bytesWritten} total={progress.bytesTotal} etaSeconds={progress.etaSeconds} />
@@ -456,22 +516,13 @@ function InstalledRow({
             <Text style={styles.btnOutlineText}>Cancel</Text>
           </TouchableOpacity>
         )}
-        {activation.ok && !model.isActive && (
-          <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={() => onActivate(model.id)} activeOpacity={0.7}>
-            <Text style={styles.btnPrimaryText}>Use this model</Text>
-          </TouchableOpacity>
-        )}
-        {model.isActive && (
-          <View style={[styles.btn, styles.btnActive]}>
-            <Text style={styles.btnActiveText}>● Active</Text>
-          </View>
-        )}
-        {!downloading && canVerify(model) && (
+        <ActivateControl model={model} onActivate={onActivate} />
+        {!downloading && !loading && canVerify(model) && (
           <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => onVerify(model)} activeOpacity={0.7}>
             <Text style={styles.btnOutlineText}>Verify</Text>
           </TouchableOpacity>
         )}
-        {!downloading && (
+        {!downloading && !loading && (
           <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={() => onRemove(model)} activeOpacity={0.7}>
             <Text style={styles.btnGhostText}>Delete</Text>
           </TouchableOpacity>
@@ -523,6 +574,9 @@ function NpuSection({
   onRemove: (m: InstalledModel) => void;
   onVerify: (m: InstalledModel) => void;
 }) {
+  // Read once for the whole section: the rows below are a map(), not
+  // components, so they cannot take the hook themselves.
+  const activating = useModelStore((s) => s.activating);
   if (!npu.inBuild) return null;
 
   return (
@@ -566,6 +620,7 @@ function NpuSection({
           const prog = row ? progress[row.id] : undefined;
           const downloading = prog?.status === "downloading" || row?.state === "downloading";
           const activation = row ? canActivate(row) : null;
+          const loading = activating === row?.id;
           return (
             <View key={m.id} style={[styles.card, row?.isActive && styles.cardActive]}>
               <View style={styles.rowHeader}>
@@ -601,6 +656,7 @@ function NpuSection({
               {row && !downloading && activation && !activation.ok && (
                 <Text style={styles.rowError}>{activation.message}</Text>
               )}
+              {row && <ActivationError modelId={row.id} />}
 
               {/* The hub's verdict on THIS model, in words. `absent` carries a
                   timestamp because it is a claim about a moment, never about
@@ -687,21 +743,8 @@ function NpuSection({
                     <Text style={styles.btnOutlineText}>Cancel</Text>
                   </TouchableOpacity>
                 )}
-                {row && activation?.ok && !row.isActive && (
-                  <TouchableOpacity
-                    style={[styles.btn, styles.btnPrimary]}
-                    onPress={() => onActivate(row.id)}
-                    activeOpacity={0.7}
-                  >
-                    <Text style={styles.btnPrimaryText}>Use this model</Text>
-                  </TouchableOpacity>
-                )}
-                {row?.isActive && (
-                  <View style={[styles.btn, styles.btnActive]}>
-                    <Text style={styles.btnActiveText}>● Active</Text>
-                  </View>
-                )}
-                {row && !downloading && canVerify(row) && (
+                {row && <ActivateControl model={row} onActivate={onActivate} />}
+                {row && !downloading && !loading && canVerify(row) && (
                   <TouchableOpacity
                     style={[styles.btn, styles.btnOutline]}
                     onPress={() => onVerify(row)}
@@ -710,7 +753,7 @@ function NpuSection({
                     <Text style={styles.btnOutlineText}>Verify</Text>
                   </TouchableOpacity>
                 )}
-                {row && !downloading && (
+                {row && !downloading && !loading && (
                   <TouchableOpacity
                     style={[styles.btn, styles.btnGhost]}
                     onPress={() => onRemove(row)}
@@ -769,6 +812,7 @@ function HubCatalogSection({
   onCancel: (id: string) => void;
   onRemove: (m: InstalledModel) => void;
 }) {
+  const activating = useModelStore((s) => s.activating);
   const snapshot = hub.snapshot;
   const breakdown = useMemo(
     () => (snapshot ? breakDownHubModels(snapshot.models, soc, chipsets) : null),
@@ -845,6 +889,7 @@ function HubCatalogSection({
         const downloading =
           prog?.status === "downloading" || row?.state === "downloading";
         const activation = row ? canActivate(row) : null;
+        const loading = activating === row?.id;
         const error = errors[m.entry.name];
         return (
           <View
@@ -879,6 +924,7 @@ function HubCatalogSection({
             {row && !downloading && activation && !activation.ok && (
               <Text style={styles.rowError}>{activation.message}</Text>
             )}
+            {row && <ActivationError modelId={row.id} />}
 
             {downloading && prog && (
               <ProgressBar
@@ -912,21 +958,8 @@ function HubCatalogSection({
               )}
               {/* Activation is always the user's explicit choice. Nothing here
                   promotes a hub model over the one they are already using. */}
-              {row && activation?.ok && !row.isActive && (
-                <TouchableOpacity
-                  style={[styles.btn, styles.btnPrimary]}
-                  onPress={() => onActivate(row.id)}
-                  activeOpacity={0.7}
-                >
-                  <Text style={styles.btnPrimaryText}>Use this model</Text>
-                </TouchableOpacity>
-              )}
-              {row?.isActive && (
-                <View style={[styles.btn, styles.btnActive]}>
-                  <Text style={styles.btnActiveText}>● Active</Text>
-                </View>
-              )}
-              {row && !downloading && (
+              {row && <ActivateControl model={row} onActivate={onActivate} />}
+              {row && !downloading && !loading && (
                 <TouchableOpacity
                   style={[styles.btn, styles.btnGhost]}
                   onPress={() => onRemove(row)}
@@ -1056,6 +1089,11 @@ const styles = StyleSheet.create({
   btnOutlineText: { color: colors.accent, ...typography.button },
   btnGhost: { backgroundColor: "transparent", borderWidth: 1, borderColor: colors.error },
   btnGhostText: { color: colors.error, ...typography.button },
+  // The activation in progress: the spinner sits beside the label, so the
+  // button keeps its shape and the row does not reflow on every tap.
+  btnBusy: { flexDirection: "row", alignItems: "center", gap: 8 },
+  // An activation this row could start, but not while another one is running.
+  btnBlocked: { opacity: 0.45 },
   btnActive: { backgroundColor: colors.successBg },
   btnActiveText: { color: colors.success, ...typography.button },
   progressContainer: { marginTop: 14 },

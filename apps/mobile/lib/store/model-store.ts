@@ -86,6 +86,30 @@ import { useChatStore } from "./chat-store";
 // downloads can't both fire a (multi-GB) load (H1 TOCTOU).
 let autoActivateInFlight = false;
 
+/**
+ * The activation that is running, and the promise every later caller joins.
+ *
+ * Module-level rather than store state because a promise is not renderable and
+ * must not be: `activating` is what the screen reads, this is what the code
+ * awaits. The two are set and cleared together.
+ *
+ * Why it exists at all. The engine's own lock (llm-engine.withLock) already
+ * stopped two native sessions from being created at once, so repeated taps
+ * never built two LlmWrappers. What it did NOT stop is everything activate()
+ * does AROUND the load — the registry read, the bundle probe, warmSessionCache,
+ * setActiveModel, refresh — none of which is under that lock. Two activations
+ * of different models therefore race to write `is_active`, and the one that
+ * loses the load can win the write, leaving the registry naming a model the
+ * engine is not running. Single-flight here removes the window instead of
+ * papering over it downstream.
+ */
+let inFlightActivation: { id: string; promise: Promise<void> } | null = null;
+
+/** Exposed for tests: the activation currently running, by model id. */
+export function activationInFlight(): string | null {
+  return inFlightActivation?.id ?? null;
+}
+
 // Pure: choose which file in a repo to download. Exact filename wins, then a
 // filename containing the desired quant, then the first GGUF.
 export function pickFile(
@@ -146,6 +170,25 @@ interface ModelState {
    * stays on screen.
    */
   npuInstallErrors: Record<string, string>;
+  /**
+   * The model whose activation is running right now, or null.
+   *
+   * The Models screen draws its whole pending state from this one field, and
+   * the field lives here rather than in the screen because the load does: a
+   * QAIRT session takes ~14 s to create, which is long enough for the user to
+   * leave the screen, and a `useState` on the card would have unmounted with
+   * it. Coming back re-renders the same truth.
+   */
+  activating: string | null;
+  /**
+   * The last activation failure, per model id.
+   *
+   * Keyed, like npuInstallErrors and for the same reason: the message belongs
+   * to the row it is about. The global `error` banner still gets a copy —
+   * reloadActive() reads it to decide whether a perf change took — but the
+   * banner alone could not say WHICH card failed.
+   */
+  activationErrors: Record<string, string>;
 
   refresh: () => Promise<void>;
   loadNpuHub: (force?: boolean) => Promise<HubState>;
@@ -269,6 +312,22 @@ interface NpuInstallSpec {
  */
 function failInstall(set: Setter, key: string, message: string): void {
   set((s) => ({ npuInstallErrors: { ...s.npuInstallErrors, [key]: message } }));
+}
+
+/**
+ * Records an activation failure, on the row it belongs to and in the banner.
+ *
+ * The message is whatever the layer below actually said — the backend's
+ * refusal, GenieX's own words for why it could not create the session. It is
+ * never replaced with a generic one: "could not load the model" is not a thing
+ * anyone can act on, and the native message is the only description of the
+ * failure that exists.
+ */
+function failActivation(set: Setter, id: string, message: string): void {
+  set((s) => ({
+    activationErrors: { ...s.activationErrors, [id]: message },
+    error: message,
+  }));
 }
 
 async function runNpuInstall(
@@ -439,6 +498,126 @@ async function runNpuInstall(
   }
 }
 
+/**
+ * One activation, start to finish: the checks, the load, and the registry write
+ * that records it.
+ *
+ * Module-level rather than a store action for the same reason runNpuInstall is:
+ * the action decides WHETHER an activation may start, this is the single
+ * definition of what one does. It never throws — every failure is reported as
+ * state — which is what lets the single-flight wrapper clear itself in one
+ * place whatever happened.
+ */
+async function runActivation(
+  set: Setter,
+  get: Getter,
+  id: string,
+): Promise<void> {
+  // Set before the first await, so the card changes in the same frame as the
+  // tap. This is the whole of the reported bug: ~14 s of a button that looked
+  // dead is what made the user press it again.
+  set((s) => {
+    const errors = { ...s.activationErrors };
+    delete errors[id];
+    return { activating: id, error: null, activationErrors: errors };
+  });
+  const model = await getModelById(id);
+  if (!model) {
+    failActivation(set, id, "Model is not ready.");
+    return;
+  }
+  // The SAME check the Models screen draws its buttons from, so a row that
+  // looks selectable is selectable and a row that isn't says why. Note what
+  // it does not consider: trust. An unverified model is labelled, not
+  // blocked — blocking here while the UI didn't would be a second, invisible
+  // policy.
+  const check = canActivate(model);
+  if (!check.ok) {
+    failActivation(set, id, check.message);
+    return;
+  }
+  const npuModel = isNpuModel(model);
+
+  // A bundle is a DIRECTORY the GenieX model manager owns, so the single-file
+  // checks below do not describe it. Its equivalents are the structural check
+  // (metadata.json + shards + tokenizer, all non-empty) and the recorded
+  // per-file sizes, both of which Verify runs — asking the manager whether it
+  // still resolves the name is the cheap gate that belongs on every load.
+  if (npuModel) {
+    const stillThere = model.runtimeModelName
+      ? await npuBundleInfo(model.runtimeModelName)
+      : null;
+    if (!stillThere) {
+      await setModelState(id, "error");
+      await get().refresh();
+      failActivation(
+        set,
+        id,
+        `${model.displayName}: the bundle is gone — reinstall it.`,
+      );
+      return;
+    }
+  } else {
+    const info = await FileSystem.getInfoAsync(model.filePath);
+    if (!info.exists) {
+      await setModelState(id, "error");
+      await get().refresh();
+      failActivation(set, id, "Model file is missing — re-download it.");
+      return;
+    }
+    // Cheap integrity gate on every load: the size must still be the size we
+    // recorded. Re-hashing a multi-GB file here would add seconds to every cold
+    // start, so the full check lives in verifyIntegrity(); this catches the
+    // common case (a file replaced or truncated under us) for free.
+    if (model.sizeBytes > 0 && (info.size ?? 0) !== model.sizeBytes) {
+      await setModelState(id, "error");
+      await get().refresh();
+      failActivation(
+        set,
+        id,
+        `${model.displayName} changed on disk (${info.size ?? 0} bytes, expected ${model.sizeBytes}). Tap Verify to check it against its source.`,
+      );
+      return;
+    }
+  }
+  try {
+    const perf = perfToLlmOptions(await getPerfSettings());
+    await loadModel(model.filePath, {
+      ...perf,
+      contextSize: model.contextSize,
+      gpuLayers: 0,
+      chatTemplate: model.chatTemplate ?? undefined,
+      // What tells the engine WHICH runtime this row belongs to. Without it
+      // the engine does what it always did and loads a GGUF on llama.cpp,
+      // which is right for every caller that has only a path.
+      backendModel: backendModelRef({
+        filePath: model.filePath,
+        artifact: model.artifact,
+        contextSize: model.contextSize,
+        displayName: model.displayName,
+        chatTemplate: model.chatTemplate,
+        targetSoc: model.targetSoc,
+        runtimeVersion: model.runtimeVersion,
+        quant: model.quant,
+        tokenizerPath: model.tokenizerPath,
+        runtimeModelName: model.runtimeModelName,
+      }),
+    });
+    // Same as the app-start path (chat-store.init): restore this model's
+    // persisted prefix KV before any completion. Switching back to a model
+    // whose session file is on disk skips the ~30s cold prefill. A no-op on
+    // the Qualcomm path, which has no KV state to restore.
+    await warmSessionCache();
+    await setActiveModel(id);
+    await get().refresh();
+  } catch (err) {
+    // Whatever the backend or GenieX actually said, kept verbatim. The
+    // installed model is left exactly where it is: a session that could not
+    // be created says nothing about the bytes on disk.
+    failActivation(set, id, err instanceof Error ? err.message : String(err));
+  }
+}
+
 export const useModelStore = create<ModelState>((set, get) => ({
   installed: [],
   progress: {},
@@ -459,6 +638,8 @@ export const useModelStore = create<ModelState>((set, get) => ({
   npuCatalog: [],
   npuHub: EMPTY_HUB,
   npuInstallErrors: {},
+  activating: null,
+  activationErrors: {},
 
   /**
    * Asks GenieX for the hub's own catalogue.
@@ -1182,102 +1363,61 @@ export const useModelStore = create<ModelState>((set, get) => ({
   },
 
   activate: async (id: string) => {
-    set({ error: null });
-    const model = await getModelById(id);
-    if (!model) {
-      set({ error: "Model is not ready." });
+    // Already active AND actually resident: the tap has nothing to do.
+    // Deliberately synchronous, read from store state before anything awaits,
+    // so a card that is already Active never flashes "Loading model…" on its
+    // way to finding that out. Tearing down a warm QAIRT session and building
+    // an identical one costs the user 14 s to arrive where they already were,
+    // and the ~6 ms warm reuse in the diagnostics is exactly what that would
+    // throw away.
+    const known = get().installed.find((m) => m.id === id);
+    const engine = getModelInfo();
+    if (known?.isActive && engine.loaded && engine.path === known.filePath) {
       return;
     }
-    // The SAME check the Models screen draws its buttons from, so a row that
-    // looks selectable is selectable and a row that isn't says why. Note what
-    // it does not consider: trust. An unverified model is labelled, not
-    // blocked — blocking here while the UI didn't would be a second, invisible
-    // policy.
-    const check = canActivate(model);
-    if (!check.ok) {
-      set({ error: check.message });
-      return;
-    }
-    const npuModel = isNpuModel(model);
 
-    // A bundle is a DIRECTORY the GenieX model manager owns, so the single-file
-    // checks below do not describe it. Its equivalents are the structural check
-    // (metadata.json + shards + tokenizer, all non-empty) and the recorded
-    // per-file sizes, both of which Verify runs — asking the manager whether it
-    // still resolves the name is the cheap gate that belongs on every load.
-    if (npuModel) {
-      const stillThere = model.runtimeModelName
-        ? await npuBundleInfo(model.runtimeModelName)
-        : null;
-      if (!stillThere) {
-        await setModelState(id, "error");
-        await get().refresh();
-        set({ error: `${model.displayName}: the bundle is gone — reinstall it.` });
-        return;
-      }
-    } else {
-      const info = await FileSystem.getInfoAsync(model.filePath);
-      if (!info.exists) {
-        await setModelState(id, "error");
-        await get().refresh();
-        set({ error: "Model file is missing — re-download it." });
-        return;
-      }
-      // Cheap integrity gate on every load: the size must still be the size we
-      // recorded. Re-hashing a multi-GB file here would add seconds to every cold
-      // start, so the full check lives in verifyIntegrity(); this catches the
-      // common case (a file replaced or truncated under us) for free.
-      if (model.sizeBytes > 0 && (info.size ?? 0) !== model.sizeBytes) {
-        await setModelState(id, "error");
-        await get().refresh();
-        set({
-          error: `${model.displayName} changed on disk (${info.size ?? 0} bytes, expected ${model.sizeBytes}). Tap Verify to check it against its source.`,
-        });
-        return;
-      }
+    // The second tap on the card that is already loading. Join the load that is
+    // running rather than start another: awaiting activate() has to mean "this
+    // model is now active", and a caller told that early (remove(),
+    // reloadActive()) would act on a model still ten seconds away.
+    if (inFlightActivation?.id === id) return inFlightActivation.promise;
+
+    // A DIFFERENT model while one is loading. Refused, not queued: the load in
+    // flight owns the single runtime slot for the next ~14 s, and a queue would
+    // only mean waiting 28 s for a model that was asked for once. Refusing says
+    // so on the row — it is never a silent no-op.
+    if (inFlightActivation) {
+      const pendingId = inFlightActivation.id;
+      const other =
+        get().installed.find((m) => m.id === pendingId)?.displayName ??
+        "another model";
+      failActivation(
+        set,
+        id,
+        `Still loading ${other}. Wait for it to finish, then try again.`,
+      );
+      return;
     }
-    try {
-      const perf = perfToLlmOptions(await getPerfSettings());
-      await loadModel(model.filePath, {
-        ...perf,
-        contextSize: model.contextSize,
-        gpuLayers: 0,
-        chatTemplate: model.chatTemplate ?? undefined,
-        // What tells the engine WHICH runtime this row belongs to. Without it
-        // the engine does what it always did and loads a GGUF on llama.cpp,
-        // which is right for every caller that has only a path.
-        backendModel: backendModelRef({
-          filePath: model.filePath,
-          artifact: model.artifact,
-          contextSize: model.contextSize,
-          displayName: model.displayName,
-          chatTemplate: model.chatTemplate,
-          targetSoc: model.targetSoc,
-          runtimeVersion: model.runtimeVersion,
-          quant: model.quant,
-          tokenizerPath: model.tokenizerPath,
-          runtimeModelName: model.runtimeModelName,
-        }),
-      });
-      // Same as the app-start path (chat-store.init): restore this model's
-      // persisted prefix KV before any completion. Switching back to a model
-      // whose session file is on disk skips the ~30s cold prefill. A no-op on
-      // the Qualcomm path, which has no KV state to restore.
-      await warmSessionCache();
-      await setActiveModel(id);
-      await get().refresh();
-    } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
-    } finally {
+
+    const promise = runActivation(set, get, id).finally(() => {
+      inFlightActivation = null;
+      set({ activating: null });
       // Always reflect what's actually loaded in native, even if the registry
       // write failed after a successful load (H2).
       useChatStore.getState().updateModelStatus();
-    }
+    });
+    inFlightActivation = { id, promise };
+    return promise;
   },
 
   // Reload the active model so changed perf settings (threads/mlock/KV quant)
   // take effect — a no-op if nothing is active.
   reloadActive: async () => {
+    // Never unload from underneath a load that is already running. Without
+    // this, a perf change landing during an activation would release the
+    // session GenieX is still building, and the activate() below would join
+    // that same pending load instead of starting the reload it was asked for.
+    if (inFlightActivation) await inFlightActivation.promise.catch(() => {});
     const active = await getActiveModel();
     if (!active) return;
     await unloadModel().catch(() => {});
@@ -1291,6 +1431,16 @@ export const useModelStore = create<ModelState>((set, get) => ({
   },
 
   remove: async (id: string) => {
+    // Deleting the bundle a QAIRT session is being created from is the one
+    // overlap the engine lock cannot help with: the native load holds no
+    // reference the model manager would refuse to remove, and the unload below
+    // would race the build. Refused while that load is in flight, and said so.
+    if (inFlightActivation?.id === id) {
+      const name =
+        get().installed.find((m) => m.id === id)?.displayName ?? "This model";
+      failActivation(set, id, `${name} is still loading — wait, then delete.`);
+      return;
+    }
     const model = await getModelById(id);
     if (!model) return;
     const wasActive = model.isActive;
