@@ -55,6 +55,8 @@ import {
 import { isNpuModel } from "../models/npu-compat";
 import {
   npuPull,
+  npuPullRequest,
+  npuLogDiagnostic,
   npuImportBundle,
   npuHubModels,
   npuResolveAlias,
@@ -82,6 +84,11 @@ import {
   retryDelayMs,
   waitForRetry,
 } from "../models/download-retry";
+import {
+  recordPullAttempt,
+  recordPullOutcome,
+  formatPullTrace,
+} from "../models/npu-pull-trace";
 import { checkGgufFile } from "../models/gguf-header";
 import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
 import { sha256File, normalizeSha256 } from "../native/file-hash";
@@ -387,13 +394,45 @@ async function pullWithRetry(
   request: Parameters<typeof npuPull>[0],
   rowId: string,
   signal: AbortSignal,
+  seenProgress: () => { events: number; bytes: number },
 ): Promise<Awaited<ReturnType<typeof npuPull>>> {
   let failures = 0;
 
   for (;;) {
+    // TEMPORARY DIAGNOSTIC, records only — see npu-pull-trace.ts. The request
+    // is captured as it will actually be serialised, not as it was written, so
+    // an absent key and the word "null" are distinguishable afterwards.
+    const before = seenProgress();
+    const entry = recordPullAttempt(
+      failures + 1,
+      npuPullRequest(request) as unknown as Record<string, unknown>,
+      signal.aborted,
+    );
+
     try {
-      return await npuPull(request);
+      const bundle = await npuPull(request);
+      const after = seenProgress();
+      recordPullOutcome(entry, {
+        ok: true,
+        elapsedMs: Date.now() - entry.startedAt,
+        progressEvents: after.events - before.events,
+        bytesWritten: after.bytes,
+      });
+      npuLogDiagnostic(formatPullTrace());
+      return bundle;
     } catch (err) {
+      const after = seenProgress();
+      recordPullOutcome(entry, {
+        ok: false,
+        elapsedMs: Date.now() - entry.startedAt,
+        // Zero here is the whole point: it separates a failure during setup
+        // — manifest resolution, chipset lookup, asset selection, creating
+        // .inflight — from one inside the transfer.
+        progressEvents: after.events - before.events,
+        bytesWritten: after.bytes,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      npuLogDiagnostic(formatPullTrace());
       // Read now, not at install time: this is what makes the setting live.
       const settings = await getDownloadRetrySettings();
 
@@ -506,8 +545,18 @@ async function runNpuInstall(
   });
   await get().refresh();
 
+  // TEMPORARY DIAGNOSTIC, counted beside the existing subscription so it costs
+  // nothing and cannot drift from what the UI saw. "Did any byte move before
+  // this failed" is the one fact that separates a setup failure from a
+  // transfer failure, and nothing was recording it.
+  let progressEvents = 0;
+  let progressBytes = 0;
+  const seenProgress = () => ({ events: progressEvents, bytes: progressBytes });
+
   const unsubscribe = onNpuPullProgress((p) => {
     if (p.modelName !== spec.modelName) return;
+    progressEvents += 1;
+    progressBytes = Math.max(progressBytes, p.downloaded);
     set((state) => ({
       progress: {
         ...state.progress,
@@ -542,7 +591,13 @@ async function runNpuInstall(
       hub: spec.hub,
       displayName: spec.displayName,
     };
-    const bundle = await pullWithRetry(set, request, row.id, abort.signal);
+    const bundle = await pullWithRetry(
+      set,
+      request,
+      row.id,
+      abort.signal,
+      seenProgress,
+    );
 
     // Everything that could make this unloadable, decided from the file
     // listing rather than from a load attempt that costs 20+ seconds and an

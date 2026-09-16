@@ -57,6 +57,7 @@ import {
   npuGenieXLogReport,
   npuInstalledReport,
 } from "../lib/native/npu";
+import { formatPullTrace } from "../lib/models/npu-pull-trace";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
@@ -253,7 +254,15 @@ export default function DiagnosticsScreen() {
       // `adb logcat -s VestaNpu` capture carries the probe, the cache, the
       // pull request and its failure together. Also to the JS console, which
       // is where a default build (no native bridge) can still see it.
+      // TEMPORARY DIAGNOSTIC. rc=-100000 has no symbolic name in 0.4.0 and sits
+      // at the base of the common-error block, so the number says nothing on
+      // its own — the request that produced it and whether any byte moved are
+      // the evidence. First in the report because it is currently the open
+      // question. See npu-pull-trace.ts.
+      const pullTrace = formatPullTrace();
+
       const text = [
+        pullTrace,
         formatProbe(result),
         cache
           ? formatCacheReport(cache, repo)
