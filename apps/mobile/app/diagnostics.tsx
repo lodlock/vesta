@@ -44,6 +44,7 @@ import {
   formatProbe,
   formatCacheReport,
   formatListProbe,
+  formatGenieXLog,
   type HubIdentityProbe,
 } from "../lib/models/npu-hub-probe";
 import {
@@ -51,6 +52,7 @@ import {
   npuLogDiagnostic,
   npuHubCacheReport,
   npuHubListProbe,
+  npuGenieXLogReport,
 } from "../lib/native/npu";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
@@ -210,6 +212,12 @@ export default function DiagnosticsScreen() {
       const listAll = await npuHubListProbe(null);
       const listChip = await npuHubListProbe("SM8850");
 
+      // And what the SDK itself has been saying all along. Nothing is enabled
+      // here: GenieX 0.4.0 logs at TRACE from its first instruction and its
+      // own JNI_OnLoad routes every level, plus stdout and stderr, into
+      // logcat under one tag. This capture is the only part that was missing.
+      const genieXLog = await npuGenieXLogReport();
+
       // Logged under the VestaNpu tag, not the JS one, so a single
       // `adb logcat -s VestaNpu` capture carries the probe, the cache, the
       // pull request and its failure together. Also to the JS console, which
@@ -221,6 +229,7 @@ export default function DiagnosticsScreen() {
           : "Hub cache report\nunavailable (no NPU bridge in this build)",
         listAll ? formatListProbe(listAll, "qwen3") : "",
         listChip ? formatListProbe(listChip, "qwen3") : "",
+        genieXLog ? formatGenieXLog(genieXLog) : "",
       ]
         .filter(Boolean)
         .join("\n\n");

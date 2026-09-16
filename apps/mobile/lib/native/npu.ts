@@ -25,6 +25,7 @@ interface NpuNativeModule {
   logDiagnostic(message: string): void;
   hubCacheReport(configJson: string): Promise<NpuHubCacheReport>;
   hubListProbe(configJson: string): Promise<NpuHubListProbe>;
+  genieXLogReport(configJson: string): Promise<NpuGenieXLogReport>;
   cancelPull(): void;
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
   removeBundle(modelName: string): Promise<void>;
@@ -214,6 +215,45 @@ export interface NpuHubCacheReport {
   dataDir?: string;
   dataDirExists?: boolean;
   files?: NpuCacheFile[];
+  error?: string | null;
+}
+
+/**
+ * GenieX's own native logging, as captured from this process's logcat.
+ *
+ * There is no verbosity setting behind this and none was added: `GENIEX_LOG`
+ * does not exist in geniex-android 0.4.0, `geniex_log_level` is a `.bss` int
+ * that stays 0 (TRACE) because nothing in the AAR writes it, and the SDK's own
+ * `JNI_OnLoad` has already routed every level — plus stdout and stderr — into
+ * logcat under one tag. The native module carries the symbol-level evidence.
+ *
+ * So this reads what is already there. It does NOT carry the AI Hub endpoint,
+ * manifest URL, cache hits or HTTP status: the Rust model manager reaches the
+ * log sink through six call sites and none of them writes those. Those stay
+ * the job of {@link NpuHubCacheReport}.
+ */
+export interface NpuGenieXLogReport {
+  /** The logcat tag every GenieX line arrives under. */
+  tag?: string;
+  /** The exact argv that produced this capture. */
+  command?: string;
+  /** Whether the SDK was up when the capture was taken. */
+  sdkStarted?: boolean;
+  initError?: string | null;
+  /** The captured lines, credential-shaped values already blanked natively. */
+  lines?: string[];
+  /** How many lines came back — the newest ones, when the budget bit. */
+  lineCount?: number;
+  /** How many GenieX lines the buffer held in all. */
+  totalLines?: number;
+  /** True when the budget bit, so older lines were dropped from this capture. */
+  truncated?: boolean;
+  byPriority?: { V: number; D: number; I: number; W: number; E: number };
+  /** JNI_OnLoad's own stdout/stderr probes — proof the redirect is live. */
+  sawStdoutSelfTest?: boolean;
+  sawStderrSelfTest?: boolean;
+  /** A VERBOSE line got through, so the TRACE gate is still open. */
+  verboseSeen?: boolean;
   error?: string | null;
 }
 
@@ -454,6 +494,24 @@ export async function npuHubListProbe(
   if (!moduleAvailable()) return null;
   try {
     return await Npu!.hubListProbe(JSON.stringify({ filter }));
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Reads back what GenieX has already written to logcat. Null in a default build.
+ *
+ * Nothing is enabled or configured on the way in — the SDK logs at TRACE from
+ * its first instruction and routes it to logcat itself. See the native module
+ * for why there is no level to set.
+ */
+export async function npuGenieXLogReport(
+  options: { maxLines?: number } = {},
+): Promise<NpuGenieXLogReport | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.genieXLogReport(JSON.stringify(options));
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }

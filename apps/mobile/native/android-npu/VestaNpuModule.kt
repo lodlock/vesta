@@ -35,6 +35,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 
 /**
  * The Qualcomm NPU bridge, over the GenieX SDK.
@@ -177,6 +178,47 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
          * See lib/models/npu-bundle.ts for what is done with both.
          */
         private const val HASHABLE_MAX_BYTES = 8L * 1024 * 1024
+
+        /**
+         * The one logcat tag every GenieX 0.4.0 line arrives under — the
+         * native log callback, stdout and stderr alike. See [genieXLogReport]
+         * for where that is established.
+         */
+        private const val GENIEX_LOG_TAG = "GenieXSdk"
+
+        /** Capture bounds. A diagnostic that has to be scrolled past is noise. */
+        private const val DEFAULT_LOG_LINES = 400
+        private const val MAX_LOG_LINES = 2000
+        private const val LOGCAT_TIMEOUT_MS = 5_000L
+
+        /**
+         * The two lines `libnpu_jni.so`'s `JNI_OnLoad` writes to stdout and
+         * stderr immediately after installing the redirect. Seeing either is
+         * proof the redirect is live in THIS process, rather than an inference
+         * from the binary.
+         */
+        private const val STDOUT_SELF_TEST = "GENIEX SDK: stdout redirection test"
+        private const val STDERR_SELF_TEST = "GENIEX SDK: stderr redirection test"
+
+        /** The priority letter in logcat's `threadtime` format. */
+        private val LOGCAT_PRIORITY =
+            Regex("""^\d{2}-\d{2} [\d:.]+\s+\d+\s+\d+\s+([VDIWEF])\s""")
+
+        /**
+         * A query parameter whose NAME says its value is a credential. The
+         * name is kept — it is diagnostic — and the value is not.
+         */
+        private val SECRET_QUERY_PARAM =
+            Regex(
+                """([?&][A-Za-z0-9_-]*""" +
+                    """(?:token|signature|credential|secret|password|accesskey|apikey)""" +
+                    """[A-Za-z0-9_-]*)=[^&\s"']+""",
+                RegexOption.IGNORE_CASE,
+            )
+
+        /** `Authorization: Bearer …`, in whatever shape it reaches a log line. */
+        private val AUTH_SCHEME_TOKEN =
+            Regex("""(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}""", RegexOption.IGNORE_CASE)
     }
 
     // RN requires these for a module that emits device events.
@@ -428,6 +470,179 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
             android.util.Log.i(TAG, line)
         }
     }
+
+    /**
+     * GenieX's own native logging, read back out of this process's logcat.
+     *
+     * A diagnostic surface only: this file is compiled into a build made with
+     * VESTA_ENABLE_NPU=1, and nothing but the Diagnostics screen calls it.
+     *
+     * ## There is no verbosity switch, and that is the finding
+     *
+     * `GENIEX_LOG` does not exist in geniex-android 0.4.0. The string is in
+     * none of the 52 native libraries the AAR ships and in none of its
+     * classes. The environment variables the SDK does read are
+     * `GENIEX_AIHUBBASEURL`, `GENIEX_AIHUBVERSION`, `GENIEX_HFTOKEN`,
+     * `GENIEX_DATADIR`, `GENIEX_PLUGIN_PATH`, `GENIEX_DL_CHUNK_SIZE`,
+     * `GENIEX_DL_FILE_CONCURRENCY`, `GENIEX_DL_CHUNK_CONCURRENCY`,
+     * `GENIEX_DECODE_WORKERS`, `GENIEX_DECODE_CPUMASK`, `GENIEX_DECODE_POLL`,
+     * `GENIEX_CLOCK_KEEPER_THREADS` and `GENIEX_DUMP_IO` — that is the whole
+     * list. A `setenv("GENIEX_LOG", "trace", 1)` before init would set a
+     * variable nothing reads, so no such bridge was added.
+     *
+     * What 0.4.0 has instead is a C sink, in `libgeniex.so`'s dynamic symbols:
+     *
+     *     extern void (*geniex_log)(int level, const char *msg);   // .data
+     *     extern int   geniex_log_level;                           // .bss
+     *     int          geniex_set_log(void (*cb)(int, const char *));
+     *
+     * Levels are 0 TRACE, 1 DEBUG, 2 INFO, 3 WARN, 4 ERROR — the built-in sink
+     * indexes a five-entry table of `[TRACE] `, `[DEBUG] `, `[ INFO] `,
+     * `[ WARN] `, `[ERROR] `. Every call site is gated on
+     * `geniex_log_level <= level && geniex_log != nullptr`, and no library in
+     * the AAR ever writes `geniex_log_level`: it is a four-byte `.bss` object
+     * that stays **0 — TRACE — from the first instruction**. There is no
+     * verbosity left to raise.
+     *
+     * The sink is already connected, too. `libnpu_jni.so`'s `JNI_OnLoad` calls
+     * `geniex_set_log()` with a callback that does
+     * `__android_log_print(level + 2, "GenieXSdk", "%s", msg)` — TRACE lands
+     * at VERBOSE, ERROR at ERROR — and then redirects this process's stdout
+     * and stderr into the same tag as `[STDOUT] …` and `[STDERR] …`. GenieX is
+     * at maximum verbosity, in logcat, under one tag, before Vesta's first
+     * line of Kotlin runs.
+     *
+     * Which leaves exactly one useful thing to do: read it. An app may read
+     * its own logcat entries without READ_LOGS, and every GenieX line is
+     * written by our own process.
+     *
+     * ## What it will not tell you
+     *
+     * The AI Hub endpoint, the manifest URL, cache hits and misses, the
+     * release-assets URL and the HTTP status are absent at every level,
+     * because they were never written. That half of the SDK is Rust inside
+     * `libgeniex.so`, and it reaches the sink through exactly six
+     * `geniex_model_log_emit()` call sites: "geniex model manager
+     * initialized", the already-initialized warning, and four error paths.
+     * Not one carries a URL, a cache decision or a status code. Those
+     * questions stay answered by [hubCacheReport] and [hubListProbe], which
+     * read the manifests the runtime cached in our own data directory.
+     *
+     * Anything credential-shaped is blanked before it crosses the bridge —
+     * see [redactSecrets].
+     */
+    @ReactMethod
+    fun genieXLogReport(configJson: String, promise: Promise) {
+        scope.launch {
+            val out = Arguments.createMap()
+            out.putString("tag", GENIEX_LOG_TAG)
+            try {
+                val config = JSONObject(configJson)
+                val maxLines =
+                    config.optInt("maxLines", DEFAULT_LOG_LINES).coerceIn(1, MAX_LOG_LINES)
+
+                // Brought up first when it is not already. A capture taken
+                // before init would truthfully report that GenieX has logged
+                // nothing, which is not the question anyone is asking.
+                val started = ensureSdk()
+                out.putBoolean("sdkStarted", started)
+                if (!started) out.putString("initError", initError)
+
+                // No `-t`: logcat's tail count is applied by logd to the
+                // buffer as a whole and the tag filter only afterwards, in the
+                // client, so `-t 400` on a chatty process can hand back zero
+                // GenieX lines. The whole filtered dump is read instead and the
+                // budget applied here, to the lines that actually matched.
+                val argv =
+                    arrayOf("logcat", "-d", "-v", "threadtime", "-s", "$GENIEX_LOG_TAG:V")
+                out.putString("command", argv.joinToString(" "))
+
+                val (raw, totalLines) = readOwnLogcat(argv, maxLines)
+                val counts = linkedMapOf("V" to 0, "D" to 0, "I" to 0, "W" to 0, "E" to 0)
+                val captured: WritableArray = Arguments.createArray()
+                for (line in raw) {
+                    val safe = redactSecrets(line)
+                    LOGCAT_PRIORITY.find(safe)?.groupValues?.get(1)?.let { p ->
+                        counts[p] = (counts[p] ?: 0) + 1
+                    }
+                    captured.pushString(safe)
+                }
+                out.putArray("lines", captured)
+                out.putInt("lineCount", raw.size)
+                out.putInt("totalLines", totalLines)
+                out.putBoolean("truncated", totalLines > raw.size)
+
+                val byPriority = Arguments.createMap()
+                counts.forEach { (k, v) -> byPriority.putInt(k, v) }
+                out.putMap("byPriority", byPriority)
+
+                // JNI_OnLoad's own probes. Either one proves the redirect is
+                // live in this process — unless the ring buffer has already
+                // rolled past process start, which is why absence is reported
+                // as a boolean and never as a failure.
+                out.putBoolean("sawStdoutSelfTest", raw.any { it.contains(STDOUT_SELF_TEST) })
+                out.putBoolean("sawStderrSelfTest", raw.any { it.contains(STDERR_SELF_TEST) })
+
+                // A VERBOSE line is a TRACE line that passed the gate, and is
+                // the only on-device confirmation available that
+                // geniex_log_level is still 0.
+                out.putBoolean("verboseSeen", (counts["V"] ?: 0) > 0)
+
+                promise.resolve(out)
+            } catch (e: Throwable) {
+                android.util.Log.w(TAG, "genieXLogReport failed", e)
+                out.putString("error", e.message ?: e.toString())
+                promise.resolve(out)
+            }
+        }
+    }
+
+    /**
+     * One `logcat -d`, read to completion: the last [maxLines] matching lines,
+     * and how many there were in all.
+     *
+     * The NEWEST lines are the ones kept — a diagnostic taken right after a
+     * failed pull is about what just happened — so the whole dump is read and
+     * an old line is dropped for each new one past the budget. `-d` dumps and
+     * exits, so this cannot hang on an endless stream; it is still waited on
+     * with a bound, because a diagnostics screen that wedges is worse than one
+     * that reports a timeout. logcat's own stderr is folded into the output on
+     * purpose: when the capture comes back empty, logcat's complaint is the
+     * only thing left to read.
+     */
+    private fun readOwnLogcat(argv: Array<String>, maxLines: Int): Pair<List<String>, Int> {
+        val process = ProcessBuilder(*argv).redirectErrorStream(true).start()
+        return try {
+            val kept = ArrayDeque<String>(maxLines)
+            var seen = 0
+            process.inputStream.bufferedReader().use { reader ->
+                reader.forEachLine { line ->
+                    seen++
+                    if (kept.size == maxLines) kept.removeFirst()
+                    kept.addLast(line)
+                }
+            }
+            process.waitFor(LOGCAT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            kept.toList() to seen
+        } finally {
+            process.destroy()
+        }
+    }
+
+    /**
+     * Blanks anything credential-shaped in a captured line.
+     *
+     * Applied at the source, before the line crosses the bridge, so a token
+     * cannot reach the clipboard however the formatters downstream change.
+     * Vesta never sets `GENIEX_HFTOKEN` and pins `hf_token` null in
+     * [pullInputFrom], so on this path it should have nothing to do — which is
+     * precisely why it costs nothing to keep. The parameter NAME survives;
+     * only the value goes.
+     */
+    private fun redactSecrets(line: String): String =
+        line
+            .replace(SECRET_QUERY_PARAM, "\$1=REDACTED")
+            .replace(AUTH_SCHEME_TOKEN, "\$1 REDACTED")
 
     /**
      * Finds the array of model entries in a manifest whose exact shape we have

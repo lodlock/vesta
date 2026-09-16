@@ -15,7 +15,9 @@ import {
   formatProbe,
   formatCacheReport,
   formatListProbe,
+  formatGenieXLog,
   mentionsModel,
+  type GenieXLogLike,
 } from "../npu-hub-probe";
 
 const QWEN = "qualcomm/Qwen3-4B-Instruct-2507";
@@ -397,5 +399,88 @@ describe("the hub-list probe", () => {
     );
     expect(text).toContain("error: boom");
     expect(text).toContain("manifest before: <absent>");
+  });
+});
+
+describe("GenieX's own log, reported", () => {
+  const capture = (over: Partial<GenieXLogLike> = {}): GenieXLogLike => ({
+    tag: "GenieXSdk",
+    command: "logcat -d -v threadtime -t 400 -s GenieXSdk:V",
+    sdkStarted: true,
+    lines: [
+      "09-15 10:00:00.001  4211  4211 V GenieXSdk: [TRACE] dispatch: probing plugins",
+      "09-15 10:00:00.002  4211  4211 I GenieXSdk: [ INFO] geniex model manager initialized",
+    ],
+    lineCount: 2,
+    totalLines: 2,
+    truncated: false,
+    byPriority: { V: 1, D: 0, I: 1, W: 0, E: 0 },
+    sawStdoutSelfTest: true,
+    sawStderrSelfTest: true,
+    verboseSeen: true,
+    ...over,
+  });
+
+  it("prints the capture verbatim, under a header that explains it", () => {
+    const text = formatGenieXLog(capture());
+    expect(text).toContain("tag: GenieXSdk");
+    expect(text).toContain("by priority: V=1 D=0 I=1 W=0 E=0");
+    expect(text).toContain("[TRACE] dispatch: probing plugins");
+    expect(text).toContain("[ INFO] geniex model manager initialized");
+  });
+
+  // The whole point of the header: a VERBOSE line IS a GenieX TRACE line that
+  // passed the level gate, so seeing one proves on-device that nothing is
+  // being filtered — which is why no verbosity setting was added.
+  it("reports whether TRACE is reaching logcat", () => {
+    expect(formatGenieXLog(capture())).toContain("TRACE reaching logcat: YES");
+    expect(
+      formatGenieXLog(capture({ verboseSeen: false, byPriority: undefined })),
+    ).toContain("TRACE reaching logcat: no VERBOSE line in this capture");
+  });
+
+  // Three quite different states all produce zero lines, and a reader has to
+  // be able to tell them apart.
+  it("distinguishes an empty buffer from an SDK that never started", () => {
+    const quiet = formatGenieXLog(
+      capture({ lines: [], lineCount: 0, verboseSeen: false }),
+    );
+    expect(quiet).toContain("SDK started: yes");
+    expect(quiet).toContain("<no GenieX lines in the buffer>");
+
+    const dead = formatGenieXLog(
+      capture({
+        sdkStarted: false,
+        initError: "libgeniex_plugin_qairt.so is not present as a file",
+        lines: [],
+        lineCount: 0,
+      }),
+    );
+    expect(dead).toContain("SDK started: NO");
+    expect(dead).toContain(
+      "init error: libgeniex_plugin_qairt.so is not present as a file",
+    );
+  });
+
+  it("says when the capture hit its budget, so a gap is not read as silence", () => {
+    expect(
+      formatGenieXLog(
+        capture({ truncated: true, lineCount: 400, totalLines: 1312 }),
+      ),
+    ).toContain("lines: 400 of 1312 (newest kept, older dropped)");
+  });
+
+  it("surfaces the self-tests that prove the stdout redirect is live", () => {
+    const text = formatGenieXLog(
+      capture({ sawStdoutSelfTest: false, sawStderrSelfTest: true }),
+    );
+    expect(text).toContain("stdout redirect self-test seen: no");
+    expect(text).toContain("stderr redirect self-test seen: YES");
+  });
+
+  it("survives a capture that failed outright", () => {
+    const text = formatGenieXLog({ error: "logcat: permission denied" });
+    expect(text).toContain("error: logcat: permission denied");
+    expect(text).toContain("<no GenieX lines in the buffer>");
   });
 });

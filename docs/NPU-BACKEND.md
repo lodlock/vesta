@@ -506,6 +506,10 @@ cannot be acted on — twice a `-100010` has turned out to be one of these three
 strings rather than a missing asset. No credential appears in either:
 `hf_token` is pinned null in `pullInputFrom()` and never read from config.
 
+The SDK's own logging is a second capture, under its own tag — `adb logcat -s
+GenieXSdk`. It needs no switch and has none; see *What the SDK will tell you
+about itself* below for why, and for what it does not contain.
+
 ### The hub is the catalogue
 
 The consequence for the UI is larger than one model. A hard-coded list of one
@@ -679,6 +683,102 @@ One naming trap worth keeping straight: the `genie` asset in the release
 manifest is for the older Genie CLI workflow, and `geniex_qairt` is the one this
 SDK consumes. Vesta asks for the latter by asking GenieX rather than by
 hand-rolling a URL, which is the point.
+
+### What the SDK will tell you about itself
+
+Asked whether GenieX 0.4.0 honours a `GENIEX_LOG=trace` environment variable,
+the answer from the binaries is **no — and there is nothing to turn on, because
+it is already on.** Both halves matter, so both are recorded here with how they
+were established. Everything below comes from the AAR Gradle actually resolves
+(`com.qualcomm.qti:geniex-android:0.4.0`), read with an ELF symbol/relocation
+parser and a disassembler; nothing is inferred from Qualcomm's documentation.
+
+**`GENIEX_LOG` does not exist in 0.4.0.** The string appears in none of the 52
+native libraries in the AAR and in none of its classes. The `GENIEX_*`
+environment variables that *are* in the binaries are exactly:
+
+| Variable | Library | What it governs |
+| --- | --- | --- |
+| `GENIEX_AIHUBBASEURL`, `GENIEX_AIHUBVERSION` | `libgeniex.so` | the AI Hub endpoint and release |
+| `GENIEX_HFTOKEN`, `HF_ENDPOINT` | `libgeniex.so` | the Hugging Face hub path |
+| `GENIEX_DATADIR` | `libgeniex.so` | where the model cache lives |
+| `GENIEX_DL_CHUNK_SIZE`, `GENIEX_DL_FILE_CONCURRENCY`, `GENIEX_DL_CHUNK_CONCURRENCY` | `libgeniex.so` | download shape |
+| `GENIEX_PLUGIN_PATH` | `libgeniex.so`, both plugins | where plugins are looked for |
+| `GENIEX_DECODE_WORKERS`, `GENIEX_DECODE_CPUMASK`, `GENIEX_DECODE_POLL`, `GENIEX_CLOCK_KEEPER_THREADS`, `GENIEX_DUMP_IO` | `libgeniex_core.so` | decode threading and I/O dumps |
+
+No logging variable is among them, and none of the libraries is built with
+`env_logger` or reads `RUST_LOG`. A `setenv("GENIEX_LOG", "trace", 1)` before
+`init` would set a variable nothing reads, so **no such JNI bridge was added**.
+
+**What 0.4.0 has instead is a C sink**, exported from `libgeniex.so`:
+
+```c
+extern void (*geniex_log)(int level, const char *msg);  /* .data, non-null default */
+extern int   geniex_log_level;                          /* .bss, 4 bytes */
+int          geniex_set_log(void (*cb)(int, const char *));
+```
+
+`geniex_set_log` is six instructions: it stores its one argument into
+`geniex_log` and returns 0. The levels are `0 TRACE, 1 DEBUG, 2 INFO, 3 WARN,
+4 ERROR` — the built-in sink indexes a five-entry table of `[TRACE] `,
+`[DEBUG] `, `[ INFO] `, `[ WARN] `, `[ERROR] ` (with matching ANSI colours)
+before writing the message. Every call site in `libgeniex.so`,
+`libgeniex_plugin_qairt.so` and `libgeniex_plugin_llama_cpp.so` compiles to the
+same guard:
+
+```
+w8 = geniex_log_level ; x9 = geniex_log
+cmp w8, #<level>      ; skip if geniex_log_level > level, or geniex_log == NULL
+```
+
+`geniex_log_level` lives in `.bss` and **no library in the AAR ever writes it**
+— there is no setter in the exported API, no reference to it from
+`libgeniex.so`'s own initialisers, and the two plugins only read it. It is `0`,
+i.e. TRACE, from the first instruction. There is no verbosity left to raise.
+
+**And the sink is already wired to logcat.** `libnpu_jni.so`'s `JNI_OnLoad`,
+before returning `JNI_VERSION_1_6`, does three things: installs a
+`geniex_set_log` callback that is a one-line
+`__android_log_print(level + 2, "GenieXSdk", "%s", msg)` (so TRACE arrives as
+VERBOSE and ERROR as ERROR), redirects this process's stdout and stderr into
+the same tag as `[STDOUT] …` / `[STDERR] …`, and writes one self-test line to
+each. GenieX is at maximum verbosity, in logcat, under a single tag, before
+Vesta's first line of Kotlin runs.
+
+So the only thing that was actually missing was reading it, and that is what
+`VestaNpuModule.genieXLogReport()` does — an app may read its own logcat
+entries without `READ_LOGS`, and every GenieX line comes from our process. It
+runs `logcat -d -v threadtime -s GenieXSdk:V`, keeps the newest lines up to a
+budget (logcat's own `-t` is applied by logd to the whole buffer and the tag
+filter only afterwards, so `-t 400` on a chatty process can hand back no GenieX
+lines at all), blanks anything credential-shaped *before* the line crosses the
+bridge, and reports the counts per priority alongside the lines. Two of those
+counts are load-bearing:
+
+- a **VERBOSE** line is a GenieX TRACE line that passed the level gate, which is
+  the only on-device confirmation available that `geniex_log_level` is still 0;
+- the two **self-test** lines prove the stdout/stderr redirect is live in this
+  process rather than merely present in the binary.
+
+The capture joins the identity probe, the cache report and the list probe in the
+single block the Diagnostics screen copies and writes under `VestaNpu`.
+
+#### What this does not answer
+
+The AI Hub endpoint, the manifest URL, cache hits and misses, the canonical
+model name, the chipset lookup, the release-assets URL and the HTTP status are
+**absent at every level, because they were never written.** That half of the SDK
+is Rust inside `libgeniex.so`, and it reaches the log sink through exactly six
+`geniex_model_log_emit()` call sites: `"geniex model manager initialized"`
+(DEBUG), `"geniex_model_init called after the model manager was already
+initialized…"` (WARN), and four error paths carrying runtime-formatted text.
+Not one carries a URL, a cache decision or a status code — and
+`geniex_model_log_emit` does not even consult `geniex_log_level`, so no setting
+could gate them differently.
+
+Those questions therefore stay where they already were: `hubCacheReport()` and
+`hubListProbe()`, which read the manifests the runtime cached in our own data
+directory. Turning up the SDK's logging was never going to answer them.
 
 ### What must never be committed
 

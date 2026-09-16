@@ -329,3 +329,70 @@ export function formatListProbe(
   }
   return lines.join("\n");
 }
+
+// ── What the SDK says about itself ────────────────────────────────────────
+
+/** Minimal shape of the native GenieX log capture, so this module stays testable. */
+export interface GenieXLogLike {
+  tag?: string;
+  command?: string;
+  sdkStarted?: boolean;
+  initError?: string | null;
+  lines?: string[];
+  lineCount?: number;
+  totalLines?: number;
+  truncated?: boolean;
+  byPriority?: { V: number; D: number; I: number; W: number; E: number };
+  sawStdoutSelfTest?: boolean;
+  sawStderrSelfTest?: boolean;
+  verboseSeen?: boolean;
+  error?: string | null;
+}
+
+/**
+ * GenieX's own logging, as it actually arrived — with the header a reader
+ * needs to interpret an empty capture.
+ *
+ * The header exists because "no lines" has three quite different meanings and
+ * only the surrounding facts separate them: the SDK never started (sdkStarted
+ * false, with the reason), the SDK started and said nothing, or the ring
+ * buffer has already rolled past everything it said. `verboseSeen` is the one
+ * that answers the question people actually ask first — whether anything is
+ * being filtered out. A VERBOSE line is a GenieX TRACE line that passed the
+ * level gate, so seeing one proves on-device that the gate is fully open, and
+ * that there is no verbosity setting left to look for.
+ */
+export function formatGenieXLog(report: GenieXLogLike): string {
+  const lines = ["GenieX native log"];
+  if (report.error) lines.push(`error: ${report.error}`);
+  lines.push(
+    `tag: ${report.tag ?? "<unknown>"}`,
+    `command: ${report.command ?? "<none>"}`,
+    `SDK started: ${report.sdkStarted ? "yes" : "NO"}`,
+  );
+  if (report.initError) lines.push(`init error: ${report.initError}`);
+
+  const p = report.byPriority;
+  lines.push(
+    `lines: ${report.lineCount ?? 0}${
+      report.truncated
+        ? ` of ${report.totalLines ?? "?"} (newest kept, older dropped)`
+        : ""
+    }`,
+    p
+      ? `by priority: V=${p.V} D=${p.D} I=${p.I} W=${p.W} E=${p.E}`
+      : "by priority: <not reported>",
+    // TRACE reaching logcat at all is the proof that geniex_log_level is 0.
+    `TRACE reaching logcat: ${report.verboseSeen ? "YES" : "no VERBOSE line in this capture"}`,
+    `stdout redirect self-test seen: ${report.sawStdoutSelfTest ? "YES" : "no"}`,
+    `stderr redirect self-test seen: ${report.sawStderrSelfTest ? "YES" : "no"}`,
+  );
+
+  lines.push("");
+  if ((report.lines ?? []).length === 0) {
+    lines.push("<no GenieX lines in the buffer>");
+  } else {
+    for (const line of report.lines ?? []) lines.push(line);
+  }
+  return lines.join("\n");
+}
