@@ -188,49 +188,100 @@ describe("an NPU install cannot reach a GGUF", () => {
   });
 });
 
-// A characterization test, not an endorsement.
+// The manager's own bookkeeping, against the zero-length payload rule.
 //
 // On a real device GenieX pulled the full 2.38 GB bundle and reported
 // `pull() returned rc=0`; `getPaths()` then resolved, which is the manager's
-// own completion test. The install still failed, because the bundle directory
-// also holds GenieX's own `.lock` — zero bytes by design, since the lock lives
-// in the kernel (`libgeniex.so` imports `flock` and carries the literal
-// strings `.lock`, `.inflight` and `.progress`).
+// own completion test. The install was rejected anyway, and the bundle
+// deleted, because the bundle directory also holds GenieX's zero-byte `.lock`
+// — zero bytes by design, since an advisory lock lives in the kernel and not
+// in the file (`libgeniex.so` imports `flock` and carries the literals
+// `.lock`, `.inflight` and `.progress`).
 //
-// `checkBundle()` scans EVERY file the native side measured, so the lock trips
-// the truncated-shard rule and the whole download is rejected and deleted.
-// This pins the behaviour exactly as it stands so the decision about it is
-// made deliberately, in one place, rather than discovered again on device.
-describe("GenieX's own bookkeeping files, against the zero-length rule", () => {
+// The exemption is those three names and nothing else. Everything below is
+// about keeping that line exactly where it is.
+describe("GenieX's own bookkeeping, against the zero-length rule", () => {
   const refusal = (b: MeasuredBundle) => {
     const check = checkBundle(b);
     if (check.ok) throw new Error("expected a refusal");
     return check;
   };
 
-  const withLock = () =>
-    bundle({ files: [file(".lock", 0), ...bundle().files] });
+  // A: the case that cost 2.38 GB.
+  it("accepts a complete bundle whose .lock is empty", () => {
+    const check = checkBundle(
+      bundle({ files: [file(".lock", 0), ...bundle().files] }),
+    );
+    expect(check.ok).toBe(true);
+    expect(check.warnings).toEqual([]);
+  });
 
-  it("currently rejects a complete bundle because the lock is empty", () => {
-    const check = refusal(withLock());
+  it("accepts the other two bookkeeping names on the same terms", () => {
+    for (const name of [".inflight", ".progress"]) {
+      expect(
+        checkBundle(bundle({ files: [file(name, 0), ...bundle().files] })).ok,
+      ).toBe(true);
+    }
+  });
+
+  // B: the protection the rule exists for, unchanged. An empty shard is a
+  // truncated download and must still fail, lock present or not.
+  it("still refuses a zero-byte .bin shard", () => {
+    const files = [
+      file(".lock", 0),
+      ...bundle().files.slice(0, -1),
+      file("weights_2.bin", 0),
+    ];
+    const check = refusal(bundle({ files }));
     expect(check.reason).toBe("zero-length-file");
-    expect(check.message).toBe(".lock is empty — the download did not finish.");
+    expect(check.message).toContain("weights_2.bin");
   });
 
-  // Nothing else about the bundle is wrong: every file the runtime actually
-  // requires is present and non-empty.
-  it("finds the bundle otherwise complete — every required file is there", () => {
-    const withoutLock = bundle();
-    expect(checkBundle(withoutLock).ok).toBe(true);
-    expect(withLock().files.filter((f) => f.sizeBytes <= 0)).toEqual([
-      { path: ".lock", sizeBytes: 0 },
-    ]);
+  it("still refuses a zero-byte metadata.json or tokenizer.json", () => {
+    for (const required of ["metadata.json", "tokenizer.json"]) {
+      const files = [
+        file(".lock", 0),
+        ...bundle().files.filter((f) => f.path !== required),
+        file(required, 0),
+      ];
+      const check = refusal(bundle({ files }));
+      expect(check.reason).toBe("zero-length-file");
+      expect(check.message).toContain(required);
+    }
   });
 
-  // The rule the zero-length check was written for still has to hold. A shard
-  // that is genuinely empty is a truncated download and must stay a refusal.
-  it("still refuses a genuinely empty weight shard", () => {
-    const files = [file(".lock", 0), ...bundle().files.slice(0, -1), file("weights_2.bin", 0)];
-    expect(refusal(bundle({ files })).reason).toBe("zero-length-file");
+  // C: no dotfile heuristic. An empty file we have never seen is not evidence
+  // of anything, and passing it would give back the protection above.
+  it("does not exempt an arbitrary empty dotfile", () => {
+    const check = refusal(
+      bundle({ files: [file(".DS_Store", 0), ...bundle().files] }),
+    );
+    expect(check.reason).toBe("zero-length-file");
+    expect(check.message).toContain(".DS_Store");
+  });
+
+  it("does not exempt an arbitrary empty non-dotfile", () => {
+    expect(
+      refusal(bundle({ files: [file("notes.txt", 0), ...bundle().files] }))
+        .reason,
+    ).toBe("zero-length-file");
+  });
+
+  // Exact names, not substrings and not case-folded: the literals came out of
+  // the binary, and widening them would be inventing a rule GenieX never made.
+  it("matches the names exactly", () => {
+    for (const near of [".locked", "lock", ".LOCK", ".lock.bak", "my.progress.log"]) {
+      expect(
+        refusal(bundle({ files: [file(near, 0), ...bundle().files] })).reason,
+      ).toBe("zero-length-file");
+    }
+  });
+
+  // The manager writes its lock beside the weights; a path is still matched on
+  // its basename so a nested bundle layout behaves the same way.
+  it("recognises the lock wherever in the bundle it sits", () => {
+    expect(
+      checkBundle(bundle({ files: [file("sub/.lock", 0), ...bundle().files] })).ok,
+    ).toBe(true);
   });
 });

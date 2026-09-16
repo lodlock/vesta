@@ -360,12 +360,37 @@ async function runNpuInstall(
     // out-of-memory risk to learn the same thing.
     const check = checkBundle(bundle as MeasuredBundle);
     if (!check.ok) {
-      // Removes the bundle, and only the bundle: this addresses the GenieX
-      // cache entry for this model name and nothing else on disk.
-      await npuRemoveBundle(spec.modelName).catch(() => {});
-      await removeModel(row.id);
+      // NOTHING IS DELETED HERE, and that is the point.
+      //
+      // Reaching this line means the runtime already committed the bundle:
+      // npuPull() only resolves after PullEvent.Completed AND a non-null
+      // getPaths(), which is the manager's own test for "moved out of
+      // .inflight/". So this is Vesta disagreeing with a runtime that has
+      // already said yes — and a disagreement is not grounds for throwing away
+      // gigabytes the user waited for. This branch used to call
+      // npuRemoveBundle() before the message was even on screen, and a 2.38 GB
+      // AI Hub pull that GenieX reported as rc=0 was destroyed by it.
+      //
+      // Instead the row is kept as a real handle on what is on disk: the
+      // measured manifest is recorded so Verify has something to check, and
+      // the state is then set to "error" so canActivate() refuses it. The user
+      // gets the reason, the Delete button, and the choice. A GenieX pull that
+      // actually FAILED never gets here — npuPull() rejects, and the catch
+      // below still removes the row.
+      await finalizeBundle(row.id, {
+        filePath: bundle.modelPath,
+        tokenizerPath: bundle.tokenizerPath ?? null,
+        sizeBytes: bundle.totalBytes,
+        bundleFiles: toBundleFiles(bundle.files),
+      });
+      await setModelState(row.id, "error");
       await get().refresh();
-      failInstall(set, spec.errorKey, check.message);
+      failInstall(
+        set,
+        spec.errorKey,
+        `${check.message} The download itself completed and has been KEPT — ` +
+          "delete it from this screen if you want the space back.",
+      );
       return;
     }
 
@@ -745,13 +770,27 @@ export const useModelStore = create<ModelState>((set, get) => ({
       });
 
       // Identical to the download path on purpose: one definition of "a
-      // bundle Vesta will load", applied to both sources.
+      // bundle Vesta will load", applied to both sources — and that includes
+      // not destroying one the manager has already committed. npuImportBundle()
+      // resolves on the same two conditions the download does, a completed
+      // pullFlow and a non-null getPaths(), so a failure here is again Vesta
+      // disagreeing after the runtime said yes. The row is kept, recorded and
+      // marked errored; the user decides whether it goes.
       const check = checkBundle(bundle as MeasuredBundle);
       if (!check.ok) {
-        await npuRemoveBundle(pullIdentifier(model)).catch(() => {});
-        await removeModel(row.id);
+        await finalizeBundle(row.id, {
+          filePath: bundle.modelPath,
+          tokenizerPath: bundle.tokenizerPath ?? null,
+          sizeBytes: bundle.totalBytes,
+          bundleFiles: toBundleFiles(bundle.files),
+        });
+        await setModelState(row.id, "error");
         await get().refresh();
-        set({ error: `${model.displayName}: ${check.message}` });
+        set({
+          error:
+            `${model.displayName}: ${check.message} The imported bundle has been ` +
+            "KEPT — delete it from this screen if you want the space back.",
+        });
         return;
       }
 

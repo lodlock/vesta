@@ -80,8 +80,33 @@ const METADATA = "metadata.json";
 const TOKENIZER = "tokenizer.json";
 const TOKENIZER_CONFIG = "tokenizer_config.json";
 
+/**
+ * The model manager's own bookkeeping, which lives in the bundle directory
+ * alongside the weights — and which is legitimately zero bytes.
+ *
+ * Not a guess and not a dotfile heuristic: these three literals are in
+ * `libgeniex.so` beside `geniex.json`, and the library imports `flock`. An
+ * advisory lock lives in the kernel, not in the file, so `.lock` is zero bytes
+ * for a bundle that downloaded perfectly.
+ *
+ * This cost a real 2.38 GB download. GenieX reported `pull() returned rc=0`,
+ * `getPaths()` resolved, and the install was then rejected — and deleted —
+ * because `.lock` was empty. The exempt list is exactly these three names so
+ * that an unknown empty file is still a refusal: a dotfile we have never seen
+ * is not evidence of anything, and silently passing it would give back the
+ * protection this rule exists for.
+ */
+const MANAGER_BOOKKEEPING = new Set([".lock", ".inflight", ".progress"]);
+
 function baseName(path: string): string {
   return path.split("/").pop() ?? path;
+}
+
+/** Whether this entry is the manager's own, rather than part of the payload. */
+function isManagerBookkeeping(path: string): boolean {
+  // Exact, case-sensitive: the names are literals read out of the binary, and
+  // normalising them would be inventing a rule the runtime never stated.
+  return MANAGER_BOOKKEEPING.has(baseName(path));
 }
 
 function has(files: MeasuredFile[], name: string): boolean {
@@ -149,9 +174,13 @@ export function checkBundle(bundle: MeasuredBundle): BundleCheck {
     };
   }
 
-  // A zero-length file is the signature of a pull that stopped between creating
-  // a file and writing it. The runtime would read it as a corrupt shard.
-  const empty = bundle.files.find((f) => f.sizeBytes <= 0);
+  // A zero-length PAYLOAD file is the signature of a pull that stopped between
+  // creating a file and writing it. The runtime would read it as a corrupt
+  // shard. The manager's own bookkeeping is exempt and only it — see
+  // MANAGER_BOOKKEEPING for why, and for what it cost to find out.
+  const empty = bundle.files.find(
+    (f) => f.sizeBytes <= 0 && !isManagerBookkeeping(f.path),
+  );
   if (empty) {
     return {
       ok: false,
