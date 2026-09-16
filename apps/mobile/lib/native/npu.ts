@@ -82,8 +82,22 @@ export interface NpuRuntimeInfo {
   dataDir?: string | null;
   /** Set only on a load: the manifest's own runtime for this bundle. */
   manifestRuntimeId?: string | null;
+  /** The two paths the session was actually CREATED with. */
   modelPath?: string | null;
   tokenizerPath?: string | null;
+  /**
+   * Set only on a load: `ModelPaths` as the model manager answered it, whole.
+   * Kept beside the two paths above so a diagnostics screen can show what
+   * GenieX said next to what the create used — the load failure that produced
+   * `failed to open file: null` was invisible precisely because only the
+   * second half was ever reported.
+   */
+  resolvedModelName?: string | null;
+  modelDir?: string | null;
+  manifestModelPath?: string | null;
+  manifestTokenizerPath?: string | null;
+  manifestMmprojPath?: string | null;
+  manifestModelType?: string | null;
   loadMs?: number;
   loaded?: boolean;
   loadedModel?: string | null;
@@ -127,6 +141,8 @@ export interface NpuBundleInfo {
   modelPath: string;
   modelDir: string;
   tokenizerPath?: string | null;
+  /** `ModelPaths.mmproj_path` — null for a text-only bundle. */
+  mmprojPath?: string | null;
   /** The manifest's runtime — "qairt" for a real NPU bundle. */
   runtimeId: string | null;
   modelType?: string | null;
@@ -281,6 +297,7 @@ export interface NpuInstalledProbe {
   modelPath?: string | null;
   modelDir?: string | null;
   tokenizerPath?: string | null;
+  mmprojPath?: string | null;
   runtimeId?: string | null;
   modelType?: string | null;
   getType?: string | null;
@@ -415,7 +432,32 @@ export async function npuDeviceChipset(): Promise<NpuChipsetReport | null> {
 
 export async function npuLoad(config: NpuLoadConfig): Promise<NpuRuntimeInfo> {
   if (!moduleAvailable()) throw new Error("No Qualcomm NPU runtime in this build.");
-  return Npu!.load(JSON.stringify(config));
+  return Npu!.load(JSON.stringify(npuLoadRequest(config)));
+}
+
+/**
+ * The load request as it will actually be serialised: a key the caller left
+ * null is DROPPED, not sent as a JSON null.
+ *
+ * `JSON.stringify` keeps nulls, and Android's org.json then reads one back as
+ * the four-character string "null" — `optString(key, fallback)` returns
+ * `JSON.toString()` of the JSONObject.NULL sentinel and never takes the
+ * fallback branch. That is how `tokenizerPath: null` reached QAIRT as a path
+ * called "null" and killed the session with
+ * `qwen3::makePipeline failed: failed to open file: null`.
+ *
+ * The native side no longer reads a JSON null as a value (see
+ * `VestaNpuModule.stringOrNull`). This is the other half of the same fix, and
+ * the half that can be tested without a Qualcomm device.
+ *
+ * Exported for the tests.
+ */
+export function npuLoadRequest(config: NpuLoadConfig): NpuLoadConfig {
+  const request: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (value !== null && value !== undefined) request[key] = value;
+  }
+  return request as NpuLoadConfig;
 }
 
 export interface NpuGenerateOptions {

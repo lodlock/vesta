@@ -762,6 +762,7 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         out.putString("modelPath", paths.model_path)
         out.putString("modelDir", paths.model_dir)
         out.putString("tokenizerPath", paths.tokenizer_path)
+        out.putString("mmprojPath", paths.mmproj_path)
         out.putString("runtimeId", paths.runtime_id)
         out.putString("modelType", paths.model_type.name)
         // getType() is declared `ModelType?`, unlike ModelPaths.model_type,
@@ -1478,6 +1479,7 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         out.putString("modelPath", paths.model_path)
         out.putString("modelDir", paths.model_dir)
         out.putString("tokenizerPath", paths.tokenizer_path)
+        out.putString("mmprojPath", paths.mmproj_path)
         // The manifest's own word on which runtime this is for. The TS side
         // refuses anything that is not "qairt" before a load is attempted.
         out.putString("runtimeId", paths.runtime_id)
@@ -1562,18 +1564,40 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
                 val config = JSONObject(configJson)
-                val modelName = config.optString("modelName", "").ifBlank { null }
+                val modelName = config.stringOrNull("modelName")
 
                 // A bundle is addressed by NAME, and the model manager resolves
                 // it to paths. A raw path is accepted only as a fallback for a
                 // bundle the manager does not know about.
                 val paths = modelName?.let { ModelManagerWrapper.getPaths(it) }
-                val modelPath = stripScheme(paths?.model_path ?: config.optString("modelPath", ""))
+                val modelPath = stripScheme(paths?.model_path ?: config.stringOrNull("modelPath") ?: "")
                 val tokenizerPath =
                     stripScheme(
                         paths?.tokenizer_path?.takeIf { it.isNotBlank() }
-                            ?: config.optString("tokenizerPath", "").ifBlank { defaultTokenizerPath(modelPath) },
+                            ?: config.stringOrNull("tokenizerPath")
+                            ?: defaultTokenizerPath(modelPath),
                     )
+
+                // Everything the resolution used, printed once per attempt, so a
+                // future load failure is answerable from logcat alone. GenieX's
+                // own JNI log cannot tell an absent tokenizer_path from the
+                // string "null" — that ambiguity cost a day — so absence is
+                // spelled <absent> and every supplied value is quoted.
+                android.util.Log.i(
+                    TAG,
+                    "load: asked=${quoted(modelName)} getPaths=${paths != null}" +
+                        " | ModelPaths model_name=${quoted(paths?.model_name)}" +
+                        " model_dir=${quoted(paths?.model_dir)}" +
+                        " model_path=${quoted(paths?.model_path)}" +
+                        " tokenizer_path=${quoted(paths?.tokenizer_path)}" +
+                        " mmproj_path=${quoted(paths?.mmproj_path)}" +
+                        " runtime_id=${quoted(paths?.runtime_id)}" +
+                        " model_type=${quoted(paths?.model_type?.name)}" +
+                        " | LlmCreateInput model_path=${quoted(modelPath)}" +
+                        " tokenizer_path=${quoted(tokenizerPath)}" +
+                        " runtime_id=${quoted(RuntimeIdValue.QAIRT.value)}" +
+                        " compute_unit=${quoted(ComputeUnitValue.NPU.value)}",
+                )
 
                 if (modelPath.isBlank() || !File(modelPath).exists()) {
                     promise.reject(
@@ -1622,6 +1646,11 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                 val built = LlmWrapper.builder().llmCreateInput(input).build()
                 val wrapper =
                     built.getOrElse { error ->
+                        // The runtime's failure names a bundle, not a file. Print
+                        // what is actually in that bundle so the next reader does
+                        // not have to guess which of its paths the plugin could
+                        // not open. Read-only: names and sizes, nothing moved.
+                        logBundleInventory(paths?.model_dir ?: File(modelPath).parent)
                         promise.reject(
                             "NPU_LOAD_FAILED",
                             error.message ?: "GenieX could not create a QAIRT/NPU session",
@@ -1643,6 +1672,16 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                         it.putString("modelPath", modelPath)
                         it.putString("tokenizerPath", tokenizerPath)
                         it.putString("manifestRuntimeId", manifestRuntime)
+                        // The model manager's own answer, kept whole rather than
+                        // reduced to the two paths the create used — a diagnostics
+                        // screen comparing "what we asked for" with "what GenieX
+                        // said" needs both halves.
+                        it.putString("resolvedModelName", paths?.model_name)
+                        it.putString("modelDir", paths?.model_dir)
+                        it.putString("manifestModelPath", paths?.model_path)
+                        it.putString("manifestTokenizerPath", paths?.tokenizer_path)
+                        it.putString("manifestMmprojPath", paths?.mmproj_path)
+                        it.putString("manifestModelType", paths?.model_type?.name)
                         it.putDouble("loadMs", (System.currentTimeMillis() - started).toDouble())
                     }
                 promise.resolve(attestation)
@@ -1815,13 +1854,64 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
     private fun stripScheme(path: String): String =
         if (path.startsWith("file://")) path.removePrefix("file://") else path
 
-    // A bundle ships its tokenizer beside the weights; only fall back to that
-    // convention when neither the manifest nor the caller said where it is.
+    /**
+     * A string the caller actually supplied, or null — which `optString` is not.
+     *
+     * Android's org.json maps a JSON `null` to the JSONObject.NULL sentinel, and
+     * `optString(key, fallback)` returns `JSON.toString()` OF THAT SENTINEL —
+     * the four-character string "null" — never the fallback. It is in the
+     * platform's own bytecode: `JSONObject$1.toString()` is
+     * `const-string v0, "null"`, and `optString` only takes the fallback branch
+     * when `JSON.toString` returned a Java null.
+     *
+     * Every TypeScript caller here writes `x ?? null`, and `JSON.stringify`
+     * keeps a null. So `optString(k, "").ifBlank { … }` read the literal "null"
+     * as a real value, the fallback never ran, and `tokenizer_path` reached
+     * QAIRT as the path "null" — which is exactly what
+     * `qwen3::makePipeline failed: failed to open file: null` is: an fopen of a
+     * file called "null", from geniex::Tokenizer::from_file.
+     */
+    private fun JSONObject.stringOrNull(key: String): String? =
+        if (isNull(key)) null else optString(key, "").takeIf { it.isNotBlank() }
+
+    /**
+     * Prints what is on disk for a bundle, once, at WARN. Strictly read-only —
+     * it lists and stats, and is only ever called after a failure that already
+     * named the directory.
+     */
+    private fun logBundleInventory(dir: String?) {
+        val root = dir?.let { File(stripScheme(it)) }
+        if (root == null || !root.isDirectory) {
+            android.util.Log.w(TAG, "load: bundle directory ${quoted(dir)} is not readable")
+            return
+        }
+        val files =
+            root.walkTopDown()
+                .filter { it.isFile }
+                .sortedBy { it.absolutePath }
+                .map { "${it.relativeTo(root).path.replace(File.separatorChar, '/')} (${it.length()} bytes)" }
+                .toList()
+        android.util.Log.w(TAG, "load: ${root.absolutePath} holds ${files.size} file(s)")
+        files.forEach { android.util.Log.w(TAG, "load:   $it") }
+    }
+
+    /** Distinguishes an absent value from the STRING "null" in a log line. */
+    private fun quoted(value: String?): String = if (value == null) "<absent>" else "\"" + value + "\""
+
+    // A bundle ships its tokenizer beside the weights, under the name the
+    // runtime looks for itself — "tokenizer.json" is a literal in both
+    // libgeniex_core.so ("llm_spec_loader: tokenizer.json not found in ") and
+    // libgeniex_plugin_qairt.so ("tokenizer.json not found in: {}"). Only fall
+    // back to that convention when neither the manifest nor the caller said
+    // where it is, and only name the file when it is REALLY THERE: an empty
+    // tokenizer_path leaves the plugin to run that same search over the bundle
+    // directory, which is a better answer than handing the runtime a path to a
+    // file that does not exist.
     private fun defaultTokenizerPath(modelPath: String): String {
         if (modelPath.isBlank()) return ""
         val file = File(stripScheme(modelPath))
         val dir = if (file.isDirectory) file else file.parentFile ?: return ""
-        return File(dir, "tokenizer.json").absolutePath
+        return File(dir, "tokenizer.json").takeIf { it.isFile }?.absolutePath ?: ""
     }
 
     private fun parseMessages(json: String): Array<ChatMessage> {

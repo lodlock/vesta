@@ -37,6 +37,20 @@ loopback-only MCP server, and a smaller permission set.
 
 ### Fixed — models
 
+- **An NPU bundle could not be loaded: `failed to open file: null`** — a QAIRT
+  session was created with a tokenizer path of `"null"`, the four-character
+  string, and the Qualcomm plugin duly tried to open a file by that name.
+  Android's `org.json` is the cause: `optString(key, fallback)` returns
+  `JSON.toString()` of the `JSONObject.NULL` sentinel — `"null"` — and never
+  takes the fallback branch, so the bridge read a `tokenizerPath: null` sent by
+  the TypeScript side as a real path and the "look beside the weights" fallback
+  never ran. The bridge now distinguishes an absent value from a supplied one,
+  the load request no longer puts nulls on the wire, and the tokenizer fallback
+  names a file only when that file is actually there — an empty path leaves
+  GenieX to run its own search over the bundle. A load attempt now also logs
+  every `ModelPaths` field and both paths the session was created with, quoted,
+  so an absent value can never again be mistaken for the word "null".
+
 - **Downloaded models could become unselectable with no way back** — a model
   left in an errored state (a failed load, or a recorded size that no longer
   matched) showed no explanation on the catalog card and no action except
