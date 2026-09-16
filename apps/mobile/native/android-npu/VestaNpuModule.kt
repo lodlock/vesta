@@ -939,7 +939,12 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
                 val config = JSONObject(configJson)
-                val filter = config.optString("filter", "").ifBlank { null }
+                // Absent means absent. A JSON null read with optString() comes
+                // back as the string "null", and the runtime then looks for a
+                // chipset by that name — "chipset \"null\" not found in
+                // platform.json" is what that reads like on device. See
+                // stringOrNull.
+                val filter = config.stringOrNull("filter")
                 val relative =
                     config.optString("manifestPath", "").ifBlank { "aihub/manifest.json" }
                 val manifest = File(File(reactApplicationContext.filesDir, "geniex"), relative)
@@ -1126,7 +1131,11 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
             }
         return ModelPullInput(
             config.getString("modelName"),
-            config.optString("precision", "").ifBlank { null },
+            // Null lets GenieX pick the bundle's only precision. Read with
+            // stringOrNull so a JSON null stays null instead of becoming the
+            // literal precision "null" — see the helper for why optString
+            // cannot do this.
+            config.stringOrNull("precision"),
             hub,
             config.optString("localPath", "").ifBlank { null },
             null, // hf_token — never populated, never logged

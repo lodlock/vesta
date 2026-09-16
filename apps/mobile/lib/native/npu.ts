@@ -453,11 +453,23 @@ export async function npuLoad(config: NpuLoadConfig): Promise<NpuRuntimeInfo> {
  * Exported for the tests.
  */
 export function npuLoadRequest(config: NpuLoadConfig): NpuLoadConfig {
+  return withoutNulls(config);
+}
+
+/**
+ * One request object with every null and undefined key REMOVED.
+ *
+ * The contract is deliberately narrow: only the two values JavaScript uses to
+ * mean "nothing" are dropped. The four-character STRING "null" is a value like
+ * any other and survives — if a hub ever names a precision that, it must reach
+ * the runtime spelled the way it was given.
+ */
+function withoutNulls<T extends object>(config: T): T {
   const request: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(config)) {
     if (value !== null && value !== undefined) request[key] = value;
   }
-  return request as NpuLoadConfig;
+  return request as T;
 }
 
 export interface NpuGenerateOptions {
@@ -515,7 +527,23 @@ export async function npuUnload(): Promise<void> {
  */
 export async function npuPull(config: NpuPullConfig): Promise<NpuBundleInfo> {
   if (!moduleAvailable()) throw new Error("No Qualcomm NPU runtime in this build.");
-  return Npu!.pull(JSON.stringify(aiHubPullRequest(config)));
+  return Npu!.pull(JSON.stringify(npuPullRequest(config)));
+}
+
+/**
+ * The pull request as it will actually be serialised.
+ *
+ * `aiHubPullRequest` decides the one field this path decides — `display_name`
+ * — and this drops the keys the caller left null so none of them crosses as a
+ * JSON null. In practice that is exactly `precision`: `NpuInstallSpec` types
+ * `modelName`, `chipset` and `displayName` as non-null strings, and a null
+ * precision is the hub case, meaning "let GenieX pick the bundle's only one".
+ * It was reaching the runtime as the precision "null".
+ *
+ * Exported for the tests.
+ */
+export function npuPullRequest(config: NpuPullConfig): NpuPullConfig {
+  return withoutNulls(aiHubPullRequest(config));
 }
 
 /** Exported for the tests: the request as it will actually be serialised. */
@@ -606,10 +634,27 @@ export async function npuHubListProbe(
 ): Promise<NpuHubListProbe | null> {
   if (!moduleAvailable()) return null;
   try {
-    return await Npu!.hubListProbe(JSON.stringify({ filter }));
+    return await Npu!.hubListProbe(JSON.stringify(npuHubListProbeRequest(filter)));
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/**
+ * The probe request as it will actually be serialised.
+ *
+ * "No filter" is the whole point of the unfiltered probe, and it must arrive
+ * as no filter. Sent as a JSON null it arrived as the string "null", and the
+ * runtime went looking for a chipset by that name — on device that reads
+ * `chipset "null" not found in platform.json`. The production scan, which
+ * passes a real chipset, is unaffected: a string is passed straight through.
+ *
+ * Exported for the tests.
+ */
+export function npuHubListProbeRequest(
+  filter: string | null,
+): { filter?: string | null } {
+  return withoutNulls({ filter });
 }
 
 /**
