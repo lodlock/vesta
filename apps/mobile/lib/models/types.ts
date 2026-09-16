@@ -118,6 +118,21 @@ export interface InstalledModel {
   createdAt: number;
 }
 
+/**
+ * What the UI is told while an automatic retry is pending. Never a fake byte
+ * count — the policy that produces it lives in download-retry.ts.
+ */
+export interface RetryState {
+  /** 1-based: the attempt about to be made. */
+  attempt: number;
+  /** The cap, or null when the user asked for unlimited. */
+  max: number | null;
+  /** Whole seconds left in the wait, for the countdown. */
+  secondsRemaining: number;
+  /** What actually failed, in the runtime's own terms. */
+  reason: string;
+}
+
 // Live download progress, surfaced to the UI via the model store.
 export interface DownloadProgress {
   modelId: string;
@@ -127,4 +142,13 @@ export interface DownloadProgress {
   bytesPerSec: number;
   etaSeconds: number | null;
   error?: string;
+  /**
+   * Set only while an automatic retry is waiting to start.
+   *
+   * Its presence is the signal that the byte counts above are STALE — they are
+   * whatever the failed attempt last reported, and nothing is transferring. The
+   * UI shows the retry line instead of a progress bar for exactly as long as
+   * this is here, and the bar comes back when the next attempt does.
+   */
+  retry?: RetryState;
 }

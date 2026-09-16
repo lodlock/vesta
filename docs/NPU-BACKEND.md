@@ -662,6 +662,36 @@ Anything else is reported as "the Qualcomm runtime refused this install with
 code `<n>`". Inventing an explanation for an unverified code is worse than
 offering none — it sends the reader somewhere that is not the problem.
 
+### `-100005`, and why it is retried without being named
+
+One code is treated specially without appearing in that table, and the
+distinction is deliberate: Vesta retries it, and still does not claim to know
+what it means.
+
+There is no name to be had. `javap -constants` gives three codes and this is not
+one of them, Qualcomm's published definitions gave us `-100010` and not this, and
+`libgeniex.so` carries no constant name for it — the `-1000xx` values are
+Rust-side integers built as instruction immediates, so there is no string and no
+data to grep for.
+
+What is established is the behaviour, from two directions:
+
+- **On device.** It appears repeatedly during large pulls; the SAME request has
+  failed and later succeeded with nothing changed; and a retry after a failure
+  at ~97% of 2.4 GB fetched roughly the remainder rather than starting again.
+- **In the SDK.** `libgeniex.so` carries `GENIEX_DL_CHUNK_SIZE`,
+  `byte range starts at `, `local range short read for `, and two
+  `get_range retry ` messages — one formatted with a transport error, one with
+  an HTTP status — beside `.inflight` and `.progress`. The downloader fetches
+  ranged chunks, already retries them internally, and keeps what it has.
+
+So a pull failure is what surfaces when GenieX's own retries run out, and asking
+again resumes rather than restarts. `npu-errors.isTransientPullFailure` is that
+one code and nothing else; the policy around it (whether, how often, how long to
+wait) is `models/download-retry.ts`, and the user controls it under
+Settings → Downloads. Nothing on the retry path removes a bundle, calls
+`remove()` or calls `clean()` — the partial download is the whole point.
+
 ### Other refusals the runtime can give
 
 Two more, distinguishable from `-100010` by their text rather than their code:

@@ -24,6 +24,13 @@ import { loadModel, unloadModel, getModelInfo } from "../../llm/llm-engine";
 import { npuBundleInfo } from "../../native/npu";
 import type { InstalledModel } from "../../models/types";
 
+// The store now reads one user setting straight from the config table (whether
+// to retry an interrupted download). Mocked like every other edge this suite
+// stubs — expo-sqlite has no native side here.
+jest.mock("../../storage/database", () => ({
+  getConfig: jest.fn(async () => null),
+  setConfig: jest.fn(async () => {}),
+}));
 jest.mock("expo-file-system/legacy", () => ({
   documentDirectory: "file:///docs/",
   cacheDirectory: "file:///cache/",

@@ -18,6 +18,13 @@ import { sha256File } from "../../native/file-hash";
 const GOOD = "a".repeat(64);
 const OTHER = "b".repeat(64);
 
+// The store now reads one user setting straight from the config table (whether
+// to retry an interrupted download). Mocked like every other edge this suite
+// stubs — expo-sqlite has no native side here.
+jest.mock("../../storage/database", () => ({
+  getConfig: jest.fn(async () => null),
+  setConfig: jest.fn(async () => {}),
+}));
 jest.mock("expo-file-system/legacy", () => ({
   documentDirectory: "file:///docs/",
   getInfoAsync: jest.fn(async () => ({ exists: true, size: 2_500_000_000 })),

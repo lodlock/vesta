@@ -72,7 +72,16 @@ import {
   type HubState,
   type CompatibleHubModel,
 } from "../models/npu-hub";
-import { describeGenieXFailure } from "../models/npu-errors";
+import {
+  describeGenieXFailure,
+  isTransientPullFailure,
+} from "../models/npu-errors";
+import {
+  getDownloadRetrySettings,
+  retryAllowed,
+  retryDelayMs,
+  waitForRetry,
+} from "../models/download-retry";
 import { checkGgufFile } from "../models/gguf-header";
 import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
 import { sha256File, normalizeSha256 } from "../native/file-hash";
@@ -335,6 +344,110 @@ function failActivation(set: Setter, id: string, message: string): void {
   }));
 }
 
+/**
+ * Cancellation that reaches a retry backoff, not just an active pull.
+ *
+ * Keyed by registry row id, which is the id Cancel already carries. Module
+ * level for the same reason runNpuInstall is: the store action decides whether
+ * an install may start, this is the state one install has while it runs.
+ */
+const installAborts = new Map<string, AbortController>();
+
+/** Cancels the wait as well as the pull. No-op for an install already gone. */
+function abortInstall(id: string): void {
+  installAborts.get(id)?.abort();
+}
+
+/**
+ * One pull, asked for again while the failure is transient and the user said to.
+ *
+ * ## Why this is a loop and not a scheduler
+ *
+ * Each attempt is `await`ed to completion before the next is even considered,
+ * so two pullFlows cannot overlap by construction — there is no timer holding a
+ * reference to a pull, no queue, and nothing that fires while a request is in
+ * flight. That matters because the native side enforces the same rule from the
+ * other side (`pull()` rejects with NPU_PULL_BUSY while `pullJob` is active),
+ * and a retry that raced its own predecessor would turn a transient network
+ * failure into a permanent-looking BUSY.
+ *
+ * ## What is deliberately not here
+ *
+ * Nothing is deleted between attempts. No `removeBundle`, no `clean()`, no
+ * touching the SDK's cache — GenieX keeps the partial download in `.inflight`
+ * and resumes it, which is the entire reason retrying is cheaper than
+ * restarting. See download-retry.ts for the evidence.
+ *
+ * The settings are read INSIDE the loop, once per decision, so a user who turns
+ * auto-retry off mid-backoff is obeyed by the next decision rather than by the
+ * value that was current when the download started.
+ */
+async function pullWithRetry(
+  set: Setter,
+  request: Parameters<typeof npuPull>[0],
+  rowId: string,
+  signal: AbortSignal,
+): Promise<Awaited<ReturnType<typeof npuPull>>> {
+  let failures = 0;
+
+  for (;;) {
+    try {
+      return await npuPull(request);
+    } catch (err) {
+      // Read now, not at install time: this is what makes the setting live.
+      const settings = await getDownloadRetrySettings();
+
+      // Three separate reasons to stop, and the user sees the ORIGINAL error
+      // in every one of them — a retry policy that swallowed the runtime's own
+      // words would be worse than no retry at all.
+      if (
+        signal.aborted ||
+        !isTransientPullFailure(err) ||
+        !retryAllowed(failures, settings)
+      ) {
+        throw err;
+      }
+
+      failures += 1;
+      const max = settings.maxRetries === "unlimited" ? null : settings.maxRetries;
+      const reason = describeGenieXFailure(err);
+
+      // No byte counts while nothing is transferring. The last progress event
+      // is stale the moment the pull failed, and a bar frozen at 97% reads as a
+      // hung download rather than a waiting one.
+      const publish = (secondsRemaining: number) =>
+        set((state) => {
+          const current = state.progress[rowId];
+          if (!current) return {};
+          return {
+            progress: {
+              ...state.progress,
+              [rowId]: {
+                ...current,
+                retry: { attempt: failures, max, secondsRemaining, reason },
+              },
+            },
+          };
+        });
+
+      const proceed = await waitForRetry(
+        retryDelayMs(failures),
+        signal,
+        publish,
+      );
+      if (!proceed) throw err; // cancelled during the wait
+
+      // Back to the ordinary download UI for the next attempt.
+      set((state) => {
+        const current = state.progress[rowId];
+        if (!current) return {};
+        const { retry: _retry, ...rest } = current;
+        return { progress: { ...state.progress, [rowId]: rest } };
+      });
+    }
+  }
+}
+
 async function runNpuInstall(
   set: Setter,
   get: Getter,
@@ -410,14 +523,26 @@ async function runNpuInstall(
     }));
   });
 
+  // One controller per install, so Cancel reaches the WAIT as well as the pull.
+  // During a backoff there is no pullFlow to cancel — npuCancelPull() would be
+  // a no-op — and a user who has decided to stop should not sit through ten
+  // seconds of countdown for a download that is already over.
+  const abort = new AbortController();
+  installAborts.set(row.id, abort);
+
   try {
-    const bundle = await npuPull({
+    // The same request, asked again. Byte for byte the same: the identity a
+    // resume depends on is `modelName` + `chipset` + `precision`, and a retry
+    // that changed any of them would be a different download, not a
+    // continuation of this one.
+    const request = {
       modelName: spec.modelName,
       chipset: spec.chipset,
       precision: spec.precision,
       hub: spec.hub,
       displayName: spec.displayName,
-    });
+    };
+    const bundle = await pullWithRetry(set, request, row.id, abort.signal);
 
     // Everything that could make this unloadable, decided from the file
     // listing rather than from a load attempt that costs 20+ seconds and an
@@ -476,8 +601,11 @@ async function runNpuInstall(
     if (!active) await get().activate(row.id);
   } catch (err) {
     // A cancelled or failed pull leaves partial files in the SDK's cache,
-    // where a later pull resumes them. The ROW goes, because a row pointing
-    // at an incomplete bundle is what makes a later load fail confusingly.
+    // where a later pull resumes them — and automatic retry is built on
+    // exactly that, so nothing here removes a bundle, calls remove() or calls
+    // clean(). The ROW goes, because a row pointing at an incomplete bundle is
+    // what makes a later load fail confusingly; pressing Download again starts
+    // a fresh retry cycle on top of the bytes this attempt left behind.
     await removeModel(row.id);
     await get().refresh();
     // Readable, with the runtime's own code kept on the end — see npu-errors.
@@ -495,6 +623,7 @@ async function runNpuInstall(
     );
   } finally {
     unsubscribe();
+    installAborts.delete(row.id);
     set((state) => {
       const progress = { ...state.progress };
       delete progress[row.id];
@@ -1014,6 +1143,10 @@ export const useModelStore = create<ModelState>((set, get) => ({
   },
 
   cancelNpuInstall: async (id: string) => {
+    // The wait first, then the pull. During a backoff there is nothing for
+    // npuCancelPull() to stop, and without this the loop would sit out the
+    // countdown and then start an attempt the user had already cancelled.
+    abortInstall(id);
     npuCancelPull();
     const model = await getModelById(id);
     if (model?.runtimeModelName) {

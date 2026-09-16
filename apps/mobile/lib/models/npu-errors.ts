@@ -139,3 +139,56 @@ function runtimeDetail(failure: GenieXFailure): string | null {
 export function isHubModelNotFound(err: unknown): boolean {
   return readGenieXFailure(err).rc === -100010;
 }
+
+/**
+ * The one code an interrupted download is worth simply asking for again.
+ *
+ * ## What -100005 is, and what it is not
+ *
+ * It is not named anywhere available. `javap -constants` on
+ * `ModelManagerWrapper` yields three codes and this is not among them
+ * (`GENIEX_SUCCESS` 0, `GENIEX_ERROR_CANCELLED` -100006,
+ * `GENIEX_ERROR_ALREADY_INITIALIZED` -100008); Qualcomm's published definitions
+ * gave us -100010 and not this; and `libgeniex.so` carries no constant name for
+ * it, because the -1000xx codes are Rust-side integers built as instruction
+ * immediates, not strings and not data. Grepping the binary for the name would
+ * find nothing because there is nothing to find. So this deliberately does NOT
+ * claim a meaning — `npu-errors`' own rule is that an invented explanation for
+ * an unverified code is worse than none, and that rule is not suspended because
+ * a retry would be convenient.
+ *
+ * What IS established is the behaviour, from two independent directions.
+ *
+ * From the device: it appears repeatedly during large pulls, the SAME request
+ * has failed and later succeeded with nothing changed, and a retry after a
+ * failure at ~97% of 2.4 GB fetched roughly the remainder instead of starting
+ * over. A code that resolves itself on an identical request is transient by
+ * definition, and one whose partial work survives is safe to resume.
+ *
+ * From the SDK: `libgeniex.so` carries `GENIEX_DL_CHUNK_SIZE`,
+ * `byte range starts at `, `local range short read for ` and two
+ * `get_range retry ` messages — one formatted with a transport error, one with
+ * an HTTP status — beside `.inflight` and `.progress`. The downloader fetches
+ * ranged chunks, already retries them internally, and keeps what it has. A pull
+ * failure is what the user sees when those internal retries run out; asking
+ * again is resuming, not restarting.
+ *
+ * ## Why exactly one code
+ *
+ * Every other rc either has a verified meaning that is NOT transient
+ * (-100010 is a 404: the asset is absent, and asking twice cannot publish it;
+ * -100006 is the user's own cancel) or has no meaning we can source at all. An
+ * unknown code is not evidence of transience — retrying one could mean burning
+ * a user's data on a request that can never succeed. So the list is this single
+ * number, and it grows only when another code has the same two kinds of
+ * evidence behind it.
+ */
+export function isTransientPullFailure(err: unknown): boolean {
+  return readGenieXFailure(err).rc === TRANSIENT_PULL_RC;
+}
+
+/**
+ * Observed on device as a transient download failure. Named, not inlined, so
+ * the number appears once and the tests can state which code they mean.
+ */
+export const TRANSIENT_PULL_RC = -100005;

@@ -23,6 +23,13 @@ import { npuHubModels } from "../../native/npu";
 import { breakDownHubModels, type HubModel } from "../../models/npu-hub";
 import type { RuntimeChipset } from "../../models/chipset-identity";
 
+// The store now reads one user setting straight from the config table (whether
+// to retry an interrupted download). Mocked like every other edge this suite
+// stubs — expo-sqlite has no native side here.
+jest.mock("../../storage/database", () => ({
+  getConfig: jest.fn(async () => null),
+  setConfig: jest.fn(async () => {}),
+}));
 jest.mock("expo-file-system/legacy", () => ({
   documentDirectory: "file:///docs/",
   cacheDirectory: "file:///cache/",

@@ -27,7 +27,14 @@ import {
 } from "../lib/models/npu-hub";
 import type { RuntimeChipset } from "../lib/models/chipset-identity";
 import { isNpuModel } from "../lib/models/npu-compat";
-import type { CatalogModel, InstalledModel, ModelTrust } from "../lib/models/types";
+import type {
+  CatalogModel,
+  DownloadProgress,
+  InstalledModel,
+  ModelTrust,
+  RetryState,
+} from "../lib/models/types";
+import { describeRetry } from "../lib/models/download-retry";
 import { formatBytes, formatDuration, percent, fitLabel, type FitLabel } from "../lib/models/format";
 import { canActivate, canVerify } from "../lib/models/activation";
 import { colors, spacing, radii, typography } from "../lib/theme";
@@ -298,7 +305,40 @@ function fitStyle(level: FitLabel["level"]) {
   }
 }
 
-function ProgressBar({ written, total, etaSeconds }: { written: number; total: number; etaSeconds: number | null }) {
+/**
+ * Download progress, or — while an automatic retry is waiting — the retry
+ * instead of it.
+ *
+ * Not both, and never a bar on top of a retry line. When a pull fails the last
+ * byte count it reported is stale and nothing is transferring; a bar frozen at
+ * 97% reads as a hung download rather than a waiting one, and the whole point
+ * of saying "Retrying 2 of 3" is that the user can tell those apart. The bar
+ * returns the moment the next attempt starts, because the retry field is
+ * cleared then.
+ */
+function ProgressBar({
+  written,
+  total,
+  etaSeconds,
+  retry,
+}: {
+  written: number;
+  total: number;
+  etaSeconds: number | null;
+  retry?: RetryState;
+}) {
+  if (retry) {
+    return (
+      <View style={styles.progressContainer}>
+        <Text style={styles.retryText}>{describeRetry(retry)}</Text>
+        {/* The runtime's own words for what went wrong, kept: a retry that
+            hid the reason would make a repeating failure unreadable. */}
+        <Text style={styles.retryReason} numberOfLines={2}>
+          {retry.reason}
+        </Text>
+      </View>
+    );
+  }
   const pct = percent(written, total);
   return (
     <View style={styles.progressContainer}>
@@ -389,7 +429,7 @@ function CatalogRow({
 }: {
   model: CatalogModel;
   installed: InstalledModel | undefined;
-  progress: Record<string, { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string }>;
+  progress: Record<string, DownloadProgress>;
   fit: FitLabel;
   onDownload: () => void;
   onActivate: (id: string) => void;
@@ -434,7 +474,12 @@ function CatalogRow({
       {installed && <ActivationError modelId={installed.id} />}
 
       {downloading && prog && (
-        <ProgressBar written={prog.bytesWritten} total={prog.bytesTotal} etaSeconds={prog.etaSeconds} />
+        <ProgressBar
+          written={prog.bytesWritten}
+          total={prog.bytesTotal}
+          etaSeconds={prog.etaSeconds}
+          retry={prog.retry}
+        />
       )}
 
       <View style={styles.btnRow}>
@@ -484,7 +529,7 @@ function InstalledRow({
   onVerify,
 }: {
   model: InstalledModel;
-  progress?: { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string };
+  progress?: DownloadProgress;
   onActivate: (id: string) => void;
   onCancel: (id: string) => void;
   onRemove: (m: InstalledModel) => void;
@@ -507,7 +552,12 @@ function InstalledRow({
       <ActivationError modelId={model.id} />
 
       {downloading && progress && (
-        <ProgressBar written={progress.bytesWritten} total={progress.bytesTotal} etaSeconds={progress.etaSeconds} />
+        <ProgressBar
+          written={progress.bytesWritten}
+          total={progress.bytesTotal}
+          etaSeconds={progress.etaSeconds}
+          retry={progress.retry}
+        />
       )}
 
       <View style={styles.btnRow}>
@@ -565,7 +615,7 @@ function NpuSection({
   errors: Record<string, string>;
   catalog: NpuCatalogModel[];
   installedFor: (modelName: string) => InstalledModel | undefined;
-  progress: Record<string, { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string }>;
+  progress: Record<string, DownloadProgress>;
   onCheckHub: () => void;
   onImport: (m: NpuCatalogModel) => void;
   onInstall: (m: NpuCatalogModel) => void;
@@ -681,6 +731,7 @@ function NpuSection({
                   written={prog.bytesWritten}
                   total={prog.bytesTotal}
                   etaSeconds={prog.etaSeconds}
+                  retry={prog.retry}
                 />
               )}
               {downloading && !prog && (
@@ -804,7 +855,7 @@ function HubCatalogSection({
   soc: string | null;
   chipsets: RuntimeChipset[] | undefined;
   installed: (modelName: string) => InstalledModel | undefined;
-  progress: Record<string, { bytesWritten: number; bytesTotal: number; etaSeconds: number | null; status: string }>;
+  progress: Record<string, DownloadProgress>;
   errors: Record<string, string>;
   onRefresh: () => void;
   onInstall: (m: CompatibleHubModel) => void;
@@ -931,6 +982,7 @@ function HubCatalogSection({
                 written={prog.bytesWritten}
                 total={prog.bytesTotal}
                 etaSeconds={prog.etaSeconds}
+                retry={prog.retry}
               />
             )}
             {downloading && !prog && (
@@ -1100,6 +1152,8 @@ const styles = StyleSheet.create({
   progressTrack: { height: 4, backgroundColor: colors.borderLight, borderRadius: 2, overflow: "hidden", marginBottom: 8 },
   progressFill: { height: "100%", backgroundColor: colors.accent, borderRadius: 2 },
   progressText: { color: colors.textMuted, fontSize: 12 },
+  retryText: { color: colors.textPrimary, fontSize: 13, fontWeight: "600" },
+  retryReason: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
   hfInputRow: { flexDirection: "row", gap: 10, marginTop: spacing.md, alignItems: "center" },
   hfInput: {
     flex: 1,

@@ -12,6 +12,8 @@ import {
   readGenieXFailure,
   describeGenieXFailure,
   isHubModelNotFound,
+  isTransientPullFailure,
+  TRANSIENT_PULL_RC,
 } from "../npu-errors";
 
 describe("the code that prompted all this", () => {
@@ -140,5 +142,64 @@ describe("parsing the code out of the runtime's string", () => {
   it("does not match a substring of another key", () => {
     // `src=-5` must not read as `rc=-5`.
     expect(readGenieXFailure(new Error("src=-5 failed")).rc).toBeNull();
+  });
+});
+
+// Which failures are worth asking again for.
+//
+// The classification is GenieX's half of the retry story (the policy — how many
+// times, how long — is download-retry.ts). It is one code, and it stays one
+// code until another has the same evidence behind it: repeated on device during
+// large pulls, the identical request later succeeding, and partial work that
+// survives the failure.
+describe("transient pull failures", () => {
+  const rc = (code: number) => new Error(`rc=${code}: geniex_model_pull failed`);
+
+  it("recognises the code observed on device", () => {
+    expect(TRANSIENT_PULL_RC).toBe(-100005);
+    expect(isTransientPullFailure(rc(TRANSIENT_PULL_RC))).toBe(true);
+  });
+
+  // A 404 is not transient. Asking twice cannot make Qualcomm publish an asset,
+  // and a retry loop against it would just spend the user's battery.
+  it("does not treat a hub 404 as transient", () => {
+    expect(isTransientPullFailure(rc(-100010))).toBe(false);
+  });
+
+  // The user's own cancel arrives as a code like any other, and retrying it
+  // would restart exactly what they just stopped.
+  it("does not treat a cancel as transient", () => {
+    expect(isTransientPullFailure(rc(-100006))).toBe(false);
+  });
+
+  // An unsourced code is not evidence of transience. Retrying one could mean
+  // repeating a request that can never succeed.
+  it("does not treat an unrecognised code as transient", () => {
+    expect(isTransientPullFailure(rc(-100099))).toBe(false);
+    expect(isTransientPullFailure(rc(-100001))).toBe(false);
+  });
+
+  it("does not treat a failure without a code as transient", () => {
+    expect(isTransientPullFailure(new Error("No usable Qualcomm NPU runtime"))).toBe(
+      false,
+    );
+    expect(isTransientPullFailure(null)).toBe(false);
+  });
+
+  // The number leads the message, so a code in the middle of prose is not a
+  // match — the same rule readGenieXFailure already applies.
+  it("reads the code the same way every other caller does", () => {
+    expect(isTransientPullFailure(new Error("rc=-100005"))).toBe(true);
+    expect(isTransientPullFailure(new Error("failed with -100005"))).toBe(false);
+  });
+
+  // Still reported with its number and the runtime's own words: a retry policy
+  // that swallowed the reason would make a repeating failure unreadable.
+  it("keeps the runtime's own text for the user", () => {
+    const text = describeGenieXFailure(
+      new Error(`rc=${TRANSIENT_PULL_RC}: connection reset`),
+    );
+    expect(text).toContain("-100005");
+    expect(text).toContain("connection reset");
   });
 });

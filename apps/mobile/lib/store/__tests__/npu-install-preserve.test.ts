@@ -21,6 +21,13 @@ import {
 import { npuPull, npuRemoveBundle } from "../../native/npu";
 import type { CompatibleHubModel } from "../../models/npu-hub";
 
+// The store now reads one user setting straight from the config table (whether
+// to retry an interrupted download). Mocked like every other edge this suite
+// stubs — expo-sqlite has no native side here.
+jest.mock("../../storage/database", () => ({
+  getConfig: jest.fn(async () => null),
+  setConfig: jest.fn(async () => {}),
+}));
 jest.mock("expo-file-system/legacy", () => ({
   documentDirectory: "file:///docs/",
   getInfoAsync: jest.fn(async () => ({ exists: true, size: 1 })),

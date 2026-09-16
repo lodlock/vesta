@@ -27,12 +27,25 @@ import {
   type PerfSettings,
 } from "../lib/llm/perf-config";
 import {
+  getDownloadRetrySettings,
+  setDownloadRetrySettings,
+  DEFAULT_DOWNLOAD_RETRY,
+  RETRY_LIMIT_CHOICES,
+  type DownloadRetrySettings,
+  type RetryLimit,
+} from "../lib/models/download-retry";
+import {
   isDefaultAssistant,
   requestAssistantRole,
   type AssistantRoleOutcome,
 } from "../lib/native/assist";
 import { colors, spacing, radii, typography } from "../lib/theme";
 import type { Language } from "../lib/orchestrator/types";
+
+/** "Unlimited" reads better than the value that encodes it. */
+function retryLimitLabel(limit: RetryLimit): string {
+  return limit === "unlimited" ? "Unlimited" : String(limit);
+}
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -68,6 +81,23 @@ export default function SettingsScreen() {
   useEffect(() => {
     getPerfSettings().then(setPerf).catch(() => {});
   }, []);
+
+  // Download recovery. No reload and no busy flag: the store re-reads this at
+  // the moment it decides whether to retry, so a change reaches a download that
+  // is backing off right now.
+  const [retry, setRetry] = useState<DownloadRetrySettings>(
+    DEFAULT_DOWNLOAD_RETRY,
+  );
+  const [showRetryAdvanced, setShowRetryAdvanced] = useState(false);
+
+  useEffect(() => {
+    getDownloadRetrySettings().then(setRetry).catch(() => {});
+  }, []);
+
+  const updateRetry = (next: DownloadRetrySettings) => {
+    setRetry(next);
+    setDownloadRetrySettings(next).catch(() => {});
+  };
 
   // Persist a perf change, then reload the model so it takes effect.
   const updatePerf = async (next: PerfSettings) => {
@@ -353,6 +383,74 @@ export default function SettingsScreen() {
         )}
       </View>
 
+      {/* Downloads section. One switch by default; the cap is behind Advanced,
+          because "how many times" is a question almost nobody has and the
+          answer that matters — whether to recover at all — is the toggle. */}
+      <Text style={styles.sectionTitle}>Downloads</Text>
+      <View style={styles.card}>
+        <View style={styles.toggleRow}>
+          <View style={styles.toggleInfo}>
+            <Text style={styles.toggleTitle}>
+              Automatically retry interrupted model downloads
+            </Text>
+            <Text style={styles.toggleHint}>
+              A multi-gigabyte model download can be cut short by a brief
+              network problem. Vesta waits and asks for the rest — it resumes
+              where it stopped and never starts the download again from zero.
+            </Text>
+          </View>
+          <Switch
+            value={retry.autoRetry}
+            onValueChange={(v) => updateRetry({ ...retry, autoRetry: v })}
+            trackColor={{ false: colors.disabled, true: colors.accent }}
+          />
+        </View>
+
+        <TouchableOpacity
+          onPress={() => setShowRetryAdvanced((v) => !v)}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.advancedToggle}>
+            {showRetryAdvanced ? "Hide advanced" : "Advanced"}
+          </Text>
+        </TouchableOpacity>
+
+        {showRetryAdvanced && (
+          <View style={styles.toggleRow}>
+            <View style={styles.toggleInfo}>
+              <Text style={styles.toggleTitle}>Maximum retries</Text>
+              <Text style={styles.toggleHint}>
+                How many times to try again before leaving it to you. Unlimited
+                keeps waiting between attempts and stays cancellable.
+              </Text>
+            </View>
+            <View style={styles.choiceRow}>
+              {RETRY_LIMIT_CHOICES.map((choice) => (
+                <TouchableOpacity
+                  key={String(choice)}
+                  style={[
+                    styles.choiceChip,
+                    retry.maxRetries === choice && styles.choiceChipOn,
+                  ]}
+                  disabled={!retry.autoRetry}
+                  onPress={() => updateRetry({ ...retry, maxRetries: choice })}
+                  activeOpacity={0.7}
+                >
+                  <Text
+                    style={[
+                      styles.choiceChipText,
+                      retry.maxRetries === choice && styles.choiceChipTextOn,
+                    ]}
+                  >
+                    {retryLimitLabel(choice)}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+        )}
+      </View>
+
       {/* Diagnostics section */}
       <Text style={styles.sectionTitle}>Diagnostics</Text>
       <View style={styles.card}>
@@ -591,6 +689,35 @@ const styles = StyleSheet.create({
     fontSize: 13,
     marginTop: 3,
     lineHeight: 18,
+  },
+  advancedToggle: {
+    color: colors.accent,
+    fontSize: 13,
+    fontWeight: "600",
+    marginBottom: spacing.md,
+  },
+  choiceRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing.sm,
+    justifyContent: "flex-end",
+  },
+  choiceChip: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: radii.sm,
+    backgroundColor: colors.accentMuted,
+  },
+  choiceChipOn: {
+    backgroundColor: colors.accent,
+  },
+  choiceChipText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: colors.accent,
+  },
+  choiceChipTextOn: {
+    color: colors.surface,
   },
   stepperRow: {
     flexDirection: "row",
