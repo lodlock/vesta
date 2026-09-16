@@ -976,10 +976,16 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * contract is what this has to be written against, and `!!` on a value
      * that is merely expected is how a crash gets shipped. `hub` is NOT
      * nullable (the compiler accepts `input.hub.name`) and is read directly.
+     *
+     * `display_name` is printed explicitly, and beside `model_name` rather than
+     * at the end: the two together are the request GenieX resolves against, and
+     * a failure quoting a name back (`model … not found on hub`) is only
+     * readable when the log says which of the two it was echoing.
      */
     private fun describeRequest(input: ModelPullInput): String {
         val type = input.model_type?.name ?: "unspecified"
-        return "model=${input.model_name} chipset=${input.chipset} " +
+        return "model=${input.model_name} displayName=${input.display_name} " +
+            "chipset=${input.chipset} " +
             "precision=${input.precision} hub=${input.hub.name} type=$type " +
             "runtime=${RuntimeIdValue.QAIRT.value} compute=${ComputeUnitValue.NPU.value}"
     }

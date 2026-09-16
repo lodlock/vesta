@@ -352,6 +352,33 @@ export function hubModelLabel(name: string): string {
   return repo.replace(/[_-]+/g, " ").trim() || name;
 }
 
+/**
+ * The AI Hub `display_name` implied by a catalogue identifier, or null.
+ *
+ * `listHubModels()` builds every row it returns as `qualcomm/<display_name>`,
+ * so for those rows the hub's own display name is recoverable exactly — by
+ * removing the prefix and doing nothing else. That is the whole rule:
+ *
+ *     qualcomm/Qwen3-4B-Instruct-2507  ->  Qwen3-4B-Instruct-2507
+ *
+ * Deliberately NOT {@link hubModelLabel}, which relaxes `-` and `_` to spaces
+ * for a card title. That label is a human-readable one and has been going out
+ * on the wire as `display_name`; "Qwen3 4B Instruct 2507" is the string GenieX
+ * 0.4.0 quoted back in `model … not found on hub`. Nothing here prettifies:
+ * no case change, no punctuation change, no hyphens to spaces, and not the
+ * snake_case manifest id either.
+ *
+ * Null for anything that is not exactly `qualcomm/<non-empty>` — a model from
+ * another hub, a bare name, or the prefix alone. A null means "send whatever
+ * the caller had", so a non-Qualcomm request is left byte-identical.
+ */
+export function aiHubDisplayName(modelName: string): string | null {
+  const PREFIX = "qualcomm/";
+  if (!modelName.startsWith(PREFIX)) return null;
+  const derived = modelName.slice(PREFIX.length);
+  return derived.length > 0 ? derived : null;
+}
+
 // ── Persistence ───────────────────────────────────────────────────────────
 //
 // A catalogue survives a restart so the Models screen has something to show

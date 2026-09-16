@@ -16,6 +16,7 @@
 // with whatever comes back.
 
 import {
+  aiHubDisplayName,
   breakDownHubModels,
   hubAvailability,
   hubModelLabel,
@@ -308,5 +309,45 @@ describe("the cached catalogue", () => {
       checkedAt: 7,
       cached: true,
     });
+  });
+});
+
+describe("the display_name a catalogue identifier implies", () => {
+  // listHubModels() builds every row as `qualcomm/<display_name>`, so the
+  // hub's own display name comes back exactly by removing the prefix.
+  it("is the catalogue name with the qualcomm/ prefix removed", () => {
+    expect(aiHubDisplayName("qualcomm/Qwen3-4B-Instruct-2507")).toBe(
+      "Qwen3-4B-Instruct-2507",
+    );
+  });
+
+  // The rule is generic. Nothing here knows or cares which model it is.
+  it("applies to any catalogue row, not one known model", () => {
+    expect(aiHubDisplayName("qualcomm/Llama-v3.2-3B-Chat")).toBe(
+      "Llama-v3.2-3B-Chat",
+    );
+    expect(aiHubDisplayName("qualcomm/Baichuan2-7B")).toBe("Baichuan2-7B");
+  });
+
+  // The whole point of not reusing hubModelLabel(): that one relaxes
+  // separators for a card title, and the relaxed string is what GenieX 0.4.0
+  // has been quoting back as not found.
+  it("changes no punctuation and no case", () => {
+    expect(aiHubDisplayName("qualcomm/Qwen3-4B-Instruct-2507")).not.toContain(" ");
+    expect(hubModelLabel("qualcomm/Qwen3-4B-Instruct-2507")).toBe(
+      "Qwen3 4B Instruct 2507",
+    );
+    expect(aiHubDisplayName("qualcomm/MiXeD_Case-Name")).toBe("MiXeD_Case-Name");
+  });
+
+  it("declines anything that is not exactly qualcomm/<non-empty>", () => {
+    expect(aiHubDisplayName("ai-hub-models/Qwen3-4B-Instruct-2507")).toBeNull();
+    expect(aiHubDisplayName("Qwen3-4B-Instruct-2507")).toBeNull();
+    expect(aiHubDisplayName("qualcomm/")).toBeNull();
+    expect(aiHubDisplayName("")).toBeNull();
+    // Case-sensitive on purpose: normalising it would be a guess.
+    expect(aiHubDisplayName("Qualcomm/Qwen3-4B-Instruct-2507")).toBeNull();
+    // A prefix that merely starts the same way is not the prefix.
+    expect(aiHubDisplayName("qualcomm-labs/Thing")).toBeNull();
   });
 });

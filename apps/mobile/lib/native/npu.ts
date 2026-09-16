@@ -12,6 +12,8 @@
 
 import { NativeEventEmitter, NativeModules, Platform } from "react-native";
 
+import { aiHubDisplayName } from "../models/npu-hub";
+
 const Npu = NativeModules.VestaNpuModule as NpuNativeModule | undefined;
 
 interface NpuNativeModule {
@@ -407,9 +409,32 @@ export async function npuUnload(): Promise<void> {
 
 // ── Bundle install ───────────────────────────────────────────────────────
 
+/**
+ * The one place an AI Hub pull request is finalised before it crosses to the
+ * runtime — so every catalogue model gets the same treatment, not just the one
+ * the Models screen happens to feature.
+ *
+ * The only thing decided here is `display_name`. Callers pass a human-readable
+ * card title (`Qwen3 4B Instruct 2507`), and that is what has been going out on
+ * the wire — it is the string GenieX 0.4.0 quotes back in `model … not found on
+ * hub`. For a row `listHubModels()` returned, the hub's real display name is
+ * recoverable exactly from the identifier, so it is derived instead. See
+ * {@link aiHubDisplayName} for the rule; it is a prefix removal and nothing
+ * more. A name from any other hub keeps whatever the caller passed, unchanged.
+ *
+ * Nothing else about the request is touched: model_name stays the full string
+ * the catalogue returned, and hub, chipset and precision are passed through.
+ */
 export async function npuPull(config: NpuPullConfig): Promise<NpuBundleInfo> {
   if (!moduleAvailable()) throw new Error("No Qualcomm NPU runtime in this build.");
-  return Npu!.pull(JSON.stringify(config));
+  return Npu!.pull(JSON.stringify(aiHubPullRequest(config)));
+}
+
+/** Exported for the tests: the request as it will actually be serialised. */
+export function aiHubPullRequest(config: NpuPullConfig): NpuPullConfig {
+  const derived = aiHubDisplayName(config.modelName);
+  if (derived === null) return config;
+  return { ...config, displayName: derived };
 }
 
 /**
