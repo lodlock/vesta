@@ -178,6 +178,11 @@ interface ModelState {
    * QAIRT session takes ~14 s to create, which is long enough for the user to
    * leave the screen, and a `useState` on the card would have unmounted with
    * it. Coming back re-renders the same truth.
+   *
+   * One observation, not reproduced: in a single early test, Back and the
+   * header back button appeared unresponsive for the length of a model load.
+   * Later CPU and NPU runs all navigated normally, so nothing here works
+   * around it — recorded only so a second sighting is recognised as a second.
    */
   activating: string | null;
   /**

@@ -115,7 +115,7 @@ function bundle(overrides: Partial<InstalledModel> = {}): InstalledModel {
     resumeToken: null,
     sha256: null,
     trust: "unverified",
-    backend: "qnn",
+    backend: "qualcomm_npu",
     artifact: "geniex_bundle",
     targetSoc: "SM8850",
     runtimeVersion: null,
