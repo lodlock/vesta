@@ -285,3 +285,152 @@ describe("GenieX's own bookkeeping, against the zero-length rule", () => {
     ).toBe(true);
   });
 });
+
+// The same bookkeeping, against Verify.
+//
+// The zero-byte exemption was only half the problem. GenieX keeps writing
+// `.lock`, `.inflight` and `.progress` for as long as the bundle exists — the
+// lock is taken and released around each operation, `.progress` is truncated
+// and rewritten, and both vanish once the manager is idle — so comparing them
+// like payload turns ordinary manager activity into "this model has changed
+// since it was installed", which errors the row and takes a good multi-GB
+// bundle out of activation.
+//
+// So they are dropped from both sides of the comparison, and from the baseline
+// itself. Payload is compared exactly as strictly as before.
+describe("GenieX's own bookkeeping, against Verify", () => {
+  const withLock = [file(".lock", 0), ...bundle().files];
+
+  it("is not recorded in the install baseline at all", () => {
+    const recorded = toBundleFiles([
+      ...withLock,
+      file(".inflight", 0),
+      file(".progress", 512),
+    ]);
+    expect(recorded.map((f) => f.path)).toEqual([
+      "metadata.json",
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "weights_1.bin",
+      "weights_2.bin",
+    ]);
+  });
+
+  // A: the lock was there when the baseline was taken and has since been
+  // released. Nothing about the weights changed.
+  it("passes when a .lock recorded at install has gone", () => {
+    const result = verifyAgainstBaseline(toBundleFiles(withLock), bundle().files);
+    expect(result.ok).toBe(true);
+    expect(result.problems).toEqual([]);
+  });
+
+  // B: the manager re-took the lock, or rewrote it.
+  it("passes when the .lock has changed size", () => {
+    const changed = [file(".lock", 4_096, "e".repeat(64)), ...bundle().files];
+    const result = verifyAgainstBaseline(toBundleFiles(withLock), changed);
+    expect(result.ok).toBe(true);
+  });
+
+  // C: manager state that appears after install, or disappears mid-flight.
+  it("passes when .inflight or .progress appear afterwards", () => {
+    const appeared = [
+      file(".inflight", 0),
+      file(".progress", 1_024),
+      ...bundle().files,
+    ];
+    const result = verifyAgainstBaseline(toBundleFiles(bundle().files), appeared);
+    expect(result.ok).toBe(true);
+  });
+
+  it("passes when .inflight and .progress disappear afterwards", () => {
+    const recorded = toBundleFiles([
+      file(".inflight", 0),
+      file(".progress", 1_024),
+      ...bundle().files,
+    ]);
+    expect(verifyAgainstBaseline(recorded, bundle().files).ok).toBe(true);
+  });
+
+  it("does not count bookkeeping as something it checked", () => {
+    // The number the user is shown is about the payload. Three digests, two
+    // shards by size — the lock is neither.
+    const result = verifyAgainstBaseline(toBundleFiles(withLock), withLock);
+    expect(result.checked).toBe(3);
+    expect(result.unchecked).toBe(2);
+  });
+
+  // D, E, F: the protection Verify exists for, unchanged, with the manager's
+  // files present the whole time so the exemption cannot be hiding anything.
+  it("still fails when a real payload file disappears", () => {
+    const recorded = toBundleFiles(withLock);
+    const gone = withLock.filter((f) => f.path !== "weights_2.bin");
+    const result = verifyAgainstBaseline(recorded, gone);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("weights_2.bin is missing");
+  });
+
+  it("still fails when a real payload file changes", () => {
+    const recorded = toBundleFiles(withLock);
+    const changed = withLock.map((f) =>
+      f.path === "metadata.json" ? file("metadata.json", 4_096, "f".repeat(64)) : f,
+    );
+    const result = verifyAgainstBaseline(recorded, changed);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toMatch(/metadata\.json.*SHA-256/);
+  });
+
+  it("still fails when a real payload file is truncated to zero bytes", () => {
+    const recorded = toBundleFiles(withLock);
+    const truncated = withLock.map((f) =>
+      f.path === "weights_1.bin" ? file("weights_1.bin", 0) : f,
+    );
+    const result = verifyAgainstBaseline(recorded, truncated);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("weights_1.bin is 0 bytes");
+  });
+
+  it("still fails when a real file appears that was not installed", () => {
+    const recorded = toBundleFiles(withLock);
+    const result = verifyAgainstBaseline(recorded, [...withLock, file("stray.bin", 10)]);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain("stray.bin");
+  });
+
+  // G: a baseline written by an older Vesta, which recorded the manager's
+  // files as if they were payload. It is normalised on read rather than
+  // rewritten, so nobody has to reinstall several gigabytes to escape it.
+  describe("a baseline written before this rule", () => {
+    const legacy = [
+      { path: ".lock", sha256: null, sizeBytes: 0 },
+      { path: ".progress", sha256: "0".repeat(64), sizeBytes: 128 },
+      ...toBundleFiles(bundle().files),
+    ];
+
+    it("verifies cleanly once the manager's files are gone", () => {
+      const result = verifyAgainstBaseline(legacy, bundle().files);
+      expect(result.ok).toBe(true);
+      expect(result.problems).toEqual([]);
+    });
+
+    it("verifies cleanly when they are present but different", () => {
+      const now = [file(".lock", 0), file(".progress", 4_096), ...bundle().files];
+      expect(verifyAgainstBaseline(legacy, now).ok).toBe(true);
+    });
+
+    it("still enforces every payload entry it recorded", () => {
+      const gone = bundle().files.filter((f) => f.path !== "tokenizer.json");
+      const result = verifyAgainstBaseline(legacy, gone);
+      expect(result.ok).toBe(false);
+      expect(result.problems.join(" ")).toContain("tokenizer.json is missing");
+    });
+  });
+
+  // Same exact-name rule as the zero-byte exemption, because it is the same
+  // predicate. A near-miss is payload and is verified like payload.
+  it("does not extend the exemption to near-miss names", () => {
+    const recorded = toBundleFiles([file(".lock.bak", 16), ...bundle().files]);
+    const result = verifyAgainstBaseline(recorded, bundle().files);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toContain(".lock.bak is missing");
+  });
+});

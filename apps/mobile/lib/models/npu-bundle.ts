@@ -102,11 +102,23 @@ function baseName(path: string): string {
   return path.split("/").pop() ?? path;
 }
 
-/** Whether this entry is the manager's own, rather than part of the payload. */
-function isManagerBookkeeping(path: string): boolean {
+/**
+ * Whether this entry is the manager's own, rather than part of the payload.
+ *
+ * The ONE predicate. Three rules depend on it — the zero-byte exemption in
+ * `checkBundle()`, what `toBundleFiles()` writes into the install baseline, and
+ * what `verifyAgainstBaseline()` compares — and a second list that drifted from
+ * this one would produce exactly the failure this exists to prevent.
+ */
+export function isManagerBookkeeping(path: string): boolean {
   // Exact, case-sensitive: the names are literals read out of the binary, and
   // normalising them would be inventing a rule the runtime never stated.
   return MANAGER_BOOKKEEPING.has(baseName(path));
+}
+
+/** The payload half of a listing: everything the manager does not own. */
+function payloadOnly<T extends { path: string }>(files: T[]): T[] {
+  return files.filter((f) => !isManagerBookkeeping(f.path));
 }
 
 function has(files: MeasuredFile[], name: string): boolean {
@@ -210,6 +222,27 @@ export function checkBundle(bundle: MeasuredBundle): BundleCheck {
  * recorded size must still match, and every recorded digest must still match.
  * A file that has grown, shrunk or changed is reported; a file for which
  * nothing was recorded is reported as unchecked rather than as a pass.
+ *
+ * ## Why both sides are filtered
+ *
+ * GenieX owns `.lock`, `.inflight` and `.progress` and keeps writing them for
+ * as long as the bundle exists: the lock is created and released around each
+ * operation, the progress file is truncated and rewritten, and both are gone
+ * once the manager is idle. None of that says anything about the weights — but
+ * compared like payload it says everything: a recorded `.lock` that the manager
+ * has since released reads as "is missing", one recreated by the next pull
+ * reads as "was not part of the installed bundle", and a rewritten `.progress`
+ * reads as a size change. A perfectly good multi-gigabyte bundle then lands in
+ * the `error` state, out of activation, telling the user it has been modified.
+ *
+ * So the manager's files are dropped from BOTH sides before anything is
+ * compared. Filtering `recorded` is also what makes a baseline written by an
+ * older Vesta — which recorded them — verify cleanly today, without a rewrite
+ * of the stored manifest and without asking anyone to reinstall. Filtering
+ * `measured` is what keeps manager state that appears afterwards from reading
+ * as an intruder.
+ *
+ * Nothing else is filtered. Every payload file is compared exactly as before.
  */
 export function verifyAgainstBaseline(
   recorded: BundleFile[],
@@ -224,9 +257,11 @@ export function verifyAgainstBaseline(
   let checked = 0;
   let unchecked = 0;
 
-  const byPath = new Map(measured.map((f) => [f.path, f]));
+  const want_ = payloadOnly(recorded);
+  const got_ = payloadOnly(measured);
+  const byPath = new Map(got_.map((f) => [f.path, f]));
 
-  for (const want of recorded) {
+  for (const want of want_) {
     const got = byPath.get(want.path);
     if (!got) {
       problems.push(`${want.path} is missing.`);
@@ -254,8 +289,8 @@ export function verifyAgainstBaseline(
 
   // A file that appeared after install is not automatically wrong, but it is
   // not something we recorded either, and the bundle is meant to be one unit.
-  for (const got of measured) {
-    if (!recorded.some((r) => r.path === got.path)) {
+  for (const got of got_) {
+    if (!want_.some((r) => r.path === got.path)) {
       problems.push(`${got.path} was not part of the installed bundle.`);
     }
   }
@@ -263,9 +298,16 @@ export function verifyAgainstBaseline(
   return { ok: problems.length === 0, checked, unchecked, problems };
 }
 
-/** The manifest to store on the registry row: real sizes, digests where taken. */
+/**
+ * The manifest to store on the registry row: real sizes, digests where taken.
+ *
+ * Payload only. The manager's bookkeeping is transient state that belongs to
+ * GenieX, not to the bundle, so recording it would pin a baseline to a moment
+ * in the manager's lifecycle that the next operation invalidates — see
+ * `verifyAgainstBaseline()`.
+ */
 export function toBundleFiles(measured: MeasuredFile[]): BundleFile[] {
-  return measured.map((f) => ({
+  return payloadOnly(measured).map((f) => ({
     path: f.path,
     sha256: f.sha256 ?? null,
     sizeBytes: f.sizeBytes,
