@@ -180,7 +180,21 @@ export interface ManifestAnalysis {
   modelCount?: number;
   exactDisplayName?: boolean;
   exactId?: boolean;
+  /** Whole entries. Tens of kilobytes; logcat only. */
   matches?: string[];
+  /**
+   * The same entries reduced to the fields a pull's manifest inference reads:
+   * id, display_name, domain, supported_runtimes, supported_chipsets.
+   *
+   * `ManifestModelEntry` is the struct in libgeniex.so and those are its
+   * fields; the runtime enum beside it has exactly two values,
+   * `RUNTIME_GENIEX_QAIRT` and `RUNTIME_GENIE`. This SDK consumes the first
+   * only. So an entry the hub lists for this chipset that offers only
+   * RUNTIME_GENIE has no asset this app can pull — and the inference that
+   * fails over it returns GENIEX_ERROR_COMMON_UNKNOWN (-100000), which names
+   * nothing. This line is what turns that number into a finding.
+   */
+  matchSummaries?: string[];
 }
 
 /**
@@ -211,9 +225,28 @@ export function mentionsModel(content: string, repo: string): string[] {
  * that can be truncated. JSON bodies are included whole — they are the
  * evidence, and an abbreviated manifest answers nothing.
  */
+/**
+ * How much of the cache to render.
+ *
+ * "summary" is what goes on screen and to the clipboard: every FACT about each
+ * file — path, size, mtime, whether it parsed, its top-level keys, its version,
+ * its model count, and the three exact-match answers — and none of the bulk.
+ * "full" adds the raw manifest entries and the whole content of small JSON
+ * files, and belongs only in logcat.
+ *
+ * The distinction exists because the bulk form crashed the app. Matched entries
+ * are capped at 12 per file and 4000 characters each — 48 KB per JSON file —
+ * and the geniex data directory holds dozens of them. That is how a diagnostics
+ * report reached 3.38 MB and killed the clipboard's Binder transaction. The
+ * counts below say everything those entries said about whether a model is
+ * present; only the verbatim JSON is lost, and that is what "full" is for.
+ */
+export type CacheDetail = "summary" | "full";
+
 export function formatCacheReport(
   report: CacheReportLike,
   repo: string,
+  detail: CacheDetail = "summary",
 ): string {
   const lines = ["Hub cache report"];
   if (report.error) lines.push(`error: ${report.error}`);
@@ -260,14 +293,24 @@ export function formatCacheReport(
         `exact id match: ${a.exactId ? "YES" : "NO"}`,
         `entries matching needle: ${a.matches?.length ?? 0}`,
       );
-      for (const match of a.matches ?? []) lines.push(match);
+      // Kept in BOTH forms: a few hundred bytes, and the line that says
+      // whether an entry carries a geniex_qairt asset for this chipset at all.
+      for (const summary of a.matchSummaries ?? []) lines.push(`  ${summary}`);
+      if (detail === "full") {
+        for (const match of a.matches ?? []) lines.push(match);
+      } else if ((a.matches?.length ?? 0) > 0) {
+        // The raw entries run to tens of kilobytes and belong in logcat.
+        lines.push("(raw entries omitted — see logcat, VestaNpu tag)");
+      }
     } else if (file.content) {
+      // Whether the file mentions the model is the finding; the file is not.
       const hits = mentionsModel(file.content, repo);
-      lines.push(
-        `mentions ${repo}: ${hits.length > 0 ? hits.join(", ") : "NO"}`,
-        "content:",
-        file.content,
-      );
+      lines.push(`mentions ${repo}: ${hits.length > 0 ? hits.join(", ") : "NO"}`);
+      if (detail === "full") {
+        lines.push("content:", file.content);
+      } else {
+        lines.push(`(content omitted, ${file.content.length} chars — see logcat)`);
+      }
     }
   }
   return lines.join("\n");
@@ -376,7 +419,13 @@ export interface GenieXLogLike {
  * level gate, so seeing one proves on-device that the gate is fully open, and
  * that there is no verbosity setting left to look for.
  */
-export function formatGenieXLog(report: GenieXLogLike): string {
+/** Newest lines kept in a summary. The rest is in logcat by definition. */
+const SUMMARY_LOG_LINES = 60;
+
+export function formatGenieXLog(
+  report: GenieXLogLike,
+  detail: CacheDetail = "summary",
+): string {
   const lines = ["GenieX native log"];
   if (report.error) lines.push(`error: ${report.error}`);
   lines.push(
@@ -405,8 +454,22 @@ export function formatGenieXLog(report: GenieXLogLike): string {
   lines.push("");
   if ((report.lines ?? []).length === 0) {
     lines.push("<no GenieX lines in the buffer>");
-  } else {
+  } else if (detail === "full" || (report.lines ?? []).length <= SUMMARY_LOG_LINES) {
     for (const line of report.lines ?? []) lines.push(line);
+  } else {
+    // The lines that matter for a failure are the last ones, and 400
+    // threadtime lines is more than the whole of the rest of a compact
+    // report. The drop count is printed so a trimmed capture is not read as
+    // a short one.
+    const all = report.lines ?? [];
+    const tail = all.slice(-SUMMARY_LOG_LINES);
+    lines.push(
+      `(newest ${tail.length} of ${all.length} lines; ${
+        all.length - tail.length
+      } older omitted — see logcat, VestaNpu tag)`,
+      "",
+    );
+    for (const line of tail) lines.push(line);
   }
   return lines.join("\n");
 }

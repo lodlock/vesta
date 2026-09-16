@@ -889,6 +889,7 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         var exactDisplayName = false
         var exactId = false
         val matches: WritableArray = Arguments.createArray()
+        val summaries: WritableArray = Arguments.createArray()
 
         for (i in 0 until models.length()) {
             val entry = models.optJSONObject(i) ?: continue
@@ -906,11 +907,35 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                         displayName.contains(needle, ignoreCase = true))
             ) {
                 // The whole object: every field, including the ones we have
-                // not thought to ask about. That is the point of looking.
+                // not thought to ask about. That is the point of looking — but
+                // it is tens of kilobytes, so it goes only to logcat now. See
+                // the summary beside it, and CacheDetail in npu-hub-probe.ts.
                 val raw = entry.toString()
                 matches.pushString(
                     if (raw.length <= MAX_MATCH_CHARS) raw
                     else raw.take(MAX_MATCH_CHARS) + "…(entry truncated)",
+                )
+
+                // The four fields a pull's manifest inference actually reads,
+                // on one line each.
+                //
+                // `ManifestModelEntry { id, display_name, domain, manifest_urls,
+                // supported_runtimes, supported_chipsets }` is the struct name
+                // and field list out of libgeniex.so, and the runtime enum has
+                // exactly two values there — RUNTIME_GENIEX_QAIRT and
+                // RUNTIME_GENIE. This SDK consumes the first; the second is the
+                // older Genie CLI workflow. So an entry the hub lists for this
+                // chipset but which offers only RUNTIME_GENIE has nothing this
+                // app can pull, and the inference that fails over it returns
+                // GENIEX_ERROR_COMMON_UNKNOWN (-100000) — a code that names
+                // nothing, which is why this line exists.
+                summaries.pushString(
+                    "id=" + id +
+                        " display_name=" + displayName +
+                        " domain=" + entry.optString("domain", "<none>") +
+                        " runtimes=[" + joinArray(entry.optJSONArray("supported_runtimes")) +
+                        "] chipsets=[" + joinArray(entry.optJSONArray("supported_chipsets")) +
+                        "]",
                 )
             }
         }
@@ -918,7 +943,16 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         out.putBoolean("exactDisplayName", exactDisplayName)
         out.putBoolean("exactId", exactId)
         out.putArray("matches", matches)
+        out.putArray("matchSummaries", summaries)
         return out
+    }
+
+    /** A JSON string array as `a, b, c`. Bounded: these are short enum lists. */
+    private fun joinArray(array: org.json.JSONArray?): String {
+        if (array == null) return ""
+        val parts = ArrayList<String>(array.length())
+        for (i in 0 until array.length()) parts.add(array.optString(i, ""))
+        return parts.joinToString(", ")
     }
 
     /**

@@ -184,8 +184,18 @@ export interface NpuManifestAnalysis {
   exactDisplayName?: boolean;
   /** A model whose id matches exactly. */
   exactId?: boolean;
-  /** Whole entries whose id or display_name contains the needle. */
+  /** Whole entries whose id or display_name contains the needle. Logcat only. */
   matches?: string[];
+  /**
+   * The same entries, reduced to the fields a pull's manifest inference reads:
+   * id, display_name, domain, supported_runtimes, supported_chipsets.
+   *
+   * This is the line that answers whether an entry the hub lists actually
+   * carries a `RUNTIME_GENIEX_QAIRT` asset for this chipset — the two runtime
+   * values in libgeniex.so are that and `RUNTIME_GENIE`, and this SDK consumes
+   * only the first.
+   */
+  matchSummaries?: string[];
 }
 
 /**

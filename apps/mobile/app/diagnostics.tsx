@@ -57,7 +57,12 @@ import {
   npuGenieXLogReport,
   npuInstalledReport,
 } from "../lib/native/npu";
-import { formatPullTrace } from "../lib/models/npu-pull-trace";
+import { formatPullTrace, lastPulledModelName } from "../lib/models/npu-pull-trace";
+import {
+  assembleReport,
+  clipboardSafe,
+  type ReportSection,
+} from "../lib/diagnostics/clipboard-safe";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
@@ -198,13 +203,17 @@ export default function DiagnosticsScreen() {
       // cannot be true of one manifest, and the manifests are files in our own
       // data directory. Read-only, and it triggers no fetch — the point is to
       // report what the app already acted on.
-      const repo = entry.modelName.slice(entry.modelName.lastIndexOf("/") + 1);
+      // The model the LAST PULL asked for, when there was one — otherwise the
+      // catalogue entry. Interrogating the manifest about Qwen3 while the
+      // failing install is a Falcon3 hub row answers a question nobody asked.
+      const subject = lastPulledModelName() ?? entry.modelName;
+      const repo = subject.slice(subject.lastIndexOf("/") + 1);
 
       // The three questions, asked of the manifest rather than of a 311 KB
       // dump: is there an exact display_name, an exact id, and what does the
       // manifest hold for anything Qwen3-shaped at all.
       const cache = await npuHubCacheReport({
-        needle: "qwen3",
+        needle: repo,
         displayName: repo,
         id: repo.toLowerCase().replace(/-/g, "_"),
       });
@@ -261,22 +270,55 @@ export default function DiagnosticsScreen() {
       // question. See npu-pull-trace.ts.
       const pullTrace = formatPullTrace();
 
-      const text = [
+      // TWO reports, and the difference is not cosmetic.
+      //
+      // What goes on screen and to the clipboard is a SUMMARY. What goes to
+      // logcat is everything. Copy used to hand the full thing to
+      // `Clipboard.setString`, which is a Binder call, and at 3.38 MB the
+      // kernel refused the transaction and took the process with it:
+      //
+      //   android.os.TransactionTooLargeException: data parcel size 3377296
+      //
+      // `npuLogDiagnostic` has no such limit — it splits on newlines and writes
+      // one Log.i per line — so the full dump keeps its home under
+      // `adb logcat -s VestaNpu`, which is where a raw cache dump belonged all
+      // along. Ordered most-wanted first, because that is the order the
+      // clipboard-safe assembler drops things in.
+      const sections: ReportSection[] = [
+        { name: "pull trace", body: pullTrace, essential: true },
+        { name: "identity probe", body: formatProbe(result), essential: true },
+        { name: "chipset identity", body: chipsetIdentity, essential: true },
+        {
+          name: "hub cache",
+          body: cache
+            ? formatCacheReport(cache, repo, "summary")
+            : "Hub cache report\nunavailable (no NPU bridge in this build)",
+          essential: true,
+        },
+        { name: "hub listing", body: listAll ? formatListProbe(listAll, repo) : "" },
+        { name: "installed", body: installed ? formatInstalledReport(installed) : "" },
+        {
+          name: "native log",
+          body: genieXLog ? formatGenieXLog(genieXLog, "summary") : "",
+        },
+      ];
+
+      const compact = assembleReport(sections);
+      setReport(compact.text);
+
+      const full = [
         pullTrace,
         formatProbe(result),
-        cache
-          ? formatCacheReport(cache, repo)
-          : "Hub cache report\nunavailable (no NPU bridge in this build)",
         chipsetIdentity,
-        listAll ? formatListProbe(listAll, "qwen3") : "",
+        cache ? formatCacheReport(cache, repo, "full") : "",
+        listAll ? formatListProbe(listAll, repo) : "",
         installed ? formatInstalledReport(installed) : "",
-        genieXLog ? formatGenieXLog(genieXLog) : "",
+        genieXLog ? formatGenieXLog(genieXLog, "full") : "",
       ]
         .filter(Boolean)
         .join("\n\n");
-      setReport(text);
-      npuLogDiagnostic(text);
-      console.log(`[Diagnostics] ${text}`);
+      npuLogDiagnostic(full);
+      console.log(`[Diagnostics] ${full}`);
     } finally {
       setProbing(false);
     }
@@ -288,13 +330,23 @@ export default function DiagnosticsScreen() {
   // Reports failure honestly rather than claiming a copy that did not happen.
   const copyProbe = useCallback(() => {
     if (!report) return;
+    // The last thing between any string and Binder. `report` is already the
+    // compact form, so this should never trim — it is here so the Copy button
+    // is structurally incapable of crashing the app if some future section
+    // grows, rather than relying on nobody letting it.
+    const safe = clipboardSafe(report);
     try {
-      Clipboard.setString(report);
-      setCopied("Copied");
-    } catch {
-      setCopied("Copy failed");
+      Clipboard.setString(safe.text);
+      setCopied(
+        safe.truncated
+          ? `Copied ${Math.round(safe.bytes / 1024)} KB (trimmed)`
+          : `Copied ${Math.round(safe.bytes / 1024)} KB`,
+      );
+    } catch (err) {
+      // Says what went wrong rather than claiming a copy that did not happen.
+      setCopied(err instanceof Error ? `Copy failed: ${err.message}` : "Copy failed");
     }
-    setTimeout(() => setCopied(null), 2000);
+    setTimeout(() => setCopied(null), 4000);
   }, [report]);
 
   const [diag, setDiag] = useState<Diag | null>(null);

@@ -205,20 +205,41 @@ describe("the cache report", () => {
     expect(text).toContain(`mentions ${REPO}: NO`);
   });
 
-  it("includes JSON bodies whole — an abbreviated manifest answers nothing", () => {
+  // This used to assert the opposite — "includes JSON bodies whole, an
+  // abbreviated manifest answers nothing" — and that is what took the app down:
+  // whole bodies plus whole matched entries built a 3.38 MB report, and
+  // `Clipboard.setString` is a Binder call that cannot carry it
+  // (TransactionTooLargeException, data parcel size 3377296 bytes). The body is
+  // still available, in the form that has no size limit: logcat.
+  describe("JSON bodies", () => {
     const body = '{"models":[{"id":"Qwen3-4B-Instruct-2507","domain":"qualcomm"}]}';
-    const text = formatCacheReport(
-      {
-        dataDir: "/data/geniex",
-        dataDirExists: true,
-        files: [
-          { path: "aihub/info.json", sizeBytes: 99, modifiedAt: 0, content: body },
-        ],
-      },
-      REPO,
-    );
-    expect(text).toContain(body);
-    expect(text).not.toContain("…");
+    const report = {
+      dataDir: "/data/geniex",
+      dataDirExists: true,
+      files: [
+        { path: "aihub/info.json", sizeBytes: 99, modifiedAt: 0, content: body },
+      ],
+    };
+
+    it("keeps the finding but not the file in a summary", () => {
+      const text = formatCacheReport(report, REPO, "summary");
+      expect(text).not.toContain(body);
+      // The finding the body was there for survives: does it mention the model.
+      expect(text).toContain(`mentions ${REPO}`);
+      // And the omission is stated, with its size and where to find it.
+      expect(text).toContain("content omitted");
+      expect(text).toContain(`${body.length} chars`);
+      expect(text).toContain("logcat");
+    });
+
+    it("includes them whole in the full form", () => {
+      const text = formatCacheReport(report, REPO, "full");
+      expect(text).toContain(body);
+    });
+
+    it("summarises by default, so a careless caller cannot dump", () => {
+      expect(formatCacheReport(report, REPO)).not.toContain(body);
+    });
   });
 
   it("reports the endpoint and release, and says when they are unset", () => {
@@ -273,7 +294,10 @@ describe("the cache report", () => {
 describe("the targeted manifest analysis", () => {
   const REPO = "Qwen3-4B-Instruct-2507";
 
-  const withAnalysis = (analysis: Record<string, unknown>) =>
+  const withAnalysis = (
+    analysis: Record<string, unknown>,
+    detail: "summary" | "full" = "summary",
+  ) =>
     formatCacheReport(
       {
         dataDir: "/data/geniex",
@@ -288,6 +312,7 @@ describe("the targeted manifest analysis", () => {
         ],
       },
       REPO,
+      detail,
     );
 
   it("answers both exact-match questions separately", () => {
@@ -316,13 +341,49 @@ describe("the targeted manifest analysis", () => {
     expect(text).toContain("version: 2");
   });
 
-  it("prints whole matching entries, not a summary of them", () => {
+  // Also inverted, and for the same reason: 12 entries at 4000 characters is
+  // 48 KB per JSON file, and the geniex directory holds dozens of them.
+  describe("matching entries", () => {
     const entry =
-      '{"id":"qwen3_4b_instruct_2507","display_name":"Qwen3-4B-Instruct-2507",' +
-      '"domain":"qualcomm","supported_chipsets":["qualcomm-snapdragon-8-elite-gen5"]}';
-    const text = withAnalysis({ modelCount: 19, matches: [entry] });
-    expect(text).toContain(entry);
-    expect(text).toContain("entries matching needle: 1");
+      '{"id":"falcon3_7b_instruct","display_name":"Falcon3-7B-Instruct",' +
+      '"domain":"qualcomm","supported_chipsets":["qualcomm-snapdragon-8-elite-gen5"],' +
+      '"supported_runtimes":["RUNTIME_GENIE"]}';
+    const summary =
+      "id=falcon3_7b_instruct display_name=Falcon3-7B-Instruct domain=qualcomm " +
+      "runtimes=[RUNTIME_GENIE] chipsets=[qualcomm-snapdragon-8-elite-gen5]";
+
+    it("counts them, and keeps the compact summary, in both forms", () => {
+      // The summary is a few hundred bytes and carries the fields a pull's
+      // manifest inference actually reads — including whether the entry offers
+      // RUNTIME_GENIEX_QAIRT at all, which is the question -100000 refuses to
+      // answer on its own.
+      for (const detail of ["summary", "full"] as const) {
+        const text = withAnalysis(
+          { modelCount: 220, matches: [entry], matchSummaries: [summary] },
+          detail,
+        );
+        expect(text).toContain("entries matching needle: 1");
+        expect(text).toContain(summary);
+      }
+    });
+
+    it("leaves the raw entry out of a summary, and says so", () => {
+      const text = withAnalysis(
+        { modelCount: 220, matches: [entry], matchSummaries: [summary] },
+        "summary",
+      );
+      expect(text).not.toContain(entry);
+      expect(text).toContain("raw entries omitted");
+      expect(text).toContain("logcat");
+    });
+
+    it("includes the raw entry in the full form", () => {
+      const text = withAnalysis(
+        { modelCount: 220, matches: [entry], matchSummaries: [summary] },
+        "full",
+      );
+      expect(text).toContain(entry);
+    });
   });
 
   it("does not fall back to dumping the file when an analysis exists", () => {

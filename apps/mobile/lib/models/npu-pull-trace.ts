@@ -130,3 +130,19 @@ function describeValue(value: unknown): string {
   if (typeof value === "string") return `"${value}" (len ${value.length})`;
   return String(value);
 }
+
+/**
+ * The model the last pull attempt actually asked for, if there was one.
+ *
+ * The diagnostics screen used to interrogate the manifest for whatever the
+ * curated catalogue's first entry happens to be. When the failing install is a
+ * hub row for a different model, that answers a question nobody asked — so the
+ * needle follows the request when there is one.
+ */
+export function lastPulledModelName(): string | null {
+  for (let i = trace.length - 1; i >= 0; i--) {
+    const name = trace[i].request?.modelName;
+    if (typeof name === "string" && name.length > 0) return name;
+  }
+  return null;
+}

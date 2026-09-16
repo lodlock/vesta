@@ -13,7 +13,9 @@ import {
   describeGenieXFailure,
   isHubModelNotFound,
   isTransientPullFailure,
+  isSetupPullFailure,
   TRANSIENT_PULL_RC,
+  SETUP_PULL_RC,
 } from "../npu-errors";
 
 describe("the code that prompted all this", () => {
@@ -201,5 +203,65 @@ describe("transient pull failures", () => {
     );
     expect(text).toContain("-100005");
     expect(text).toContain("connection reset");
+  });
+});
+
+// The code a real Falcon3-7B-Instruct install actually returned.
+//
+// Device logcat, in order:
+//
+//   hub error: No pre-compiled assets available for "Falcon3-7B-Instruct" due
+//   to licensing restrictions. Please use the qai-hub-models Python package to
+//   manually export the model.
+//   pull() returned rc=-100000
+//
+// So the request resolved, the model was found, and the runtime then had
+// nothing to download. -100000 is GENIEX_ERROR_COMMON_UNKNOWN — the SDK's own
+// Python bindings name it and comment it as what the model-manager FFI returns
+// when manifest inference fails — and the specific sentence went only to the
+// log, which is why the user saw a bare code.
+describe("the code that means the runtime gave up before downloading", () => {
+  const rc = (code: number, text = "geniex_model_pull failed") =>
+    new Error(`rc=${code}: ${text}`);
+
+  it("names the constant from the SDK's own bindings", () => {
+    expect(SETUP_PULL_RC).toBe(-100000);
+    const failure = readGenieXFailure(rc(SETUP_PULL_RC));
+    expect(failure.name).toBe("GENIEX_ERROR_COMMON_UNKNOWN");
+  });
+
+  it("says it happened before the download, and what to do instead", () => {
+    const text = describeGenieXFailure(rc(SETUP_PULL_RC));
+    expect(text).toContain("before any download starts");
+    expect(text).toContain("qai-hub-models");
+    expect(text).toContain("Import bundle");
+    // The number still leads, because it is the only lookup token.
+    expect(text).toContain("-100000");
+  });
+
+  it("does not state the licensing cause as a fact", () => {
+    // The runtime did not hand us its reason, so the sentence says what this
+    // USUALLY is, not what it definitely was.
+    expect(describeGenieXFailure(rc(SETUP_PULL_RC))).toContain("most common cause");
+  });
+
+  it("still prints whatever the runtime did attach", () => {
+    const text = describeGenieXFailure(
+      rc(SETUP_PULL_RC, "geniex_model_pull failed (rc=-100000)"),
+    );
+    expect(text).toContain("runtime said:");
+  });
+
+  // The distinction that must not blur. A licensing/export failure retried
+  // three times is three identical failures and a slower message.
+  it("is never retried", () => {
+    expect(isTransientPullFailure(rc(SETUP_PULL_RC))).toBe(false);
+    expect(isSetupPullFailure(rc(SETUP_PULL_RC))).toBe(true);
+  });
+
+  it("is a different code from the transient one, both ways", () => {
+    expect(isSetupPullFailure(rc(TRANSIENT_PULL_RC))).toBe(false);
+    expect(isTransientPullFailure(rc(TRANSIENT_PULL_RC))).toBe(true);
+    expect(SETUP_PULL_RC).not.toBe(TRANSIENT_PULL_RC);
   });
 });

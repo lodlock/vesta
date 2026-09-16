@@ -20,6 +20,40 @@
 
 /** Codes with a verified meaning. Anything absent is reported raw. */
 const KNOWN: Record<number, { name: string; message: string }> = {
+  // GenieX's own Python bindings (bindings/python/geniex/auto.py) define
+  // GENIEX_ERROR_COMMON_UNKNOWN = -100000, and comment it as what the
+  // model-manager FFI returns "when manifest inference" fails. So it is a
+  // SETUP failure, before any transfer, and it is the generic outer code for
+  // something more specific that the FFI did not carry out.
+  //
+  // What it most often is on this path, confirmed on device: the model has no
+  // pre-compiled Hexagon bundle. libgeniex.so carries the exact sentence, in
+  // the same function that reads release-assets.json —
+  //
+  //   "No pre-compiled assets available for {} due to licensing restrictions.
+  //    Please use the qai-hub-models Python package to manually export the
+  //    model. See export instructions here: <url>"
+  //
+  // — and emits it through its `hub error: {}` LOG line before returning
+  // -100000. The text does not reach PullEvent.Error.message, which is why a
+  // real Falcon3-7B-Instruct install surfaced only "geniex_model_pull failed
+  // (rc=-100000)". The one API that would return it,
+  // ModelManager.lastErrorMessage(), is on a Kotlin-`internal` class.
+  //
+  // So the sentence below states what the code means and what to do, while
+  // describeGenieXFailure still prints whatever text the runtime DID attach.
+  // It does not claim the licensing cause as fact — "most often" is exactly as
+  // strong as the evidence is.
+  [-100000]: {
+    name: "GENIEX_ERROR_COMMON_UNKNOWN",
+    message:
+      "The Qualcomm runtime could not resolve a downloadable bundle for this model. " +
+      "This happens before any download starts. The most common cause is a model " +
+      "Qualcomm publishes no pre-compiled Hexagon bundle for — those have to be " +
+      "exported with the qai-hub-models Python package and added with Import bundle " +
+      "(https://github.com/qualcomm/ai-hub-apps/blob/main/tutorials/llm_on_genie/export.md).",
+  },
+
   // javap -constants on ModelManagerWrapper: GENIEX_SUCCESS = 0
   0: { name: "GENIEX_SUCCESS", message: "Succeeded." },
 
@@ -186,6 +220,22 @@ export function isHubModelNotFound(err: unknown): boolean {
 export function isTransientPullFailure(err: unknown): boolean {
   return readGenieXFailure(err).rc === TRANSIENT_PULL_RC;
 }
+
+/**
+ * True when the runtime gave up before any transfer began.
+ *
+ * -100000 is GENIEX_ERROR_COMMON_UNKNOWN, which the SDK's own Python bindings
+ * document as what the model-manager FFI returns when manifest inference fails.
+ * Retrying it is pointless by construction: nothing about asking a second time
+ * changes which assets Qualcomm published. It is listed here so the distinction
+ * from -100005 is a named fact rather than an omission from a list.
+ */
+export function isSetupPullFailure(err: unknown): boolean {
+  return readGenieXFailure(err).rc === SETUP_PULL_RC;
+}
+
+/** GENIEX_ERROR_COMMON_UNKNOWN — manifest inference failed, before transfer. */
+export const SETUP_PULL_RC = -100000;
 
 /**
  * Observed on device as a transient download failure. Named, not inlined, so
