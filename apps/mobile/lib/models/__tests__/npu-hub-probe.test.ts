@@ -15,6 +15,7 @@ import {
   formatProbe,
   formatCacheReport,
   formatListProbe,
+  formatChipsetIdentity,
   formatGenieXLog,
   formatInstalledReport,
   mentionsModel,
@@ -352,7 +353,7 @@ describe("the targeted manifest analysis", () => {
 
 describe("the hub-list probe", () => {
   const probe = (over: Record<string, unknown> = {}) => ({
-    filter: null,
+    chipset: null,
     before: { exists: true, sizeBytes: 311319, modifiedAt: 1000 },
     after: { exists: true, sizeBytes: 311319, modifiedAt: 1000 },
     count: 19,
@@ -387,10 +388,19 @@ describe("the hub-list probe", () => {
     );
   });
 
-  it("records which filter was passed, including none", () => {
-    expect(formatListProbe(probe(), "qwen3")).toContain("listHubModels(null)");
-    expect(formatListProbe(probe({ filter: "SM8850" }), "qwen3")).toContain(
-      "listHubModels(SM8850)",
+  // The old label printed `listHubModels(null)`, and a capture carrying that
+  // line beside the runtime's own `chipset "null" not found in platform.json`
+  // read as a bug in the argument. It was not one: absent is the SDK's declared
+  // default and its unfiltered query. The label now distinguishes the two.
+  it("says an unfiltered call was unfiltered, not that it passed null", () => {
+    const text = formatListProbe(probe(), "qwen3");
+    expect(text).toContain("every model the hub has");
+    expect(text).not.toContain("listHubModels(null)");
+  });
+
+  it("names the chipset when one was actually passed", () => {
+    expect(formatListProbe(probe({ chipset: "SM8850" }), "qwen3")).toContain(
+      "listHubModels(chipset: SM8850)",
     );
   });
 
@@ -573,5 +583,95 @@ describe("what the runtime considers installed", () => {
     expect(formatInstalledReport({ error: "runtime unavailable" })).toContain(
       "error: runtime unavailable",
     );
+  });
+});
+
+// The Hub identity probe's chipset half.
+//
+// This replaces a pair of listHubModels() calls — one unfiltered, one with the
+// literal "SM8850" — that were made to "measure" what the parameter meant. The
+// released 0.4.0 signature is `listHubModels(chipset: String? = null)`, so the
+// first was production's own call repeated and the second was a guess at a key
+// in the runtime's platform.json, which fails the whole call when wrong. A
+// failed call is not a measurement.
+//
+// The question underneath was worth asking: which spelling of this chip does
+// the SDK accept. Everything needed to answer it is already in the app — the
+// device's SoC, the runtime's equivalence table, and the keys the hub itself
+// published — so this reports that, with no call and no guess.
+describe("the chipset identity block", () => {
+  const TABLE = [
+    {
+      name: "Snapdragon 8 Elite Gen 5 QRD",
+      aliases: ["SM8850", "qualcomm-snapdragon-8-elite-gen5"],
+    },
+    { name: "Snapdragon 8 Elite QRD", aliases: ["SM8750"] },
+  ];
+  const MODELS = [
+    {
+      name: "qualcomm/Qwen3-4B-Instruct-2507",
+      modelType: "LLM",
+      chipsets: ["qualcomm-snapdragon-8-elite-gen5"],
+    },
+    { name: "qualcomm/Older", modelType: "LLM", chipsets: ["SM8750"] },
+  ];
+
+  const full = () =>
+    formatChipsetIdentity({ deviceSoc: "SM8850", table: TABLE, models: MODELS });
+
+  // E: the identity evidence that must survive the simplification.
+  it("reports the device SoC, the runtime's name for it, and its aliases", () => {
+    const text = full();
+    expect(text).toContain("device SoC (Build.SOC_MODEL): SM8850");
+    expect(text).toContain("runtime name for this chip: Snapdragon 8 Elite Gen 5 QRD");
+    expect(text).toMatch(/runtime aliases: .*qualcomm-snapdragon-8-elite-gen5/);
+    expect(text).toContain("known to runtime: YES");
+  });
+
+  it("reports the canonical target", () => {
+    expect(full()).toContain("canonical target: SM8850");
+  });
+
+  // The thing the second listHubModels() call was reaching for: a chipset
+  // spelling the RUNTIME supplied, rather than one Vesta guessed.
+  it("reports the hub's own chipset keys for this device", () => {
+    const text = full();
+    expect(text).toContain(
+      "hub chipset keys for this device: qualcomm-snapdragon-8-elite-gen5",
+    );
+    // Not the key for the other silicon in the same catalogue.
+    expect(text).not.toMatch(/hub chipset keys for this device:.*SM8750/);
+    expect(text).toContain("hub models offered for it: 1 of 2");
+  });
+
+  it("separates a table never consulted from one that came back empty", () => {
+    expect(
+      formatChipsetIdentity({ deviceSoc: "SM8850", table: undefined, models: null }),
+    ).toContain("runtime chipset table: not consulted");
+    expect(
+      formatChipsetIdentity({ deviceSoc: "SM8850", table: [], models: null }),
+    ).toContain("runtime chipset table: empty");
+  });
+
+  it("says the chip is unknown to the runtime rather than inventing an entry", () => {
+    // Fail closed, and say so: SM8750 and SM8850 are one digit apart and are
+    // different silicon.
+    const text = formatChipsetIdentity({
+      deviceSoc: "SM7999",
+      table: TABLE,
+      models: MODELS,
+    });
+    expect(text).toContain("known to runtime: NO");
+    expect(text).toContain("hub chipset keys for this device: <none>");
+  });
+
+  it("survives having no hub answer and no SoC at all", () => {
+    const text = formatChipsetIdentity({
+      deviceSoc: null,
+      table: TABLE,
+      models: null,
+    });
+    expect(text).toContain("device SoC (Build.SOC_MODEL): <unknown>");
+    expect(text).toContain("hub chipset keys for this device: <no hub answer yet>");
   });
 });

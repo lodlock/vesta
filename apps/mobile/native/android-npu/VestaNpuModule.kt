@@ -62,7 +62,8 @@ import java.util.concurrent.TimeUnit
  *   ModelManagerWrapper.getPaths(name): ModelPaths?           suspend
  *   ModelManagerWrapper.detectChipset(offline): String?       suspend
  *   ModelManagerWrapper.listChipsets(): List<ChipsetInfo>     suspend
- *   ModelManagerWrapper.listHubModels(domain): List<HubModel> suspend
+ *   ModelManagerWrapper.listHubModels(chipset: String? = null)     suspend
+ *                                                  : List<HubModel>
  *   ModelManagerWrapper.resolveAlias(name): String?           suspend
  *   ModelManagerWrapper.remove(name): Int                     suspend
  *   LlmWrapper.builder().llmCreateInput(input).build()        suspend, Result<LlmWrapper>
@@ -927,6 +928,15 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * If listHubModels() refreshes or replaces the file that pull() then reads,
      * these two stats differ — and that would explain a catalogue and a
      * download disagreeing about the same model without either being wrong.
+     * That is the ONLY thing this adds over [hubModels], which is why it is one
+     * call and not two: it asks the same question production asks, and watches
+     * the file while it does.
+     *
+     * The chipset argument is the SDK's own, and means exactly what it means in
+     * [hubModels] — absent is the unfiltered query, and a string must be a
+     * platform.json key. It is kept because a caller holding a key the RUNTIME
+     * supplied has a real question to ask with it; it is not a place to try
+     * spellings. A guess is not a measurement, it is a failed call.
      */
     @ReactMethod
     fun hubListProbe(configJson: String, promise: Promise) {
@@ -943,15 +953,17 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                 // back as the string "null", and the runtime then looks for a
                 // chipset by that name — "chipset \"null\" not found in
                 // platform.json" is what that reads like on device. See
-                // stringOrNull.
-                val filter = config.stringOrNull("filter")
+                // stringOrNull. Blank is folded into absent for the same reason
+                // hubModels() does it: the runtime rejects "" outright
+                // ("empty chipset"), so it cannot stand for "no filter".
+                val chipset = config.stringOrNull("chipset")
                 val relative =
                     config.optString("manifestPath", "").ifBlank { "aihub/manifest.json" }
                 val manifest = File(File(reactApplicationContext.filesDir, "geniex"), relative)
 
-                out.putString("filter", filter)
+                out.putString("chipset", chipset)
                 out.putMap("before", statOf(manifest))
-                val models = ModelManagerWrapper.listHubModels(filter)
+                val models = ModelManagerWrapper.listHubModels(chipset)
                 out.putMap("after", statOf(manifest))
 
                 out.putInt("count", models.size)
@@ -1086,7 +1098,7 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
     //
     // `ModelManagerWrapper` is the public surface, and it is the whole of it:
     //
-    //     listHubModels(domain) : List<HubModel>   ← used
+    //     listHubModels(chipset: String? = null)   ← used, with null
     //     resolveAlias(name)    : String?          ← used
     //     listChipsets()        : List<ChipsetInfo>← used (chipset identity)
     //     pullFlow(input)       : Flow<PullEvent>  ← used
@@ -1233,21 +1245,54 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
      * Every model the hub offers, with the chipsets it offers each one FOR.
      *
      * `HubModel.chipsets` is the authoritative answer to "can this device have
-     * this model", in the hub's own vocabulary — which is also the string the
-     * pull must then be given. Asking beats guessing: Android says `SM8850`,
-     * GenieX's chipset table answers with a device name, and AI Hub's release
-     * manifest keys on a third spelling. Only one of those resolves an asset,
-     * and this is the call that says which.
+     * this model", in the hub's own vocabulary. Asking beats guessing: Android
+     * says `SM8850`, GenieX's chipset table answers with a device name, and AI
+     * Hub's release manifest keys on a third spelling. Only one of those
+     * resolves an asset, and this is the call that says which.
+     *
+     * ## The parameter is a CHIPSET, and null is its supported default
+     *
+     * An earlier revision of this file called it `domain`, from the SDK's own
+     * KDoc, and the diagnostics probe then spent two calls trying to work out
+     * what it meant. It is not a domain — `domain` is a different field
+     * entirely, on the release manifest's model entry, and the runtime has its
+     * own error for it ("AI Hub model … has unsupported domain"). Read out of
+     * geniex-android 0.4.0 rather than inferred:
+     *
+     *   LocalVariableTable of ModelManagerWrapper.listHubModels
+     *     slot 1  name: chipset   Ljava/lang/String;
+     *   RuntimeInvisibleParameterAnnotations
+     *     parameter 0: org.jetbrains.annotations.Nullable
+     *   listHubModels$default(…, String, Continuation, int, Object)
+     *
+     * So the Kotlin signature is `listHubModels(chipset: String? = null)`, and
+     * null is not a loophole — it is the DECLARED DEFAULT, and it is the
+     * unfiltered "everything the hub has" query. That is the production path
+     * and it is proven on device: 19 models returned, of which 14 are
+     * compatible after Vesta filters them against this silicon in TypeScript
+     * (npu-hub.breakDownHubModels). The SDK is asked for the catalogue; the
+     * device question is answered here, where it is testable.
+     *
+     * A non-empty string is NOT free-form. `libgeniex.so` looks it up in
+     * platform.json and fails the whole call when it is not a key there —
+     * `chipset "…" not found in platform.json` — and rejects "" separately
+     * ("empty chipset"). Since "" has no unfiltered meaning of its own,
+     * `ifBlank { null }` maps it to the query that does.
+     *
+     * Nothing in Vesta passes a chipset here, and nothing should without a key
+     * that came from the runtime: `HubModel.chipsets` is AI Hub's asset key and
+     * the SoC id is `SM8850`, and those are different vocabularies — see
+     * CompatibleHubModel in npu-hub.ts.
      */
     @ReactMethod
-    fun hubModels(domain: String?, promise: Promise) {
+    fun hubModels(chipset: String?, promise: Promise) {
         scope.launch {
             try {
                 if (!ensureSdk()) {
                     promise.reject("NPU_UNAVAILABLE", initError ?: "No usable Qualcomm NPU runtime")
                     return@launch
                 }
-                val models = ModelManagerWrapper.listHubModels(domain?.ifBlank { null })
+                val models = ModelManagerWrapper.listHubModels(chipset?.ifBlank { null })
                 val entries: WritableArray = Arguments.createArray()
                 for (m in models) {
                     val entry = Arguments.createMap()

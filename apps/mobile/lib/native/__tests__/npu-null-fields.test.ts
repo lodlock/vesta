@@ -60,22 +60,36 @@ describe("the precision on an AI Hub pull", () => {
   });
 });
 
-describe("the filter on a hub list probe", () => {
-  it("does not send a null filter", () => {
+// `listHubModels(chipset: String? = null)` — the released 0.4.0 signature, read
+// out of the bytecode: the parameter is named `chipset`, carries @Nullable, and
+// has a Kotlin default. So an absent chipset is the SDK's own unfiltered query,
+// and it has to arrive absent: a JSON null read back with optString() is the
+// four-character string "null", and the runtime then looks for a chipset by
+// that name — `chipset "null" not found in platform.json`.
+describe("the chipset on a hub list probe", () => {
+  it("does not send a null chipset", () => {
     expect(npuHubListProbeRequest(null)).toEqual({});
   });
 
-  it("sends no filter key at all, rather than an empty one", () => {
+  it("sends no chipset key at all, rather than an empty one", () => {
     expect(JSON.stringify(npuHubListProbeRequest(null))).toBe("{}");
   });
 
-  // The production scan. It has always passed a real chipset and must keep
-  // passing it through byte for byte.
-  it("passes a real chipset straight through", () => {
-    expect(npuHubListProbeRequest("SM8850")).toEqual({ filter: "SM8850" });
+  // Absence must not survive as the WORD for absence anywhere in the payload.
+  it("puts no \"null\" anywhere in the serialised request", () => {
+    expect(JSON.stringify(npuHubListProbeRequest(null))).not.toContain("null");
   });
 
-  it("treats the STRING \"null\" as a filter, not as absence", () => {
-    expect(npuHubListProbeRequest("null")).toEqual({ filter: "null" });
+  // A key the runtime supplied is passed through byte for byte. Nothing in
+  // Vesta currently sends one — see the probe — but the bridge must not be the
+  // thing that mangles it when something does.
+  it("passes a real chipset straight through", () => {
+    expect(npuHubListProbeRequest("SM8850")).toEqual({ chipset: "SM8850" });
+  });
+
+  it("treats the STRING \"null\" as a chipset, not as absence", () => {
+    // Not special-cased: "null" is a string a caller chose, and silently
+    // reading it as absence would hide the very bug this shape exists to stop.
+    expect(npuHubListProbeRequest("null")).toEqual({ chipset: "null" });
   });
 });

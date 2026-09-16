@@ -22,7 +22,7 @@ interface NpuNativeModule {
   deviceChipset(): Promise<NpuChipsetReport>;
   pull(configJson: string): Promise<NpuBundleInfo>;
   importBundle(configJson: string): Promise<NpuBundleInfo>;
-  hubModels(domain: string | null): Promise<NpuHubModelsResult>;
+  hubModels(chipset: string | null): Promise<NpuHubModelsResult>;
   resolveModelAlias(modelName: string): Promise<string | null>;
   logDiagnostic(message: string): void;
   hubCacheReport(configJson: string): Promise<NpuHubCacheReport>;
@@ -196,7 +196,8 @@ export interface NpuManifestAnalysis {
  * the same model without either being wrong.
  */
 export interface NpuHubListProbe {
-  filter?: string | null;
+  /** The chipset the listing was filtered by; absent means it was not. */
+  chipset?: string | null;
   before?: { exists: boolean; sizeBytes: number; modifiedAt: number };
   after?: { exists: boolean; sizeBytes: number; modifiedAt: number };
   count?: number;
@@ -568,14 +569,32 @@ export async function npuImportBundle(
 /**
  * The hub's own catalogue. Null when there is no bridge to ask.
  *
- * @param domain Optional hub domain filter; null asks for everything.
+ * ## Unfiltered, deliberately
+ *
+ * `listHubModels` in geniex-android 0.4.0 is `(chipset: String? = null)` — the
+ * parameter is named `chipset` in the released bytecode, carries `@Nullable`,
+ * and has a Kotlin default, which is null. So absent is the SDK's OWN
+ * "everything the hub has" query, not a gap in it, and that is what this asks
+ * for: the catalogue whole, filtered against this device afterwards by
+ * `breakDownHubModels` where the rule is testable without a Qualcomm phone.
+ * On device that is 19 models returned and 14 compatible here.
+ *
+ * A string is only meaningful if it is a key in the runtime's platform.json —
+ * anything else fails the whole call with `chipset "…" not found in
+ * platform.json`, and "" fails separately as `empty chipset`. The SoC id
+ * (`SM8850`) and AI Hub's asset key are different vocabularies (see
+ * CompatibleHubModel), so neither is a safe guess at that key, and nothing
+ * here guesses.
+ *
+ * @param chipset A platform.json chipset key. Null — the default — asks for
+ *   every model the hub has.
  */
 export async function npuHubModels(
-  domain: string | null = null,
+  chipset: string | null = null,
 ): Promise<NpuHubModelsResult | null> {
   if (!moduleAvailable()) return null;
   try {
-    return await Npu!.hubModels(domain);
+    return await Npu!.hubModels(chipset);
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
@@ -625,16 +644,21 @@ export async function npuHubCacheReport(query: {
 /**
  * Lists hub models and stats the manifest either side of the call.
  *
- * @param filter passed straight through to `listHubModels()`. Its meaning is
- *   not verified — the SDK names the parameter for a domain, and calling it
- *   with a chipset is part of what this is measuring.
+ * The stat is the only thing this has that `npuHubModels()` does not, and it
+ * answers one question: did the listing rewrite the file the pull then reads?
+ *
+ * @param chipset the SDK's own parameter, with the SDK's own meaning — see
+ *   `npuHubModels`. Null is the supported unfiltered query. A string must be a
+ *   platform.json key the runtime supplied; this is not a place to try
+ *   spellings, because a rejected guess fails the call instead of measuring
+ *   anything.
  */
 export async function npuHubListProbe(
-  filter: string | null,
+  chipset: string | null = null,
 ): Promise<NpuHubListProbe | null> {
   if (!moduleAvailable()) return null;
   try {
-    return await Npu!.hubListProbe(JSON.stringify(npuHubListProbeRequest(filter)));
+    return await Npu!.hubListProbe(JSON.stringify(npuHubListProbeRequest(chipset)));
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
@@ -643,18 +667,23 @@ export async function npuHubListProbe(
 /**
  * The probe request as it will actually be serialised.
  *
- * "No filter" is the whole point of the unfiltered probe, and it must arrive
- * as no filter. Sent as a JSON null it arrived as the string "null", and the
- * runtime went looking for a chipset by that name — on device that reads
- * `chipset "null" not found in platform.json`. The production scan, which
- * passes a real chipset, is unaffected: a string is passed straight through.
+ * "No chipset" is the whole point of the unfiltered probe, and it must arrive
+ * as no chipset — omitted from the object, not present with a null value.
+ * Sent as a JSON null it arrived as the string "null", because that is what
+ * Android's `optString` does with the JSON null sentinel, and the runtime then
+ * went looking for a chipset by that name: `chipset "null" not found in
+ * platform.json`. The key is therefore dropped here AND read with
+ * `stringOrNull` natively — either alone would be enough, and both is what
+ * keeps it true after the next edit to one of them.
+ *
+ * A real chipset string is passed straight through, untouched.
  *
  * Exported for the tests.
  */
 export function npuHubListProbeRequest(
-  filter: string | null,
-): { filter?: string | null } {
-  return withoutNulls({ filter });
+  chipset: string | null,
+): { chipset?: string | null } {
+  return withoutNulls({ chipset });
 }
 
 /**

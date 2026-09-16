@@ -44,6 +44,7 @@ import {
   formatProbe,
   formatCacheReport,
   formatListProbe,
+  formatChipsetIdentity,
   formatGenieXLog,
   formatInstalledReport,
   type HubIdentityProbe,
@@ -207,12 +208,31 @@ export default function DiagnosticsScreen() {
         id: repo.toLowerCase().replace(/-/g, "_"),
       });
 
-      // And the listing, twice: unfiltered, then with the chipset. The
-      // parameter is named for a domain in the SDK, so passing a chipset is
-      // itself part of what this measures — and the manifest is stat-ed either
-      // side, in case the listing rewrites the file the pull then reads.
-      const listAll = await npuHubListProbe(null);
-      const listChip = await npuHubListProbe("SM8850");
+      // And the listing, ONCE, unfiltered — which is the SDK's own default
+      // and the same call production makes. This used to run twice, the second
+      // time with the literal "SM8850", on the belief that the parameter's
+      // meaning was unknown and worth measuring. It is not unknown:
+      // geniex-android 0.4.0 declares `listHubModels(chipset: String? = null)`,
+      // and a string that is not a key in the runtime's platform.json fails the
+      // whole call (`chipset "…" not found in platform.json`). So the second
+      // call could only ever return the catalogue or an error about our own
+      // guess, and neither is evidence. What it was really asking — which
+      // spelling of this chip the SDK accepts — is answered below from the
+      // runtime's own table and the hub's own keys, with no extra call.
+      //
+      // The manifest is still stat-ed either side, which is the one thing this
+      // has that the production call does not: if the listing rewrites the file
+      // the pull then reads, the two stats differ.
+      const listAll = await npuHubListProbe();
+
+      // Read off the store, never re-queried: diagnostics must report what the
+      // app already believes. See gatherHub for the same rule.
+      const store = useModelStore.getState();
+      const chipsetIdentity = formatChipsetIdentity({
+        deviceSoc: store.npu.soc,
+        table: store.npu.chipsets,
+        models: store.npuHub.snapshot?.models ?? null,
+      });
 
       // And what the SDK itself has been saying all along. Nothing is enabled
       // here: GenieX 0.4.0 logs at TRACE from its first instruction and its
@@ -238,8 +258,8 @@ export default function DiagnosticsScreen() {
         cache
           ? formatCacheReport(cache, repo)
           : "Hub cache report\nunavailable (no NPU bridge in this build)",
+        chipsetIdentity,
         listAll ? formatListProbe(listAll, "qwen3") : "",
-        listChip ? formatListProbe(listChip, "qwen3") : "",
         installed ? formatInstalledReport(installed) : "",
         genieXLog ? formatGenieXLog(genieXLog) : "",
       ]

@@ -11,6 +11,9 @@
 // enumerated, asked about individually, and reported verbatim. Choosing
 // between them is a decision for a human holding the results.
 
+import { canonicalChipset, type RuntimeChipset } from "./chipset-identity";
+import { hubChipsetFor, type HubModel } from "./npu-hub";
+
 /** One spelling, and what the runtime made of it. */
 export interface HubIdentityRow {
   /** Where this candidate came from, so a result can be attributed. */
@@ -272,7 +275,8 @@ export function formatCacheReport(
 
 /** Minimal shape of a hub-list probe, so this module stays testable. */
 export interface ListProbeLike {
-  filter?: string | null;
+  /** The chipset the listing was filtered by; absent means it was not. */
+  chipset?: string | null;
   before?: { exists: boolean; sizeBytes: number; modifiedAt: number };
   after?: { exists: boolean; sizeBytes: number; modifiedAt: number };
   count?: number;
@@ -291,7 +295,17 @@ export function formatListProbe(
   probe: ListProbeLike,
   needle: string,
 ): string {
-  const lines = [`listHubModels(${probe.filter ?? "null"})`];
+  // Spelled out rather than printed as "null". The report that said
+  // `listHubModels(null)` sat in the same capture as the runtime's
+  // `chipset "null" not found in platform.json`, and reading the two together
+  // suggested a bug in the argument when the argument was correct — absent IS
+  // the SDK's declared default and its unfiltered query. The label now says
+  // which of the two things happened.
+  const lines = [
+    probe.chipset
+      ? `listHubModels(chipset: ${probe.chipset})`
+      : "listHubModels() — no chipset, every model the hub has",
+  ];
   if (probe.error) lines.push(`error: ${probe.error}`);
   lines.push(`count: ${probe.count ?? 0}`);
 
@@ -470,5 +484,91 @@ export function formatInstalledReport(report: InstalledReportLike): string {
     );
     for (const f of p.files ?? []) lines.push(`  ${f.sizeBytes}\t${f.path}`);
   }
+  return lines.join("\n");
+}
+
+// ── Chipset identity ─────────────────────────────────────────────────────────
+//
+// What the Hub identity probe should have been asking all along.
+//
+// It used to make the same listHubModels() call twice — once unfiltered, once
+// with the literal "SM8850" — and called the pair a measurement of what the
+// parameter means. It was not. `listHubModels(chipset: String? = null)` is the
+// released 0.4.0 signature (the bytecode names the parameter `chipset`, marks
+// it @Nullable and gives it a default), so the unfiltered call was already
+// production's own call, repeated, and the second was a guess at a key in the
+// runtime's platform.json — which fails the whole call when it is wrong rather
+// than reporting anything, and which Vesta has no business guessing at: the SoC
+// id and AI Hub's asset key are different vocabularies by design (see
+// CompatibleHubModel).
+//
+// The question underneath was real, though: WHICH SPELLING OF THIS CHIP IS THE
+// ONE THE SDK ACCEPTS. That is answerable from evidence the app already holds,
+// with no extra call and no guess — the device's own SoC, the runtime's
+// equivalence table, and the keys the hub itself published for this silicon.
+
+export interface ChipsetIdentityInput {
+  /** `Build.SOC_MODEL`, as the device reports it. */
+  deviceSoc: string | null;
+  /** `listChipsets()` — the runtime's own vocabulary. Undefined when unasked. */
+  table: RuntimeChipset[] | undefined;
+  /** The last hub answer, if there is one. Never re-queried for this. */
+  models: HubModel[] | null;
+}
+
+/**
+ * Every name this device's silicon goes by, and where each one came from.
+ *
+ * Read-only over state already gathered: no bridge call, no network, and
+ * therefore no chance of reporting a runtime the rest of the app never saw.
+ *
+ * The last line is the one the old two-call probe was reaching for. Each
+ * distinct `HubModel.chipsets` key that resolves to this device is a spelling
+ * the HUB published for this chip — supplied by the runtime, not invented here,
+ * and so the only kind of string that could be handed back to a filtered
+ * listing without it being a guess.
+ */
+export function formatChipsetIdentity(input: ChipsetIdentityInput): string {
+  const { deviceSoc, table, models } = input;
+  const identity = canonicalChipset(deviceSoc, table);
+  const lines = ["Chipset identity", `device SoC (Build.SOC_MODEL): ${deviceSoc ?? "<unknown>"}`];
+
+  if (!table) {
+    // Never consulted is a different answer from consulted and empty, and the
+    // fail-closed guard downstream treats them differently too.
+    lines.push("runtime chipset table: not consulted");
+  } else if (table.length === 0) {
+    lines.push("runtime chipset table: empty (listChipsets() returned nothing)");
+  } else {
+    lines.push(`runtime chipset table: ${table.length} entries`);
+    lines.push(`runtime name for this chip: ${identity?.runtimeName ?? "<no entry>"}`);
+    lines.push(
+      `runtime aliases: ${
+        identity && identity.aliases.length > 0 ? identity.aliases.join(", ") : "<none>"
+      }`,
+    );
+    lines.push(`known to runtime: ${identity?.knownToRuntime ? "YES" : "NO"}`);
+  }
+
+  lines.push(`canonical target: ${identity?.canonical ?? "<none>"}`);
+
+  if (!models) {
+    lines.push("hub chipset keys for this device: <no hub answer yet>");
+    return lines.join("\n");
+  }
+
+  // Distinct, and in the order the hub listed them: this is evidence, so it is
+  // reported as the hub spelled it.
+  const keys: string[] = [];
+  for (const entry of models) {
+    const key = hubChipsetFor(entry, deviceSoc, table);
+    if (key && !keys.includes(key)) keys.push(key);
+  }
+  lines.push(
+    `hub chipset keys for this device: ${keys.length > 0 ? keys.join(", ") : "<none>"}`,
+    `hub models offered for it: ${
+      models.filter((m) => hubChipsetFor(m, deviceSoc, table)).length
+    } of ${models.length}`,
+  );
   return lines.join("\n");
 }
