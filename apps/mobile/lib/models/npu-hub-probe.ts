@@ -396,3 +396,79 @@ export function formatGenieXLog(report: GenieXLogLike): string {
   }
   return lines.join("\n");
 }
+
+// ── What the runtime considers installed ──────────────────────────────────
+
+/** Minimal shape of the native installed report, so this module stays testable. */
+export interface InstalledReportLike {
+  installed?: string[];
+  installedCount?: number;
+  probes?: {
+    asked: string;
+    inList: boolean;
+    resolveAlias?: string | null;
+    getPaths?: boolean;
+    getPathsError?: string | null;
+    resolvedName?: string | null;
+    modelDir?: string | null;
+    modelPath?: string | null;
+    tokenizerPath?: string | null;
+    runtimeId?: string | null;
+    modelType?: string | null;
+    getType?: string | null;
+    dirExists?: boolean;
+    fileCount?: number;
+    totalBytes?: number;
+    zeroLengthFiles?: string[];
+    files?: { path: string; sizeBytes: number }[];
+  }[];
+  error?: string | null;
+}
+
+/**
+ * Whether a pulled bundle is actually there, and under which identity.
+ *
+ * `list()` and `getPaths()` are printed as the two separate answers they are.
+ * A name in `list()` with a null `getPaths()` is a bundle the manager knows
+ * about but has not finished; a resolving `getPaths()` is the same test
+ * `pull()` itself uses to decide the download completed.
+ *
+ * The zero-length files get their own line because that set is exactly what
+ * `checkBundle()` reads as "the download did not finish" — a bundle listed as
+ * installed, with paths that resolve, and a zero-byte `.lock` beside the
+ * weights is a Vesta false negative rather than a broken download.
+ */
+export function formatInstalledReport(report: InstalledReportLike): string {
+  const lines = ["GenieX installed models"];
+  if (report.error) lines.push(`error: ${report.error}`);
+  lines.push(`list(): ${report.installedCount ?? 0} model(s)`);
+  for (const name of report.installed ?? []) lines.push(`  ${name}`);
+
+  for (const p of report.probes ?? []) {
+    lines.push("", `asked: ${p.asked}`, `in list(): ${p.inList ? "YES" : "no"}`);
+    lines.push(`resolveAlias: ${p.resolveAlias ?? "<null>"}`);
+    lines.push(`getPaths: ${p.getPaths ? "RESOLVED" : "<null>"}`);
+    if (p.getPathsError) lines.push(`getPaths threw: ${p.getPathsError}`);
+    if (!p.getPaths) continue;
+
+    // The identity question: the catalogue name we asked with against the key
+    // the manager filed it under.
+    lines.push(
+      `resolvedName: ${p.resolvedName ?? "<null>"}`,
+      `identity matches asked: ${p.resolvedName === p.asked ? "yes" : "NO"}`,
+      `getType: ${p.getType ?? "<null>"}`,
+      `runtimeId: ${p.runtimeId ?? "<null>"}`,
+      `modelDir: ${p.modelDir ?? "<null>"} (${p.dirExists ? "exists" : "ABSENT"})`,
+      `modelPath: ${p.modelPath ?? "<null>"}`,
+      `tokenizerPath: ${p.tokenizerPath ?? "<null>"}`,
+      `files: ${p.fileCount ?? 0}, ${p.totalBytes ?? 0} bytes`,
+    );
+
+    const zero = p.zeroLengthFiles ?? [];
+    lines.push(
+      `zero-length files: ${zero.length === 0 ? "none" : zero.join(", ")}`,
+    );
+    for (const f of p.files ?? []) lines.push(`  ${f.sizeBytes}\t${f.path}`);
+  }
+  return lines.join("\n");
+}

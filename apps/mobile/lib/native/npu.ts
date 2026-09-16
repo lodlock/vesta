@@ -28,6 +28,7 @@ interface NpuNativeModule {
   hubCacheReport(configJson: string): Promise<NpuHubCacheReport>;
   hubListProbe(configJson: string): Promise<NpuHubListProbe>;
   genieXLogReport(configJson: string): Promise<NpuGenieXLogReport>;
+  installedReport(configJson: string): Promise<NpuInstalledReport>;
   cancelPull(): void;
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
   removeBundle(modelName: string): Promise<void>;
@@ -256,6 +257,51 @@ export interface NpuGenieXLogReport {
   sawStderrSelfTest?: boolean;
   /** A VERBOSE line got through, so the TRACE gate is still open. */
   verboseSeen?: boolean;
+  error?: string | null;
+}
+
+/**
+ * One identity, as every read-only GenieX API answers about it.
+ *
+ * `getPaths` is the field that matters: `pull()` already uses a non-null
+ * `getPaths()` as its own completion test, so a true here means the manager
+ * finished the download and moved the bundle out of `.inflight/`.
+ */
+export interface NpuInstalledProbe {
+  /** The identity we asked with. */
+  asked: string;
+  /** Whether `list()` — the runtime's own register — holds this name. */
+  inList: boolean;
+  resolveAlias?: string | null;
+  /** True when `getPaths()` resolved. The download-finished signal. */
+  getPaths?: boolean;
+  getPathsError?: string | null;
+  /** `ModelPaths.model_name` — the manager's own key, which may differ. */
+  resolvedName?: string | null;
+  modelPath?: string | null;
+  modelDir?: string | null;
+  tokenizerPath?: string | null;
+  runtimeId?: string | null;
+  modelType?: string | null;
+  getType?: string | null;
+  dirExists?: boolean;
+  fileCount?: number;
+  totalBytes?: number;
+  files?: { path: string; sizeBytes: number }[];
+  /** Exactly the set `checkBundle()` reads as "the download did not finish". */
+  zeroLengthFiles?: string[];
+}
+
+/**
+ * What GenieX considers installed, read without changing anything.
+ *
+ * Nothing here pulls, removes, cleans or loads — it exists to be run over a
+ * bundle whose fate is undecided.
+ */
+export interface NpuInstalledReport {
+  installed?: string[];
+  installedCount?: number;
+  probes?: NpuInstalledProbe[];
   error?: string | null;
 }
 
@@ -537,6 +583,27 @@ export async function npuGenieXLogReport(
   if (!moduleAvailable()) return null;
   try {
     return await Npu!.genieXLogReport(JSON.stringify(options));
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Asks GenieX what it considers installed. Null in a default build.
+ *
+ * Read-only by construction — see the native module. Safe to run over a bundle
+ * whose fate is undecided, which is the only reason it exists.
+ *
+ * @param names identities to probe even if `list()` does not hold them. Asking
+ *   for a name that is absent is the only way to get "it is missing" as an
+ *   answer rather than as an omission.
+ */
+export async function npuInstalledReport(
+  names: string[] = [],
+): Promise<NpuInstalledReport | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.installedReport(JSON.stringify({ names }));
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) };
   }

@@ -187,3 +187,50 @@ describe("an NPU install cannot reach a GGUF", () => {
     expect(bundleIsolatedFromGguf("/files/", "/files")).toBe(false);
   });
 });
+
+// A characterization test, not an endorsement.
+//
+// On a real device GenieX pulled the full 2.38 GB bundle and reported
+// `pull() returned rc=0`; `getPaths()` then resolved, which is the manager's
+// own completion test. The install still failed, because the bundle directory
+// also holds GenieX's own `.lock` — zero bytes by design, since the lock lives
+// in the kernel (`libgeniex.so` imports `flock` and carries the literal
+// strings `.lock`, `.inflight` and `.progress`).
+//
+// `checkBundle()` scans EVERY file the native side measured, so the lock trips
+// the truncated-shard rule and the whole download is rejected and deleted.
+// This pins the behaviour exactly as it stands so the decision about it is
+// made deliberately, in one place, rather than discovered again on device.
+describe("GenieX's own bookkeeping files, against the zero-length rule", () => {
+  const refusal = (b: MeasuredBundle) => {
+    const check = checkBundle(b);
+    if (check.ok) throw new Error("expected a refusal");
+    return check;
+  };
+
+  const withLock = () =>
+    bundle({ files: [file(".lock", 0), ...bundle().files] });
+
+  it("currently rejects a complete bundle because the lock is empty", () => {
+    const check = refusal(withLock());
+    expect(check.reason).toBe("zero-length-file");
+    expect(check.message).toBe(".lock is empty — the download did not finish.");
+  });
+
+  // Nothing else about the bundle is wrong: every file the runtime actually
+  // requires is present and non-empty.
+  it("finds the bundle otherwise complete — every required file is there", () => {
+    const withoutLock = bundle();
+    expect(checkBundle(withoutLock).ok).toBe(true);
+    expect(withLock().files.filter((f) => f.sizeBytes <= 0)).toEqual([
+      { path: ".lock", sizeBytes: 0 },
+    ]);
+  });
+
+  // The rule the zero-length check was written for still has to hold. A shard
+  // that is genuinely empty is a truncated download and must stay a refusal.
+  it("still refuses a genuinely empty weight shard", () => {
+    const files = [file(".lock", 0), ...bundle().files.slice(0, -1), file("weights_2.bin", 0)];
+    expect(refusal(bundle({ files })).reason).toBe("zero-length-file");
+  });
+});

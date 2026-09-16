@@ -45,6 +45,7 @@ import {
   formatCacheReport,
   formatListProbe,
   formatGenieXLog,
+  formatInstalledReport,
   type HubIdentityProbe,
 } from "../lib/models/npu-hub-probe";
 import {
@@ -53,6 +54,7 @@ import {
   npuHubCacheReport,
   npuHubListProbe,
   npuGenieXLogReport,
+  npuInstalledReport,
 } from "../lib/native/npu";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
@@ -218,6 +220,15 @@ export default function DiagnosticsScreen() {
       // logcat under one tag. This capture is the only part that was missing.
       const genieXLog = await npuGenieXLogReport();
 
+      // And whether the runtime still holds the bundle a pull just produced.
+      // Read-only: list(), getPaths(), getType(), resolveAlias() and a stat.
+      // Both spellings are asked for, because the answer to "is it filed under
+      // the name we asked with?" is only available by asking for both.
+      const installed = await npuInstalledReport([
+        entry.modelName,
+        ...(hubName && hubName !== entry.modelName ? [hubName] : []),
+      ]);
+
       // Logged under the VestaNpu tag, not the JS one, so a single
       // `adb logcat -s VestaNpu` capture carries the probe, the cache, the
       // pull request and its failure together. Also to the JS console, which
@@ -229,6 +240,7 @@ export default function DiagnosticsScreen() {
           : "Hub cache report\nunavailable (no NPU bridge in this build)",
         listAll ? formatListProbe(listAll, "qwen3") : "",
         listChip ? formatListProbe(listChip, "qwen3") : "",
+        installed ? formatInstalledReport(installed) : "",
         genieXLog ? formatGenieXLog(genieXLog) : "",
       ]
         .filter(Boolean)

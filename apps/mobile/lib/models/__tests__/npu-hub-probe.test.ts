@@ -16,8 +16,10 @@ import {
   formatCacheReport,
   formatListProbe,
   formatGenieXLog,
+  formatInstalledReport,
   mentionsModel,
   type GenieXLogLike,
+  type InstalledReportLike,
 } from "../npu-hub-probe";
 
 const QWEN = "qualcomm/Qwen3-4B-Instruct-2507";
@@ -482,5 +484,94 @@ describe("GenieX's own log, reported", () => {
     const text = formatGenieXLog({ error: "logcat: permission denied" });
     expect(text).toContain("error: logcat: permission denied");
     expect(text).toContain("<no GenieX lines in the buffer>");
+  });
+});
+
+describe("what the runtime considers installed", () => {
+  // The shape of the case under investigation: GenieX returned rc=0, the
+  // bundle is in list(), getPaths() resolves — and there is a zero-byte .lock
+  // beside the weights, which is what checkBundle() rejected the install on.
+  const pulled: InstalledReportLike = {
+    installed: ["qualcomm/Qwen3-4B-Instruct-2507"],
+    installedCount: 1,
+    probes: [
+      {
+        asked: "qualcomm/Qwen3-4B-Instruct-2507",
+        inList: true,
+        resolveAlias: "qualcomm/Qwen3-4B-Instruct-2507",
+        getPaths: true,
+        resolvedName: "qualcomm/Qwen3-4B-Instruct-2507",
+        modelDir: "/data/user/0/com.cosmico.vesta/files/geniex/models/qwen3",
+        modelPath: "/data/user/0/com.cosmico.vesta/files/geniex/models/qwen3",
+        tokenizerPath: "…/tokenizer.json",
+        runtimeId: "qairt",
+        modelType: "LLM",
+        getType: "LLM",
+        dirExists: true,
+        fileCount: 3,
+        totalBytes: 2_380_000_000,
+        zeroLengthFiles: [".lock"],
+        files: [
+          { path: ".lock", sizeBytes: 0 },
+          { path: "metadata.json", sizeBytes: 4096 },
+          { path: "weights_1.bin", sizeBytes: 2_379_995_904 },
+        ],
+      },
+    ],
+  };
+
+  it("separates the register from the paths — they are two answers", () => {
+    const text = formatInstalledReport(pulled);
+    expect(text).toContain("list(): 1 model(s)");
+    expect(text).toContain("in list(): YES");
+    expect(text).toContain("getPaths: RESOLVED");
+  });
+
+  // The identity question: the catalogue name against the manager's cache key.
+  it("says whether the resolved identity is the one asked for", () => {
+    expect(formatInstalledReport(pulled)).toContain("identity matches asked: yes");
+    const renamed: InstalledReportLike = {
+      ...pulled,
+      probes: [{ ...pulled.probes![0], resolvedName: "Qwen3-4B-Instruct-2507" }],
+    };
+    expect(formatInstalledReport(renamed)).toContain("identity matches asked: NO");
+  });
+
+  // The finding itself, made legible: a complete 2.38 GB bundle whose only
+  // zero-length file is GenieX's own lock.
+  it("names the zero-length files rather than burying them in the listing", () => {
+    const text = formatInstalledReport(pulled);
+    expect(text).toContain("zero-length files: .lock");
+    expect(text).toContain("0\t.lock");
+    expect(text).toContain("files: 3, 2380000000 bytes");
+  });
+
+  it("reports a clean bundle as having none", () => {
+    const clean: InstalledReportLike = {
+      ...pulled,
+      probes: [{ ...pulled.probes![0], zeroLengthFiles: [] }],
+    };
+    expect(formatInstalledReport(clean)).toContain("zero-length files: none");
+  });
+
+  // Asking for an identity that is absent is the only way to get "it is gone"
+  // as an answer rather than as an omission.
+  it("distinguishes a missing model from one that merely has no paths", () => {
+    const gone = formatInstalledReport({
+      installed: [],
+      installedCount: 0,
+      probes: [{ asked: "qualcomm/Qwen3-4B-Instruct-2507", inList: false, getPaths: false }],
+    });
+    expect(gone).toContain("list(): 0 model(s)");
+    expect(gone).toContain("in list(): no");
+    expect(gone).toContain("getPaths: <null>");
+    // Nothing downstream is printed for a probe with no paths.
+    expect(gone).not.toContain("modelDir:");
+  });
+
+  it("survives a report that failed outright", () => {
+    expect(formatInstalledReport({ error: "runtime unavailable" })).toContain(
+      "error: runtime unavailable",
+    );
   });
 });

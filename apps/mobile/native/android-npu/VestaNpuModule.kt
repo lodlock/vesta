@@ -645,6 +645,174 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
             .replace(AUTH_SCHEME_TOKEN, "\$1 REDACTED")
 
     /**
+     * What GenieX itself considers installed, asked without changing anything.
+     *
+     * STRICTLY READ-ONLY. It calls `list()`, `getPaths()`, `getType()` and
+     * `resolveAlias()`, and it stats a directory. It does not pull, remove,
+     * clean, load or write, because it exists to be run over a bundle whose
+     * fate is undecided — several gigabytes that may or may not still be there.
+     *
+     * It answers four questions the install path currently cannot:
+     *
+     * 1. Is the bundle still on disk at all? `list()` is the runtime's own
+     *    register of installed models and is the only authority on that.
+     * 2. Does `getPaths()` resolve for it? That is what `pull()` already uses
+     *    as its completion test, and a non-null answer means the manager has
+     *    moved it out of `.inflight/` — i.e. the download finished.
+     * 3. Under WHICH identity? The name `list()` returns and the
+     *    `ModelPaths.model_name` it resolves to are reported beside the name we
+     *    asked with, so a mismatch between the catalogue identifier and the
+     *    manager's cache key is visible rather than inferred.
+     * 4. Which files in the bundle are zero length? The manager keeps its own
+     *    bookkeeping beside the weights — `libgeniex.so` carries the literal
+     *    strings `.lock`, `.inflight` and `.progress`, and imports `flock` —
+     *    and a lock file is zero bytes BY DESIGN, since the lock lives in the
+     *    kernel and not in the file. They are listed separately here because
+     *    `checkBundle()` currently treats any zero-length file in the bundle
+     *    directory as a truncated download.
+     *
+     * `query()` is deliberately not called: it lives on
+     * `com.geniex.sdk.jni.ModelManager`, which is `internal` in the SDK's
+     * Kotlin metadata, so there is no supported path to it. See the note above
+     * pullInputFrom for why reflection is not used to get one.
+     */
+    @ReactMethod
+    fun installedReport(configJson: String, promise: Promise) {
+        scope.launch {
+            val out = Arguments.createMap()
+            try {
+                if (!ensureSdk()) {
+                    out.putString("error", initError ?: "runtime unavailable")
+                    promise.resolve(out)
+                    return@launch
+                }
+                val config = JSONObject(configJson)
+
+                // The runtime's own register. Whatever is in here is installed,
+                // whatever is not is not, and no amount of client-side checking
+                // overrides it.
+                val installed = ModelManagerWrapper.list()
+                val names: WritableArray = Arguments.createArray()
+                installed.forEach { names.pushString(it) }
+                out.putArray("installed", names)
+                out.putInt("installedCount", installed.size)
+
+                // Everything the register holds, plus any identity the caller
+                // wants tested even when absent — "is it missing?" is an answer
+                // only obtainable by asking for a name that is not listed.
+                val asked = linkedSetOf<String>()
+                asked.addAll(installed)
+                val extra = config.optJSONArray("names")
+                if (extra != null) {
+                    for (i in 0 until extra.length()) {
+                        extra.optString(i, "").takeIf { it.isNotBlank() }?.let { asked.add(it) }
+                    }
+                }
+
+                val probes: WritableArray = Arguments.createArray()
+                for (name in asked) {
+                    probes.pushMap(probeInstalled(name, installed.contains(name)))
+                }
+                out.putArray("probes", probes)
+                promise.resolve(out)
+            } catch (e: Throwable) {
+                android.util.Log.w(TAG, "installedReport failed", e)
+                out.putString("error", e.message ?: e.toString())
+                promise.resolve(out)
+            }
+        }
+    }
+
+    /**
+     * One identity, asked of every read-only API that will answer about it.
+     *
+     * Each call is caught separately and reported as its own error string: a
+     * `getType()` that throws must not cost us the `getPaths()` answer, which
+     * is the one that decides whether the download finished.
+     */
+    private suspend fun probeInstalled(name: String, inList: Boolean): WritableMap {
+        val out = Arguments.createMap()
+        out.putString("asked", name)
+        out.putBoolean("inList", inList)
+
+        out.putString(
+            "resolveAlias",
+            try {
+                ModelManagerWrapper.resolveAlias(name)
+            } catch (e: Throwable) {
+                "<threw: ${e.message}>"
+            },
+        )
+
+        val paths =
+            try {
+                ModelManagerWrapper.getPaths(name)
+            } catch (e: Throwable) {
+                out.putString("getPathsError", e.message ?: e.toString())
+                null
+            }
+        out.putBoolean("getPaths", paths != null)
+        if (paths == null) {
+            // The whole point of the probe when it comes back like this: a null
+            // here is what pull() would have called NPU_PULL_INCOMPLETE.
+            return out
+        }
+
+        out.putString("resolvedName", paths.model_name)
+        out.putString("modelPath", paths.model_path)
+        out.putString("modelDir", paths.model_dir)
+        out.putString("tokenizerPath", paths.tokenizer_path)
+        out.putString("runtimeId", paths.runtime_id)
+        out.putString("modelType", paths.model_type.name)
+        // getType() is declared `ModelType?`, unlike ModelPaths.model_type,
+        // which is not. Read through `?.`: a null is the manager declining to
+        // say, and is a different answer from the call throwing.
+        out.putString(
+            "getType",
+            try {
+                ModelManagerWrapper.getType(name)?.name ?: "<null>"
+            } catch (e: Throwable) {
+                "<threw: ${e.message}>"
+            },
+        )
+
+        val dir = File(stripScheme(paths.model_dir))
+        out.putBoolean("dirExists", dir.isDirectory)
+        if (!dir.isDirectory) return out
+
+        // Sizes only. No hashing: a multi-gigabyte bundle would take minutes on
+        // the phone, and nothing here is deciding anything — it is being looked
+        // at.
+        val files: WritableArray = Arguments.createArray()
+        val zeroLength: WritableArray = Arguments.createArray()
+        var totalBytes = 0L
+        var count = 0
+        dir.walkTopDown()
+            .filter { it.isFile }
+            .sortedBy { it.absolutePath }
+            .forEach { file ->
+                val size = file.length()
+                totalBytes += size
+                count++
+                val rel = file.relativeTo(dir).path.replace(File.separatorChar, '/')
+                if (size <= 0L) zeroLength.pushString(rel)
+                if (count <= MAX_CACHE_ENTRIES) {
+                    val entry = Arguments.createMap()
+                    entry.putString("path", rel)
+                    entry.putDouble("sizeBytes", size.toDouble())
+                    files.pushMap(entry)
+                }
+            }
+        out.putInt("fileCount", count)
+        out.putDouble("totalBytes", totalBytes.toDouble())
+        out.putArray("files", files)
+        // Listed on their own because this is exactly the set checkBundle()
+        // currently reads as "the download did not finish".
+        out.putArray("zeroLengthFiles", zeroLength)
+        return out
+    }
+
+    /**
      * Finds the array of model entries in a manifest whose exact shape we have
      * never seen.
      *
