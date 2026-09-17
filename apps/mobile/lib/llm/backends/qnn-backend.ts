@@ -243,6 +243,7 @@ export class QualcommNpuBackend implements ModelBackend {
         ttftMs: result.ttftMs,
         prefillTokensPerSecond: result.prefillSpeed,
         generatedTokens: result.generatedTokens,
+        generatedChars: result.text?.length ?? 0,
         decodeTokensPerSecond: result.decodeSpeed,
         totalMs: Date.now() - started,
         stopReason: result.stopReason,

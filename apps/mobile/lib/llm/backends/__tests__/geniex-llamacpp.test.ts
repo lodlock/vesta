@@ -12,9 +12,13 @@
 // failed GenieX load must THROW. Quietly re-loading the same file on llama.rn
 // would produce a CPU run wearing this backend's label.
 
-const mockLoadLlamaCpp = jest.fn(async () => ({
+// Echoes the compute unit back, exactly as VestaNpuModule does: the native side
+// resolves and validates the alias and then reports the one it built the session
+// with. A mock that answered "hybrid" to every request would hide the bug this
+// lane had — a label taken from the pending selector rather than the session.
+const mockLoadLlamaCpp = jest.fn(async (config?: { computeUnit?: string }) => ({
   version: "0.4.0",
-  computeUnit: "hybrid",
+  computeUnit: config?.computeUnit ?? "hybrid",
   runtimeId: "llama_cpp",
   soc: "SM8850",
   manifestRuntimeId: "llama_cpp",
@@ -43,7 +47,8 @@ jest.mock("../../../native/npu", () => ({
   isNpuBuild: jest.fn(() => true),
   isNpuRuntimeAvailable: jest.fn(() => mockRuntimeAvailable),
   npuUnavailableReason: jest.fn(() => "The runtime did not start."),
-  npuLoadLlamaCpp: (...args: unknown[]) => mockLoadLlamaCpp(...(args as [])),
+  npuLoadLlamaCpp: (...args: unknown[]) =>
+    mockLoadLlamaCpp(...(args as [{ computeUnit?: string }])),
   npuGenerate: (...args: unknown[]) => mockGenerate(...(args as [])),
   npuUnload: () => mockUnload(),
   npuCancel: jest.fn(),
@@ -234,5 +239,203 @@ describe("what it says about the hardware", () => {
     await backend.generate([{ role: "user", content: "again" }]);
     expect(getLastRun()?.reusedSession).toBe(true);
     expect(getLastRun()?.coldLoadMs).toBeUndefined();
+  });
+});
+
+// ── Compute-unit lifecycle ──────────────────────────────────────────────────
+//
+// From the device: a model was loaded as `npu`, the Diagnostics selector moved
+// to `hybrid`, and the same model stayed active. Re-activating it did not
+// rebuild the native session — every short-circuit on the way compared file
+// paths — so pinned HTP0 went on serving turns while Last Run called them
+// hybrid. Forcing a QAIRT → llama.cpp handoff was the only way to get a real
+// hybrid session, because that path releases everything and cannot short-circuit.
+//
+// Two separate faults, and both are pinned below:
+//   1. the compute unit the SESSION was built with was never recorded, so the
+//      label had nothing to read but the pending selector;
+//   2. "same model id" was treated as "same session", so a changed setting was
+//      silently discarded.
+
+describe("the loaded session owns its compute unit", () => {
+  it("labels a turn with the unit the SESSION was built with", async () => {
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    await backend.load(owned());
+
+    // The selector moves after the session exists — the exact device sequence.
+    backend.setComputeUnit("hybrid");
+    await backend.generate([{ role: "user", content: "hi" }]);
+
+    // The turn ran on pinned HTP0 and says so. Reading the pending value here
+    // is what let a stale selector relabel a live session.
+    expect(getLastRun()?.computeLabel).toBe("Hexagon HTP (pinned HTP0)");
+    expect(getLastRun()?.computeLabel).not.toMatch(/hybrid/);
+  });
+
+  it("keeps the session's unit and the pending one as separate facts", async () => {
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    await backend.load(owned());
+    backend.setComputeUnit("hybrid");
+
+    const details = backend.getDiagnostics().details;
+    // Backend diagnostics are the source of truth for what is LOADED…
+    expect(details.requestedComputeUnit).toBe("npu");
+    expect(backend.getLoadedComputeUnit()).toBe("npu");
+    // …and the pending value is visible beside it rather than replacing it.
+    expect(details.pendingComputeUnit).toBe("hybrid");
+    expect(details.computeUnitStale).toBe(true);
+  });
+
+  it("reports no stale config when nothing has been changed", async () => {
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    await backend.load(owned());
+
+    const details = backend.getDiagnostics().details;
+    expect(details.requestedComputeUnit).toBe("npu");
+    expect(details.pendingComputeUnit).toBe("npu");
+    expect(details.computeUnitStale).toBe(false);
+  });
+
+  it("claims no session compute unit before anything is loaded", async () => {
+    // An unloaded backend showing the pending value looked exactly like a
+    // loaded one running in that mode.
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    expect(backend.getDiagnostics().details.requestedComputeUnit).toBe("n/a");
+    expect(backend.getLoadedComputeUnit()).toBeNull();
+    expect(backend.getDiagnostics().details.computeUnitStale).toBe(false);
+  });
+
+  it("forgets the session's unit when the session goes", async () => {
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    await backend.load(owned());
+    await backend.unload();
+
+    expect(backend.getLoadedComputeUnit()).toBeNull();
+    expect(backend.getDiagnostics().details.requestedComputeUnit).toBe("n/a");
+  });
+
+  it("forgets it when the load FAILS, rather than describing a session that never existed", async () => {
+    mockLoadLlamaCpp.mockRejectedValueOnce(new Error("HTP0 not found"));
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    await expect(backend.load(owned())).rejects.toThrow();
+
+    expect(backend.getLoadedComputeUnit()).toBeNull();
+  });
+
+  it("describes the session by what the RUNTIME echoed, not what was asked", async () => {
+    // The native side resolves and validates the alias before building
+    // LlmCreateInput, so its answer is the one that describes the session. If
+    // those two ever disagree, the runtime wins — a request is not an outcome.
+    mockLoadLlamaCpp.mockResolvedValueOnce({
+      version: "0.4.0",
+      computeUnit: "hybrid",
+      runtimeId: "llama_cpp",
+      soc: "SM8850",
+      manifestRuntimeId: "llama_cpp",
+      contextSize: 4096,
+      deviceSelection: {},
+    } as Awaited<ReturnType<typeof mockLoadLlamaCpp>>);
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    await backend.load(owned());
+
+    expect(backend.getLoadedComputeUnit()).toBe("hybrid");
+  });
+
+  it("ignores an echoed unit it does not recognise, keeping what it asked for", async () => {
+    // A future runtime answering something new must not become a label nothing
+    // else in the app understands.
+    mockLoadLlamaCpp.mockResolvedValueOnce({
+      version: "0.4.0",
+      computeUnit: "quantum",
+      runtimeId: "llama_cpp",
+      soc: "SM8850",
+      manifestRuntimeId: "llama_cpp",
+      contextSize: 4096,
+      deviceSelection: {},
+    } as Awaited<ReturnType<typeof mockLoadLlamaCpp>>);
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    await backend.load(owned());
+
+    expect(backend.getLoadedComputeUnit()).toBe("npu");
+  });
+
+  it("is not changed mid-load by a tap that lands during the load", async () => {
+    // A load takes seconds and the selector is a button. Re-reading the field
+    // after the await would let a tap decide how a session it did not
+    // configure gets described.
+    let release!: () => void;
+    const pending = new Promise<void>((r) => (release = r));
+    mockLoadLlamaCpp.mockImplementationOnce(async () => {
+      await pending;
+      return {
+        version: "0.4.0",
+        computeUnit: "npu",
+        runtimeId: "llama_cpp",
+        soc: "SM8850",
+        manifestRuntimeId: "llama_cpp",
+        contextSize: 4096,
+        deviceSelection: {},
+      } as Awaited<ReturnType<typeof mockLoadLlamaCpp>>;
+    });
+
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    const loading = backend.load(owned());
+    backend.setComputeUnit("hybrid"); // lands mid-load
+    release();
+    await loading;
+
+    expect(mockLoadLlamaCpp).toHaveBeenCalledWith(
+      expect.objectContaining({ computeUnit: "npu" }),
+    );
+    expect(backend.getLoadedComputeUnit()).toBe("npu");
+  });
+});
+
+describe("the load fingerprint decides whether a session can be reused", () => {
+  it("is unchanged for the same model and the same compute unit", () => {
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    expect(backend.loadFingerprint(owned())).toBe(
+      backend.loadFingerprint(owned()),
+    );
+  });
+
+  it("CHANGES when the compute unit changes", () => {
+    // This is the whole mechanism: npu → hybrid must not compare equal, or the
+    // session gets reused and the setting silently does nothing.
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("npu");
+    const pinned = backend.loadFingerprint(owned());
+    backend.setComputeUnit("hybrid");
+    expect(backend.loadFingerprint(owned())).not.toBe(pinned);
+  });
+
+  it("changes in both directions", () => {
+    const backend = new GenieXLlamaCppBackend();
+    backend.setComputeUnit("hybrid");
+    const hybrid = backend.loadFingerprint(owned());
+    backend.setComputeUnit("npu");
+    const npu = backend.loadFingerprint(owned());
+    backend.setComputeUnit("hybrid");
+    expect(backend.loadFingerprint(owned())).toBe(hybrid);
+    expect(npu).not.toBe(hybrid);
+  });
+
+  it("changes when the context size does", () => {
+    // The other thing the session is built around. Same model file, different
+    // session.
+    const backend = new GenieXLlamaCppBackend();
+    expect(backend.loadFingerprint(owned({ contextSize: 4096 }))).not.toBe(
+      backend.loadFingerprint(owned({ contextSize: 8192 })),
+    );
   });
 });

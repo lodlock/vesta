@@ -71,6 +71,17 @@ import type {
 /** The manifest runtime a model must declare to belong to this lane. */
 const LLAMA_CPP_RUNTIME = "llama_cpp";
 
+/**
+ * The runtime's echoed compute unit, when it is one we recognise.
+ *
+ * `NpuRuntimeInfo.computeUnit` is a bare string off the bridge. An unrecognised
+ * one is dropped rather than cast, so a runtime that starts answering something
+ * new cannot silently become a label nothing else in the app understands.
+ */
+function asComputeUnit(value: string | null | undefined): GenieXComputeUnit | null {
+  return value && value in COMPUTE_LABELS ? (value as GenieXComputeUnit) : null;
+}
+
 /** How each compute unit is described once a session exists. */
 const COMPUTE_LABELS: Record<GenieXComputeUnit, string> = {
   hybrid: "Hexagon HTP + CPU (hybrid)",
@@ -85,7 +96,24 @@ export class GenieXLlamaCppBackend implements ModelBackend {
 
   private loadedRef: BackendModelRef | null = null;
   private runtime: NpuRuntimeInfo | null = null;
+  /**
+   * The compute unit the NEXT load will use. Mutable at any time, including
+   * while a session is running — which is exactly why it must never be used to
+   * describe that session. See {@link loadedComputeUnit}.
+   */
   private computeUnit: GenieXComputeUnit = DEFAULT_GENIEX_COMPUTE_UNIT;
+  /**
+   * The compute unit the LOADED session was actually created with, or null when
+   * nothing is loaded.
+   *
+   * These were one field, and that was a bug with two faces. Last Run relabelled
+   * a live `npu` session as `hybrid` the moment the selector moved, because the
+   * label read the pending value; and nothing could tell that the session no
+   * longer matched the configuration, because there was nothing to compare it
+   * against. A session's compute unit is a fact about a session, so it is stored
+   * with the session and set only by a load that succeeded.
+   */
+  private loadedComputeUnit: GenieXComputeUnit | null = null;
   private devices: NpuDeviceSelection | null = null;
   private lastError: string | null = null;
   private lastProfile: NpuRawResult | null = null;
@@ -93,19 +121,42 @@ export class GenieXLlamaCppBackend implements ModelBackend {
   private turnsSinceLoad = 0;
 
   /**
-   * The compute unit the next load will use.
+   * Chooses the compute unit the NEXT load will use.
    *
-   * Internal and test-only, as the brief asks: `npu` is the one alias that
-   * makes GenieX log the explicit "Found device: HTP0" sentence, so it is the
-   * mode that PROVES binding, while `hybrid` is the one that should be fast.
-   * There is deliberately no UI for this.
+   * `npu` is the one alias that makes GenieX log the explicit "Found device:
+   * HTP0" sentence, so it is the mode that PROVES binding, while `hybrid` is
+   * the one that should be fast.
+   *
+   * Deliberately does not touch the running session: GenieX has no way to move
+   * a live session between devices, so the only honest options are "rebuild it"
+   * or "leave it alone", and rebuilding several gigabytes of weights as a side
+   * effect of a tap is not something a setter should decide. It leaves the
+   * session exactly as it is and makes {@link loadFingerprint} disagree, which
+   * is what tells activation to reload.
    */
   setComputeUnit(unit: GenieXComputeUnit): void {
     this.computeUnit = unit;
   }
 
+  /** The compute unit the next load will use — NOT necessarily the loaded one. */
   getComputeUnit(): GenieXComputeUnit {
     return this.computeUnit;
+  }
+
+  /** What the loaded session was created with, or null when nothing is loaded. */
+  getLoadedComputeUnit(): GenieXComputeUnit | null {
+    return this.loadedComputeUnit;
+  }
+
+  /**
+   * What separates one GenieX llama.cpp session from another with the same
+   * model: the compute unit, and the context size the session was built around.
+   *
+   * Compared against the fingerprint recorded at load time, so "same model" can
+   * stop meaning "same session". See ModelBackend.loadFingerprint.
+   */
+  loadFingerprint(model: BackendModelRef): string {
+    return `computeUnit=${this.computeUnit};contextSize=${model.contextSize}`;
   }
 
   isAvailable(): boolean {
@@ -148,12 +199,16 @@ export class GenieXLlamaCppBackend implements ModelBackend {
       this.lastError = refusal;
       throw new Error(refusal);
     }
+    // Read ONCE, before the await. The selector is mutable and a load takes
+    // seconds; re-reading the field afterwards would let a tap that arrived
+    // mid-load decide how we describe a session it did not configure.
+    const requested = this.computeUnit;
     try {
       const started = Date.now();
       const runtime = await npuLoadLlamaCpp({
         // Non-null by the guard above; the manager resolves the path itself.
         modelName: model.runtimeModelName as string,
-        computeUnit: this.computeUnit,
+        computeUnit: requested,
         contextSize: model.contextSize,
       });
 
@@ -172,11 +227,18 @@ export class GenieXLlamaCppBackend implements ModelBackend {
       this.lastLoadMs = Date.now() - started;
       this.turnsSinceLoad = 0;
       this.loadedRef = model;
+      // The session's own compute unit, taken from what the native side echoed
+      // back rather than from what we asked for — VestaNpuModule resolves and
+      // validates the alias before building LlmCreateInput, so its answer is
+      // the one that describes the session. `requested` is the fallback for a
+      // runtime that does not echo, and never the pending selector value.
+      this.loadedComputeUnit = asComputeUnit(runtime.computeUnit) ?? requested;
       this.lastError = null;
     } catch (err) {
       this.loadedRef = null;
       this.runtime = null;
       this.devices = null;
+      this.loadedComputeUnit = null;
       this.lastError = err instanceof Error ? err.message : String(err);
       throw err;
     }
@@ -219,6 +281,7 @@ export class GenieXLlamaCppBackend implements ModelBackend {
         ttftMs: result.ttftMs,
         prefillTokensPerSecond: result.prefillSpeed,
         generatedTokens: result.generatedTokens,
+        generatedChars: result.text?.length ?? 0,
         decodeTokensPerSecond: result.decodeSpeed,
         totalMs: Date.now() - started,
         stopReason: result.stopReason,
@@ -251,6 +314,7 @@ export class GenieXLlamaCppBackend implements ModelBackend {
       this.loadedRef = null;
       this.runtime = null;
       this.devices = null;
+      this.loadedComputeUnit = null;
       this.lastLoadMs = null;
       this.turnsSinceLoad = 0;
     }
@@ -265,7 +329,14 @@ export class GenieXLlamaCppBackend implements ModelBackend {
    * request back.
    */
   private computeLabel(): string {
-    const asked = COMPUTE_LABELS[this.computeUnit];
+    // The LOADED session's unit. Reading the pending selector here is what let
+    // a turn produced by a pinned-HTP0 session be labelled "hybrid" because
+    // somebody had since tapped hybrid in Diagnostics — a label describing a
+    // session that did not exist yet. There is no session to label when nothing
+    // is loaded, and generate() cannot be reached in that state.
+    const unit = this.loadedComputeUnit;
+    if (!unit) return "no session";
+    const asked = COMPUTE_LABELS[unit];
     if (this.devices?.sawNoValidDevices) {
       return `${asked} — requested, but GenieX found no valid device`;
     }
@@ -290,7 +361,17 @@ export class GenieXLlamaCppBackend implements ModelBackend {
         // What the session was REQUESTED with. Named that way on purpose, as
         // on the QAIRT lane.
         requestedRuntime: this.runtime?.runtimeId ?? LLAMA_CPP_RUNTIME,
-        requestedComputeUnit: this.runtime?.computeUnit ?? this.computeUnit,
+        // The LOADED session's compute unit — the source of truth for what is
+        // actually running, and "n/a" rather than the pending value when there
+        // is no session, so an unloaded backend never looks like a loaded one.
+        requestedComputeUnit: this.loadedComputeUnit ?? "n/a",
+        // What a load right now would use. Shown beside the above precisely so
+        // a disagreement between them is visible instead of being resolved
+        // silently in favour of whichever field a screen happened to read.
+        pendingComputeUnit: this.computeUnit,
+        computeUnitStale:
+          this.loadedComputeUnit !== null &&
+          this.loadedComputeUnit !== this.computeUnit,
         manifestRuntime: this.runtime?.manifestRuntimeId ?? "n/a",
         runtimeVersion: this.runtime?.version ?? "n/a",
         soc: this.runtime?.soc ?? "unknown",

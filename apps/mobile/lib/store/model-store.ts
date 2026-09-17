@@ -105,7 +105,13 @@ import { checkGgufFile } from "../models/gguf-header";
 import { parseSha256File, readAdjacentChecksum } from "../models/integrity";
 import { sha256File, normalizeSha256 } from "../native/file-hash";
 import { getDeviceCaps, type DeviceCaps } from "../models/device-caps";
-import { loadModel, unloadModel, validateGguf, getModelInfo } from "../llm/llm-engine";
+import {
+  loadModel,
+  unloadModel,
+  validateGguf,
+  getModelInfo,
+  sessionMatches,
+} from "../llm/llm-engine";
 import { warmSessionCache } from "../orchestrator/session-warmer";
 import { getPerfSettings, perfToLlmOptions } from "../llm/perf-config";
 import { useChatStore } from "./chat-store";
@@ -1850,9 +1856,19 @@ export const useModelStore = create<ModelState>((set, get) => ({
     // an identical one costs the user 14 s to arrive where they already were,
     // and the ~6 ms warm reuse in the diagnostics is exactly what that would
     // throw away.
+    // "Already active AND the loaded session is the one a load would build now."
+    //
+    // The second half used to be `engine.loaded && engine.path === filePath` —
+    // model IDENTITY, which is not the same question. A GenieX llama.cpp model
+    // loaded as `npu` and then re-activated after the compute unit was switched
+    // to `hybrid` satisfied that test perfectly, so activation returned here,
+    // the native session was never rebuilt, and the run went on executing on
+    // pinned HTP0 while everything downstream called it hybrid. sessionMatches()
+    // asks the backend what configuration it WOULD load with and compares it to
+    // what the live session was built with, so a changed setting reloads and an
+    // unchanged one still costs nothing.
     const known = get().installed.find((m) => m.id === id);
-    const engine = getModelInfo();
-    if (known?.isActive && engine.loaded && engine.path === known.filePath) {
+    if (known?.isActive && sessionMatches(backendModelRef(known))) {
       return;
     }
 

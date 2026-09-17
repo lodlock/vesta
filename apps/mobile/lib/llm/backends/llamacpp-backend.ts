@@ -74,6 +74,7 @@ export class LlamaCppBackend implements ModelBackend {
       reusedSession: this.lastLoadMs === null,
       promptTokens: result.tokensEvaluated,
       generatedTokens: result.tokensPredicted,
+      generatedChars: result.text?.length ?? 0,
       decodeTokensPerSecond: result.timings.predictedPerSecond,
       // llama.rn reports prompt time, which is the prefill cost; TTFT as such
       // is not separately measured, so it is left unreported rather than

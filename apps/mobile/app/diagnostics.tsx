@@ -25,6 +25,10 @@ import {
   type SessionCacheInfo,
 } from "../lib/llm/session-cache";
 import { getLastRun, reportedOr, type RunRecord } from "../lib/llm/run-record";
+import {
+  accountGeneratedTokens,
+  describeGeneratedTokens,
+} from "../lib/llm/token-accounting";
 import { backendDiagnostics, genieXLlamaCpp } from "../lib/llm/backends/registry";
 import type { BackendDiagnostics } from "../lib/llm/backends/types";
 import { getStartupTrace, type StartupTrace } from "../lib/dev/startup-trace";
@@ -242,6 +246,7 @@ const SUMMARY_BACKEND_KEYS = [
   "runtimeVersion",
   "requestedRuntime",
   "requestedComputeUnit",
+  "pendingComputeUnit",
   "manifestRuntime",
   "lastError",
 ];
@@ -648,7 +653,18 @@ export default function DiagnosticsScreen() {
                 label="Prefill"
                 value={reportedOr(diag.run.prefillTokensPerSecond, "tok/s")}
               />
-              <Row label="Generated" value={reportedOr(diag.run.generatedTokens)} />
+              {/* The runtime's own count, shown as such — and shown with its
+                  contradiction attached when the text it produced proves the
+                  count cannot be right. See lib/llm/token-accounting. */}
+              <Row
+                label="Generated"
+                value={describeGeneratedTokens(
+                  accountGeneratedTokens(
+                    diag.run.generatedTokens,
+                    diag.run.generatedChars ?? 0,
+                  ),
+                )}
+              />
               <Row
                 label="Decode"
                 value={reportedOr(diag.run.decodeTokensPerSecond, "tok/s")}
@@ -940,10 +956,28 @@ export default function DiagnosticsScreen() {
                     label="Requested runtime"
                     value={String(backend.details.requestedRuntime)}
                   />
+                  {/* The LOADED session's compute unit, and separately the one
+                      the next load would use. One field used to serve both, so
+                      moving the selector silently rewrote the description of a
+                      running session. They are two facts and they can disagree;
+                      when they do, the next load is a real reload. */}
                   <Row
-                    label="Requested compute"
+                    label="Session compute"
                     value={String(backend.details.requestedComputeUnit)}
                   />
+                  <Row
+                    label="Next load compute"
+                    value={String(backend.details.pendingComputeUnit)}
+                  />
+                  {backend.details.computeUnitStale === true && (
+                    <Text style={styles.hint}>
+                      The loaded session was built with{" "}
+                      {String(backend.details.requestedComputeUnit)}. Activating
+                      this model again will rebuild it as{" "}
+                      {String(backend.details.pendingComputeUnit)} — the session
+                      is not reused when the compute unit changes.
+                    </Text>
+                  )}
                   <Row
                     label="Manifest runtime"
                     value={String(backend.details.manifestRuntime)}

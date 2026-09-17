@@ -33,7 +33,21 @@ export interface RunRecord {
   promptTokens?: number;
   ttftMs?: number;
   prefillTokensPerSecond?: number;
+  /**
+   * The runtime's own generated-token count, forwarded verbatim. Never derived
+   * from stream callbacks or chunk counts — see llm/token-accounting.
+   */
   generatedTokens?: number;
+  /**
+   * Characters of text the backend actually received this turn.
+   *
+   * Recorded alongside the count because it is the one thing that can FALSIFY
+   * it: text of n characters cannot come from fewer than n/32 tokens, so a
+   * runtime reporting `1` for a 42-character answer is provably wrong and the
+   * screen must not print that as a measurement. It is evidence, not a
+   * substitute count.
+   */
+  generatedChars?: number;
   decodeTokensPerSecond?: number;
   totalMs?: number;
   unloadMs?: number;

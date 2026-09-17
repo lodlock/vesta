@@ -88,6 +88,28 @@ export interface ModelBackend {
    */
   supports(model: BackendModelRef): boolean;
 
+  /**
+   * A stable description of the configuration this backend would load `model`
+   * with RIGHT NOW — everything that changes the session it creates but is not
+   * part of the model's identity.
+   *
+   * It exists because "the same model is already loaded" is not the same
+   * question as "the loaded session is the one a load would produce now", and
+   * treating them as one is how a setting silently fails to take effect. The
+   * GenieX llama.cpp lane made that concrete: its compute unit (`npu` pins
+   * HTP0, `hybrid` lets llama.cpp schedule across HTP and CPU) is chosen per
+   * load, so flipping it and re-activating the SAME model has to rebuild the
+   * native session — and did not, because every short-circuit on the way
+   * compared file paths.
+   *
+   * Optional, and absence means "nothing outside the model ref affects my
+   * session". A backend that does not implement it keeps the plain same-model
+   * no-op, which is what QAIRT (compute unit pinned in Kotlin) and llama.rn
+   * want. Never used to decide WHICH backend runs a model — only whether the
+   * session one already holds can be reused.
+   */
+  loadFingerprint?(model: BackendModelRef): string;
+
   load(model: BackendModelRef): Promise<void>;
   generate(
     messages: BackendMessage[],

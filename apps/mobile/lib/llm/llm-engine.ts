@@ -13,6 +13,7 @@ import type { LlmOptions, GenerateOptions, ModelInfo } from "./types";
 import { npuBackend } from "./backends/npu-instance";
 import { genieXLlamaCppBackend } from "./backends/geniex-llamacpp-instance";
 import { isNpuModel } from "../models/npu-compat";
+import type { BackendModelRef, ModelBackend } from "./backends/types";
 
 export interface CompletionMessage {
   role: "system" | "user" | "assistant";
@@ -138,6 +139,57 @@ export function estimatePromptTokens(messages: CompletionMessage[]): number {
   );
 }
 
+// The load configuration each GenieX session was actually built with, as its
+// backend described it at the time. Kept beside the model ref because model
+// identity alone does not determine a session — see ModelBackend.loadFingerprint.
+let npuFingerprint: string | null = null;
+let genieXLlamaFingerprint: string | null = null;
+
+/**
+ * The load configuration `backend` would use for `model`, or null when it has
+ * none that varies.
+ *
+ * Goes through the `ModelBackend` interface rather than the concrete class so
+ * `loadFingerprint` stays genuinely optional: a backend that declares none is
+ * saying "my sessions are determined by the model alone", and null on both
+ * sides of a comparison is the same-model no-op preserved.
+ */
+function fingerprintFor(
+  backend: ModelBackend,
+  model: BackendModelRef,
+): string | null {
+  return backend.loadFingerprint?.(model) ?? null;
+}
+
+/**
+ * Whether the session already loaded is the one a load of `model` would produce
+ * right now — same model AND same load configuration.
+ *
+ * The single definition of "nothing to do", shared by `loadModel()` and by the
+ * Models screen's activate(). They each had their own before, both comparing
+ * file paths and nothing else, and so both answered "already loaded" about a
+ * session built with a different compute unit. A setting that silently fails to
+ * apply is worse than one that is slow to: the user gets a number from the
+ * hardware they did not select, labelled as the hardware they did.
+ */
+export function sessionMatches(model: BackendModelRef): boolean {
+  if (npuModel) {
+    return (
+      npuModel.filePath === model.filePath &&
+      fingerprintFor(npuBackend, model) === npuFingerprint
+    );
+  }
+  if (genieXLlamaModel) {
+    return (
+      genieXLlamaModel.filePath === model.filePath &&
+      fingerprintFor(genieXLlamaCppBackend, model) === genieXLlamaFingerprint
+    );
+  }
+  // llama.rn holds no configuration this can vary: options that change the
+  // context are already folded into the path-keyed reload by its callers.
+  return context !== null && currentModelPath === model.filePath;
+}
+
 export function getModelInfo(): ModelInfo {
   return {
     loaded: context !== null || genieXSession() !== null,
@@ -204,12 +256,23 @@ export function loadModel(
     // name — a `.bin` could be anything, and guessing here is how a context
     // binary ends up being handed to llama.cpp.
     if (backendModel && isNpuModel(backendModel)) {
-      if (npuModel && npuModel.filePath === modelPath) return; // already loaded
+      const fingerprint = fingerprintFor(npuBackend, backendModel);
+      // Same model AND same load configuration. QAIRT declares no fingerprint
+      // (its compute unit is pinned in Kotlin), so both sides are null and this
+      // stays the plain same-model no-op it has always been.
+      if (
+        npuModel &&
+        npuModel.filePath === modelPath &&
+        fingerprint === npuFingerprint
+      ) {
+        return;
+      }
       await releaseAll();
       // No fallback: if the NPU cannot take it, the caller hears why. Quietly
       // loading it on the CPU instead would make every later "NPU" label a lie.
       await npuBackend.load(backendModel);
       npuModel = backendModel;
+      npuFingerprint = fingerprint;
       currentModelPath = modelPath;
       currentContextSize = backendModel.contextSize;
       // The Qualcomm path has no llama.cpp KV cache to describe, and saying
@@ -226,10 +289,23 @@ export function loadModel(
     // the fallback, and is reached by falling through rather than by any
     // catch: a failed GenieX load throws, it does not quietly land on the CPU.
     if (backendModel && genieXLlamaCppBackend.supports(backendModel)) {
-      if (genieXLlamaModel && genieXLlamaModel.filePath === modelPath) return;
+      const fingerprint = fingerprintFor(genieXLlamaCppBackend, backendModel);
+      // The reason this is not a path comparison: the compute unit is chosen
+      // per load, so the same file loaded as `npu` and as `hybrid` are two
+      // different sessions on two different arrangements of hardware. Returning
+      // early on the path alone left the old session in place and every later
+      // label describing the new selection.
+      if (
+        genieXLlamaModel &&
+        genieXLlamaModel.filePath === modelPath &&
+        fingerprint === genieXLlamaFingerprint
+      ) {
+        return;
+      }
       await releaseAll();
       await genieXLlamaCppBackend.load(backendModel);
       genieXLlamaModel = backendModel;
+      genieXLlamaFingerprint = fingerprint;
       currentModelPath = modelPath;
       currentContextSize = backendModel.contextSize;
       // GenieX exposes no KV state save/load from Kotlin at 0.4.0, so there is
@@ -325,6 +401,10 @@ async function releaseAll(): Promise<void> {
     await genieXLlamaCppBackend.unload().catch(() => {});
     genieXLlamaModel = null;
   }
+  // A released session has no configuration. Leaving these behind would let the
+  // next load match against a fingerprint whose session is gone.
+  npuFingerprint = null;
+  genieXLlamaFingerprint = null;
   currentModelPath = null;
 }
 

@@ -20,7 +20,12 @@
 
 import { useModelStore, activationInFlight } from "../model-store";
 import { getModelById, setActiveModel } from "../../models/model-registry";
-import { loadModel, unloadModel, getModelInfo } from "../../llm/llm-engine";
+import {
+  loadModel,
+  unloadModel,
+  getModelInfo,
+  sessionMatches,
+} from "../../llm/llm-engine";
 import { npuBundleInfo } from "../../native/npu";
 import type { InstalledModel } from "../../models/types";
 
@@ -80,6 +85,9 @@ jest.mock("../../llm/llm-engine", () => ({
   unloadModel: jest.fn(async () => {}),
   validateGguf: jest.fn(async () => ({ ok: true })),
   getModelInfo: jest.fn(() => ({ loaded: false })),
+  // "Is the loaded session the one a load would build now?" — model identity
+  // AND load configuration. Nothing resident by default.
+  sessionMatches: jest.fn(() => false),
 }));
 jest.mock("../../models/device-caps", () => ({
   getDeviceCaps: jest.fn(async () => ({ freeBytes: 500e9, totalRamMb: 16384 })),
@@ -100,6 +108,9 @@ const mockSetActive = setActiveModel as jest.MockedFunction<typeof setActiveMode
 const mockLoad = loadModel as jest.MockedFunction<typeof loadModel>;
 const mockUnload = unloadModel as jest.MockedFunction<typeof unloadModel>;
 const mockInfo = getModelInfo as jest.MockedFunction<typeof getModelInfo>;
+const mockSessionMatches = sessionMatches as jest.MockedFunction<
+  typeof sessionMatches
+>;
 const mockBundleInfo = npuBundleInfo as jest.MockedFunction<typeof npuBundleInfo>;
 
 // The real row: an AI Hub bundle, ready, not yet active. Its file_path points
@@ -168,6 +179,7 @@ beforeEach(() => {
   mockGetModel.mockResolvedValue(bundle());
   mockBundleInfo.mockResolvedValue({ modelName: "qualcomm/Qwen3-4B" } as never);
   mockInfo.mockReturnValue({ loaded: false });
+  mockSessionMatches.mockReturnValue(false);
   mockLoad.mockResolvedValue(undefined);
 });
 
@@ -283,10 +295,8 @@ describe("the model that is already resident", () => {
   // because a card was tapped would spend the first to arrive at the second.
   it("does nothing when the active model is loaded and tapped again", async () => {
     useModelStore.setState({ installed: [bundle({ isActive: true })] });
-    mockInfo.mockReturnValue({
-      loaded: true,
-      path: "/data/geniex/models/qwen3/model.serialized.bin",
-    });
+    // The engine holds a session for this model built with this configuration.
+    mockSessionMatches.mockReturnValue(true);
 
     await activate();
 
@@ -302,11 +312,28 @@ describe("the model that is already resident", () => {
     // process has no session yet.
     useModelStore.setState({ installed: [bundle({ isActive: true })] });
     mockGetModel.mockResolvedValue(bundle({ isActive: true }));
-    mockInfo.mockReturnValue({ loaded: false });
+    mockSessionMatches.mockReturnValue(false);
 
     await activate();
 
     expect(mockLoad).toHaveBeenCalledTimes(1);
+  });
+
+  it("reloads a resident model whose LOAD CONFIGURATION no longer matches", async () => {
+    // The GenieX compute-unit bug, at the layer that hid it. The row is active,
+    // the engine holds a session for exactly this file, and the only thing that
+    // changed is how the next load would build it — `npu` instead of `hybrid`.
+    // Keying the no-op on model identity let that change be swallowed, leaving a
+    // pinned-HTP0 session running under a hybrid label.
+    useModelStore.setState({ installed: [bundle({ isActive: true })] });
+    mockGetModel.mockResolvedValue(bundle({ isActive: true }));
+    mockSessionMatches.mockReturnValue(false);
+
+    await activate();
+
+    expect(mockLoad).toHaveBeenCalledTimes(1);
+    // The model was asked for by the same id; it is the session that is new.
+    expect(mockSetActive).toHaveBeenCalledWith("npu1");
   });
 });
 
