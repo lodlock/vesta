@@ -484,6 +484,57 @@ function withSystemActions(config) {
       });
     }
 
+    // Vesta's own FileProvider, for the diagnostics report.
+    //
+    // The full report leaves the device as a file through the share sheet
+    // rather than as a clipboard string — 3.38 MB through
+    // ClipboardManager.setPrimaryClip is a Binder transaction the kernel
+    // refuses, fatally. ACTION_SEND needs a content:// URI, and a content://
+    // URI needs a provider.
+    //
+    // A SEPARATE authority from expo-file-system's `.FileSystemFileProvider`,
+    // which declares <files-path> and <cache-path> both rooted at "." — the
+    // entire private storage, models and database included. Reusing it would
+    // mean sharing a diagnostics file through a provider that can address
+    // everything the app owns. This one can address one cache subdirectory
+    // (see native/android/src/main/res/xml/vesta_file_paths.xml).
+    //
+    // exported=false with grantUriPermissions=true is the required pairing:
+    // nothing may query the provider on its own, and a recipient named in an
+    // ACTION_SEND grant may read exactly the URI it was handed.
+    //
+    // REWRITTEN rather than skipped-if-present, for the same reason as
+    // VestaVoiceActivity above: android/ is generated but not always
+    // regenerated from scratch, and a skip-if-present check would preserve
+    // whatever shape an older prebuild left behind.
+    if (!mainApplication.provider) {
+      mainApplication.provider = [];
+    }
+    const fileProvider = {
+      $: {
+        "android:name": "androidx.core.content.FileProvider",
+        "android:authorities": "${applicationId}.fileprovider",
+        "android:exported": "false",
+        "android:grantUriPermissions": "true",
+      },
+      "meta-data": [
+        {
+          $: {
+            "android:name": "android.support.FILE_PROVIDER_PATHS",
+            "android:resource": "@xml/vesta_file_paths",
+          },
+        },
+      ],
+    };
+    const providerIndex = mainApplication.provider.findIndex(
+      (p) => p.$?.["android:authorities"] === "${applicationId}.fileprovider"
+    );
+    if (providerIndex >= 0) {
+      mainApplication.provider[providerIndex] = fileProvider;
+    } else {
+      mainApplication.provider.push(fileProvider);
+    }
+
     // Register VestaService (foreground service) in manifest
     if (!mainApplication.service) {
       mainApplication.service = [];

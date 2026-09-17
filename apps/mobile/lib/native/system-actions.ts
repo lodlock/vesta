@@ -185,3 +185,46 @@ export async function getDeviceInfo(): Promise<NativeDeviceInfo | null> {
 // lib/native/reminders.ts (offline, reliably alerting). The old native
 // calendar-insert path was removed because ACTION_INSERT did not honor the
 // reminder alarm.
+
+// ── Sharing a file ─────────────────────────────────────────────────────
+// How the full diagnostics report leaves the device. A content:// URI rather
+// than a clipboard string: `Clipboard.setString` is a Binder call with a ~1 MB
+// shared buffer, and a report that outgrew it took the process down. See
+// lib/diagnostics/deliver.ts for the caller and the file it writes.
+
+export interface ShareFileResult {
+  /**
+   * What happened. "shared" means the chooser opened — not that the user
+   * picked anything, which Android does not report back.
+   */
+  status: "shared" | "no-activity" | "no-handler";
+  /** The content:// URI handed to the chooser. Never a filesystem path. */
+  uri: string;
+  mimeType: string;
+  fileName: string;
+  /** Whether FLAG_GRANT_READ_URI_PERMISSION was set on the intent. */
+  readPermissionGranted: boolean;
+}
+
+/**
+ * Opens the Android share sheet for a file in the app's own cache.
+ *
+ * Throws on a real failure — a missing file, a path the provider will not
+ * serve, no foreground Activity — so a caller can report it rather than
+ * claiming a share that never happened. The native side refuses any path
+ * outside the app cache; this is not a general file-sharing bridge.
+ */
+export async function shareFile(
+  path: string,
+  mimeType: string,
+  title: string,
+): Promise<ShareFileResult> {
+  if (!isAvailable || typeof SystemActionsModule.shareFile !== "function") {
+    throw new Error("Sharing is not available in this build");
+  }
+  return (await SystemActionsModule.shareFile(
+    path,
+    mimeType,
+    title,
+  )) as ShareFileResult;
+}

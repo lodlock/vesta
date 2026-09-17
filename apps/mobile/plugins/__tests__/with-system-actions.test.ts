@@ -18,6 +18,7 @@ interface Attrs {
 interface Node {
   $: Attrs;
   "intent-filter"?: { action?: { $: Attrs }[]; category?: { $: Attrs }[] }[];
+  "meta-data"?: { $: Attrs }[];
 }
 interface Manifest {
   $?: Attrs;
@@ -25,6 +26,7 @@ interface Manifest {
     activity?: Node[];
     service?: Node[];
     receiver?: Node[];
+    provider?: Node[];
   }[];
 }
 
@@ -115,11 +117,84 @@ describe("assistant eligibility", () => {
     );
   });
 
-  it("adds no permissions — an ACTION_ASSIST assistant needs none", () => {
+  it("adds no permissions — an ACTION_ASSIST assistant needs none, and neither does sharing", () => {
     // BIND_VOICE_INTERACTION would be required for a VoiceInteractionService;
     // this route needs nothing, which is what keeps a scheduling-only build
     // scheduling-only.
     const manifest = runPlugin(emptyManifest());
     expect((manifest as { "uses-permission"?: unknown[] })["uses-permission"]).toBeUndefined();
+  });
+});
+
+// The diagnostics report leaves the device as a file through the share sheet,
+// which needs a content:// URI, which needs a provider. Without this element
+// the app builds, runs, and throws IllegalArgumentException the first time
+// anyone taps Share full report — another failure that only shows up on device.
+describe("the diagnostics FileProvider", () => {
+  const AUTHORITY = "${applicationId}.fileprovider";
+
+  function fileProvider(manifest: Manifest): Node | undefined {
+    return manifest.application[0].provider?.find(
+      (p) => p.$["android:authorities"] === AUTHORITY,
+    );
+  }
+
+  it("is declared, with its own authority", () => {
+    const provider = fileProvider(runPlugin(emptyManifest()));
+    expect(provider).toBeDefined();
+    expect(provider!.$["android:name"]).toBe("androidx.core.content.FileProvider");
+  });
+
+  // The required pairing. exported=true would let any app query the provider
+  // directly; grantUriPermissions=false would make the read grant on the
+  // ACTION_SEND intent a no-op and the recipient would get a
+  // SecurityException instead of the report.
+  it("is unexported and grants per-URI permission", () => {
+    const provider = fileProvider(runPlugin(emptyManifest()))!;
+    expect(provider.$["android:exported"]).toBe("false");
+    expect(provider.$["android:grantUriPermissions"]).toBe("true");
+  });
+
+  // Vesta's own paths file, NOT expo-file-system's — that one declares
+  // <files-path path="."> and <cache-path path=".">, i.e. the whole of private
+  // storage, models and database included. Ours names one cache subdirectory.
+  it("points at Vesta's own paths file", () => {
+    const provider = fileProvider(runPlugin(emptyManifest()))!;
+    const meta = provider["meta-data"]?.[0];
+    expect(meta?.$["android:name"]).toBe("android.support.FILE_PROVIDER_PATHS");
+    expect(meta?.$["android:resource"]).toBe("@xml/vesta_file_paths");
+  });
+
+  it("does not disturb expo-file-system's provider", () => {
+    const existing = emptyManifest();
+    existing.application[0].provider = [
+      {
+        $: {
+          "android:name": ".FileSystemFileProvider",
+          "android:authorities": "${applicationId}.FileSystemFileProvider",
+        },
+      },
+    ];
+    const manifest = runPlugin(existing);
+    expect(manifest.application[0].provider).toHaveLength(2);
+    expect(fileProvider(manifest)).toBeDefined();
+  });
+
+  it("REWRITES a stale entry rather than keeping it", () => {
+    const stale = emptyManifest();
+    stale.application[0].provider = [
+      {
+        $: {
+          "android:name": "androidx.core.content.FileProvider",
+          "android:authorities": AUTHORITY,
+          "android:exported": "true",
+          "android:grantUriPermissions": "false",
+        },
+      },
+    ];
+    const provider = fileProvider(runPlugin(stale))!;
+    expect(provider.$["android:exported"]).toBe("false");
+    expect(provider.$["android:grantUriPermissions"]).toBe("true");
+    expect(runPlugin(stale).application[0].provider).toHaveLength(1);
   });
 });

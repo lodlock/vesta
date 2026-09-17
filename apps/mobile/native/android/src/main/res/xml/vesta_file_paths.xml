@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What Vesta's FileProvider is allowed to hand out, and nothing more.
+
+  One entry: a `diagnostics` subdirectory of the app's cache. Deliberately not
+  the whole cache and emphatically not `files/` — the model bundles, the SQLite
+  database and the prefix session cache all live under this app's private
+  storage, and a provider rooted any higher would make every one of them
+  reachable through a content:// URI.
+
+  `name` is the segment that appears in the generated URI, so a shared report
+  reads as
+
+    content://com.cosmico.vesta.fileprovider/diagnostics/vesta-diagnostics-….txt
+
+  and the real path under /data/user/0/… is never exposed to the recipient.
+-->
+<paths>
+    <cache-path name="diagnostics" path="diagnostics/" />
+</paths>

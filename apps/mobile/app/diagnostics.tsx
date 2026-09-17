@@ -4,7 +4,7 @@
 // footprint (database + prefix session cache). Everything is read locally; the
 // screen sends nothing anywhere.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ScrollView,
   View,
@@ -12,7 +12,6 @@ import {
   TouchableOpacity,
   StyleSheet,
   Platform,
-  Clipboard,
 } from "react-native";
 import {
   getModelInfo,
@@ -59,10 +58,17 @@ import {
 } from "../lib/native/npu";
 import { formatPullTrace, lastPulledModelName } from "../lib/models/npu-pull-trace";
 import {
-  assembleReport,
-  clipboardSafe,
-  type ReportSection,
-} from "../lib/diagnostics/clipboard-safe";
+  buildReports,
+  type DiagnosticsReports,
+  type DiagnosticsSection,
+} from "../lib/diagnostics/report";
+import { copySummary, shareFullReport } from "../lib/diagnostics/deliver";
+import {
+  countPullability,
+  describePullabilityCounts,
+  pullabilityIndex,
+  type PullabilityCounts,
+} from "../lib/models/npu-pullability";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
@@ -98,6 +104,16 @@ interface HubDiag {
   cached: boolean;
   total: number;
   compatible: number;
+  /** Right model type, wrong silicon. Counted because it explains an empty list. */
+  otherChipsets: number;
+  /** Right silicon, a type this app has no runtime for. Same reason. */
+  unsupportedType: number;
+  /**
+   * How the compatible models divide into downloadable / manual-export /
+   * unknown. Null before any manifest has been read — which is "unknown",
+   * not "none".
+   */
+  pullability: PullabilityCounts | null;
   canonicalSoc: string | null;
   error: string | null;
   activeNpuModel: string | null;
@@ -142,11 +158,20 @@ function gatherHub(active: InstalledModel | null): HubDiag | null {
   const breakdown = snapshot
     ? breakDownHubModels(snapshot.models, store.npu.soc, store.npu.chipsets)
     : null;
+  const pullIndex = pullabilityIndex(store.npuPullability);
   return {
     checkedAt: snapshot?.checkedAt ?? null,
     cached: snapshot?.cached ?? false,
     total: snapshot?.models.length ?? 0,
     compatible: breakdown?.compatible.length ?? 0,
+    otherChipsets: breakdown?.otherChipsets ?? 0,
+    unsupportedType: breakdown?.unsupportedType ?? 0,
+    pullability: breakdown
+      ? countPullability(
+          breakdown.compatible.map((m) => m.entry.name),
+          pullIndex,
+        )
+      : null,
     canonicalSoc: store.npu.canonicalSoc,
     error: store.npuHub.error,
     activeNpuModel: active && isNpuModel(active) ? active.displayName : null,
@@ -164,14 +189,195 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
+/**
+ * Who this device is, what is loaded on it, and what last ran.
+ *
+ * First in both reports, because every other section is uninterpretable
+ * without it: a pull failure means something different on a chipset the
+ * runtime does not recognise than on one it does, and a cache report about a
+ * model that is not the active one is a different question entirely.
+ *
+ * `detail` decides how much of each backend's `details` map is printed. The
+ * summary prints the fields that identify the device and the ones carrying an
+ * error; the full report prints every key the backend reported, because the
+ * useful one is regularly the one nobody thought to select.
+ */
+function formatDeviceState(
+  diag: Diag | null,
+  at: Date,
+  detail: "summary" | "full",
+): string {
+  const lines = ["Vesta diagnostics — device, runtime and active model"];
+  lines.push(`captured: ${at.toISOString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone})`);
+  lines.push(`platform: ${Platform.OS} ${String(Platform.Version)}`);
+  if (!diag) {
+    lines.push("device state: unavailable — the screen had not finished gathering");
+    return lines.join("\n");
+  }
+
+  lines.push(`active model: ${diag.modelName ?? "<none>"}`);
+  lines.push(`model file: ${diag.modelPath?.split("/").pop() ?? "<none>"}`);
+  lines.push(`loaded: ${diag.modelLoaded ? "yes" : "no"}`);
+  lines.push(`context: ${diag.contextSize} tokens, KV ${diag.kvType}`);
+
+  const run = diag.run;
+  lines.push(
+    run
+      ? `last run: ${run.backendLabel} · ${run.computeLabel} · ${run.modelName || "<none>"} · ${run.artifactLabel}`
+      : "last run: none this session",
+  );
+  if (run?.soc) lines.push(`last run SoC: ${run.soc}`);
+  if (run?.runtimeVersion) lines.push(`last run runtime: ${run.runtimeVersion}`);
+
+  for (const backend of diag.backends) {
+    const state = backend.loaded ? "loaded" : backend.available ? "available" : "unavailable";
+    lines.push(`backend ${backend.id}: ${state}`);
+    if (backend.unavailableReason) lines.push(`  reason: ${backend.unavailableReason}`);
+    const keys =
+      detail === "full"
+        ? Object.keys(backend.details)
+        : SUMMARY_BACKEND_KEYS.filter((k) => k in backend.details);
+    for (const key of keys) {
+      const value = String(backend.details[key]);
+      // An empty lastError is the absence of an error, not a field worth a
+      // line — but a non-empty one is among the most important lines here.
+      if (value === "") continue;
+      lines.push(`  ${key}: ${value}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * The backend fields the summary carries.
+ *
+ * Identity and failure, nothing else: which silicon, which name the runtime
+ * knows it by, which one compatibility is decided on, which plugin version,
+ * and whatever went wrong last. The full report prints the whole map.
+ */
+const SUMMARY_BACKEND_KEYS = [
+  "soc",
+  "runtimeChipset",
+  "canonicalChipset",
+  "runtimeVersion",
+  "requestedRuntime",
+  "requestedComputeUnit",
+  "manifestRuntime",
+  "lastError",
+];
+
+/**
+ * Cache health in four lines rather than an inventory.
+ *
+ * The prefix session cache is the difference between a 13x cold start and a
+ * warm one, so whether it exists and whether it was validated this session are
+ * worth carrying. The FILES are not: a per-file listing is what made the old
+ * report unsendable, and it answers nothing this does not.
+ */
+function formatCacheHealth(diag: Diag | null): string {
+  if (!diag) return "";
+  const c = diag.cache;
+  return [
+    "Cache health",
+    `prefix session cache: ${c.exists ? "present" : "absent"}`,
+    `size: ${formatBytes(c.sizeBytes)}`,
+    `tokens: ${c.tokenCount ?? "<not recorded>"}`,
+    `saved: ${c.savedAt ? new Date(c.savedAt).toISOString() : "never"}`,
+    `primed this session: ${c.primed ? "yes" : "no"}`,
+    `database: ${formatBytes(diag.dbBytes)}`,
+  ].join("\n");
+}
+
+/**
+ * What the hub said, as counts.
+ *
+ * The models themselves live on the Models screen and in the listing section
+ * below; what belongs here is the arithmetic that explains an empty list —
+ * how many the hub returned, how many survive the chipset filter, how many
+ * survive the model-type filter, and how many of the survivors Qualcomm
+ * actually distributes a bundle for.
+ */
+function formatHubState(hub: HubDiag | null): string {
+  if (!hub) return "";
+  const lines = [
+    "Qualcomm Hub state",
+    `last check: ${hub.checkedAt === null ? "never" : new Date(hub.checkedAt).toISOString()}${hub.cached ? " (cached)" : ""}`,
+    `models returned: ${hub.total}`,
+    `compatible here: ${hub.compatible}`,
+    `excluded — other chipsets: ${hub.otherChipsets}`,
+    `excluded — unsupported model type: ${hub.unsupportedType}`,
+    `filtering on: ${hub.canonicalSoc ?? "unknown chipset"}`,
+    `pullability: ${hub.pullability ? describePullabilityCounts(hub.pullability) : "unknown (no manifest read yet)"}`,
+    `active NPU model: ${hub.activeNpuModel ?? "none"}`,
+  ];
+  if (hub.error) lines.push(`last hub error: ${hub.error}`);
+  return lines.join("\n");
+}
+
+/**
+ * The whole report, in the order a reader wants it.
+ *
+ * Identity first, then whatever the hub probe turned up (the open question on
+ * an NPU build, and nothing at all on any other), then the state that explains
+ * both. Everything before and after `probe` is available on EVERY build, which
+ * is why Copy summary and Share full report are not inside the Qualcomm card:
+ * a report of the model, the backends and the cache is worth having on a device
+ * that has no NPU to ask about.
+ */
+function reportSections(
+  diag: Diag | null,
+  at: Date,
+  probe: DiagnosticsSection[],
+): DiagnosticsSection[] {
+  return [
+    {
+      name: "device",
+      summary: formatDeviceState(diag, at, "summary"),
+      full: formatDeviceState(diag, at, "full"),
+      essential: true,
+    },
+    ...probe,
+    { name: "hub state", summary: formatHubState(diag?.hub ?? null), essential: true },
+    { name: "cache health", summary: formatCacheHealth(diag), essential: true },
+  ];
+}
+
 export default function DiagnosticsScreen() {
   const [probe, setProbe] = useState<HubIdentityProbe | null>(null);
   const [probing, setProbing] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
-  // The whole diagnostic as text: what gets copied and what gets logged.
-  // Kept beside the structured probe because the text is the artefact that
-  // leaves the device, and it must never be the abbreviated one.
-  const [report, setReport] = useState<string | null>(null);
+  const [sharedNote, setSharedNote] = useState<string | null>(null);
+  const [sharing, setSharing] = useState(false);
+  // What the hub probe turned up, if it has been run. Empty on every build
+  // without an NPU bridge, and until the button is pressed on one that has it.
+  const [probeSections, setProbeSections] = useState<DiagnosticsSection[]>([]);
+
+  // Gathered state. It lives ABOVE runProbe because the report leads with the
+  // device's identity, and a probe result with no device attached to it is
+  // most of a page about a machine the reader cannot name.
+  const [diag, setDiag] = useState<Diag | null>(null);
+
+  const refresh = useCallback(() => {
+    gather()
+      .then(setDiag)
+      .catch(() => setDiag(null));
+  }, []);
+
+  useEffect(refresh, [refresh]);
+
+  // Stamped when the state was gathered, not when the button was pressed: the
+  // report's "captured" line should name the moment the numbers are from.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const capturedAt = useMemo(() => new Date(), [diag]);
+
+  // Both artefacts, built together from one set of sections: the compact one
+  // for the clipboard and the complete one for the file. See lib/diagnostics/
+  // report.ts for why there are two and what separates them.
+  const reports: DiagnosticsReports | null = useMemo(
+    () => (diag ? buildReports(reportSections(diag, capturedAt, probeSections)) : null),
+    [diag, capturedAt, probeSections],
+  );
 
   // Explicitly triggered, never on render: this calls into the runtime, and a
   // diagnostics screen that fetched on its own would report a state the rest
@@ -266,104 +472,164 @@ export default function DiagnosticsScreen() {
       // TEMPORARY DIAGNOSTIC. rc=-100000 has no symbolic name in 0.4.0 and sits
       // at the base of the common-error block, so the number says nothing on
       // its own — the request that produced it and whether any byte moved are
-      // the evidence. First in the report because it is currently the open
-      // question. See npu-pull-trace.ts.
+      // the evidence. First after the device identity, because it is
+      // currently the open question. See npu-pull-trace.ts.
       const pullTrace = formatPullTrace();
 
-      // TWO reports, and the difference is not cosmetic.
+      // ONE list of sections, TWO artefacts, and the difference is not
+      // cosmetic.
       //
-      // What goes on screen and to the clipboard is a SUMMARY. What goes to
-      // logcat is everything. Copy used to hand the full thing to
-      // `Clipboard.setString`, which is a Binder call, and at 3.38 MB the
-      // kernel refused the transaction and took the process with it:
+      // Each section declares a compact form and, where it has bulk, a
+      // complete one. The compact forms become the clipboard summary; the
+      // complete ones become the file that goes out through the share sheet.
+      // Copy used to hand the whole thing to `Clipboard.setString`, which is a
+      // Binder call, and at 3.38 MB the kernel refused the transaction and took
+      // the process with it:
       //
       //   android.os.TransactionTooLargeException: data parcel size 3377296
       //
-      // `npuLogDiagnostic` has no such limit — it splits on newlines and writes
-      // one Log.i per line — so the full dump keeps its home under
-      // `adb logcat -s VestaNpu`, which is where a raw cache dump belonged all
-      // along. Ordered most-wanted first, because that is the order the
-      // clipboard-safe assembler drops things in.
-      const sections: ReportSection[] = [
-        { name: "pull trace", body: pullTrace, essential: true },
-        { name: "identity probe", body: formatProbe(result), essential: true },
-        { name: "chipset identity", body: chipsetIdentity, essential: true },
+      // Capping the clipboard payload stopped the crash but could cut the
+      // answer off, so the full report stopped travelling that way at all. See
+      // lib/diagnostics/deliver.ts.
+      //
+      // Ordered most-wanted first, because that is the order the clipboard-safe
+      // assembler drops things in. reportSections() puts the device identity
+      // ahead of all of these.
+      const gathered: DiagnosticsSection[] = [
+        { name: "pull trace", summary: pullTrace, essential: true },
+        { name: "identity probe", summary: formatProbe(result), essential: true },
+        { name: "chipset identity", summary: chipsetIdentity, essential: true },
         {
           name: "hub cache",
-          body: cache
+          summary: cache
             ? formatCacheReport(cache, repo, "summary")
+            : "Hub cache report\nunavailable (no NPU bridge in this build)",
+          full: cache
+            ? formatCacheReport(cache, repo, "full")
             : "Hub cache report\nunavailable (no NPU bridge in this build)",
           essential: true,
         },
-        { name: "hub listing", body: listAll ? formatListProbe(listAll, repo) : "" },
-        { name: "installed", body: installed ? formatInstalledReport(installed) : "" },
+        {
+          name: "hub listing",
+          summary: listAll ? formatListProbe(listAll, repo) : "",
+        },
+        {
+          name: "installed",
+          summary: installed ? formatInstalledReport(installed) : "",
+        },
         {
           name: "native log",
-          body: genieXLog ? formatGenieXLog(genieXLog, "summary") : "",
+          summary: genieXLog ? formatGenieXLog(genieXLog, "summary") : "",
+          full: genieXLog ? formatGenieXLog(genieXLog, "full") : "",
         },
       ];
+      setProbeSections(gathered);
 
-      const compact = assembleReport(sections);
-      setReport(compact.text);
-
-      const full = [
-        pullTrace,
-        formatProbe(result),
-        chipsetIdentity,
-        cache ? formatCacheReport(cache, repo, "full") : "",
-        listAll ? formatListProbe(listAll, repo) : "",
-        installed ? formatInstalledReport(installed) : "",
-        genieXLog ? formatGenieXLog(genieXLog, "full") : "",
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-      npuLogDiagnostic(full);
-      console.log(`[Diagnostics] ${full}`);
+      // Still logged in full. `npuLogDiagnostic` splits on newlines and writes
+      // one Log.i per line, so it has no Binder ceiling — and a report already
+      // in logcat survives an app that dies before anyone shares it.
+      const built = buildReports(reportSections(diag, new Date(), gathered));
+      npuLogDiagnostic(built.full);
+      console.log(`[Diagnostics] ${built.full}`);
     } finally {
       setProbing(false);
     }
-  }, []);
+  }, [diag]);
 
-  // Clipboard comes from react-native core. Still present in 0.83 (with a
-  // deprecation warning) and already linked — pulling in a new native
-  // dependency mid-investigation would cost a rebuild to copy a string.
-  // Reports failure honestly rather than claiming a copy that did not happen.
-  const copyProbe = useCallback(() => {
-    if (!report) return;
-    // The last thing between any string and Binder. `report` is already the
-    // compact form, so this should never trim — it is here so the Copy button
-    // is structurally incapable of crashing the app if some future section
-    // grows, rather than relying on nobody letting it.
-    const safe = clipboardSafe(report);
-    try {
-      Clipboard.setString(safe.text);
-      setCopied(
-        safe.truncated
-          ? `Copied ${Math.round(safe.bytes / 1024)} KB (trimmed)`
-          : `Copied ${Math.round(safe.bytes / 1024)} KB`,
-      );
-    } catch (err) {
-      // Says what went wrong rather than claiming a copy that did not happen.
-      setCopied(err instanceof Error ? `Copy failed: ${err.message}` : "Copy failed");
+  // ── The two ways the report leaves the device ───────────────────────
+  //
+  // Both delegate to lib/diagnostics/deliver.ts, which owns the rule that
+  // separates them: the clipboard carries the summary and nothing else, and
+  // the full report never goes near it. These handlers only turn an outcome
+  // into a button label.
+
+  const copySummaryAction = useCallback(() => {
+    if (!reports) return;
+    const outcome = copySummary(reports.summary);
+    const kb = Math.max(1, Math.round(outcome.bytes / 1024));
+    if (!outcome.copied) {
+      setCopied(outcome.error ? `Copy failed: ${outcome.error}` : "Copy failed");
+    } else if (outcome.truncated) {
+      // Should be unreachable: the summary carries no per-file inventory and
+      // so does not grow with the cache. If it ever shows, a section has
+      // started dumping and the fix is in the section, not in the cap.
+      setCopied(`Copied ${kb} KB (trimmed — report a bug)`);
+    } else {
+      setCopied(`Copied summary · ${kb} KB`);
     }
     setTimeout(() => setCopied(null), 4000);
-  }, [report]);
+  }, [reports]);
 
-  const [diag, setDiag] = useState<Diag | null>(null);
-
-  const refresh = useCallback(() => {
-    gather()
-      .then(setDiag)
-      .catch(() => setDiag(null));
-  }, []);
-
-  useEffect(refresh, [refresh]);
+  const shareFullAction = useCallback(async () => {
+    if (!reports) return;
+    setSharing(true);
+    try {
+      const outcome = await shareFullReport(reports.full);
+      const kb = Math.max(1, Math.round(outcome.bytes / 1024));
+      setSharedNote(
+        outcome.shared
+          ? `Shared ${outcome.fileName} · ${kb} KB`
+          : `Share failed: ${outcome.error ?? "unknown error"}`,
+      );
+    } finally {
+      setSharing(false);
+      setTimeout(() => setSharedNote(null), 6000);
+    }
+  }, [reports]);
 
   const fileName = diag?.modelPath?.split("/").pop() ?? "—";
   const last = diag?.last;
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      {/* Two actions, named for what they actually deliver, and first on the
+          screen because they are what a diagnostics screen is FOR.
+
+          The clipboard one says "summary" because it IS one — a button
+          labelled "Copy" beside a deliberately abbreviated payload is how
+          someone ends up pasting half a report into a bug tracker and
+          believing it is the whole thing.
+
+          Outside the Qualcomm card, deliberately: the report leads with the
+          model, the backends and the cache, and all of that is worth sending
+          from a device that has no NPU to ask about. Running the hub probe
+          adds its sections to the same report. */}
+      {reports && (
+        <>
+          <Text style={styles.sectionTitle}>Report</Text>
+          <View style={styles.card}>
+            <View style={styles.probeActions}>
+              <TouchableOpacity
+                style={styles.probeBtn}
+                onPress={copySummaryAction}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.probeBtnText}>{copied ?? "Copy summary"}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.probeBtn}
+                onPress={shareFullAction}
+                disabled={sharing}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.probeBtnText}>
+                  {sharing ? "Preparing…" : (sharedNote ?? "Share full report")}
+                </Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.hint}>
+              &ldquo;Copy summary&rdquo; puts{" "}
+              {Math.max(1, Math.round(reports.summaryBytes / 1024))} KB on the
+              clipboard — identity, state and errors, no file inventories.
+              &ldquo;Share full report&rdquo; sends all{" "}
+              {Math.max(1, Math.round(reports.fullBytes / 1024))} KB as a .txt
+              file through the share sheet; the clipboard cannot carry that much
+              and the attempt used to crash the app.
+            </Text>
+          </View>
+        </>
+      )}
+
       {diag && (
         <>
         {/* Which backend produced the last answer. Written by the backend that
@@ -482,10 +748,15 @@ export default function DiagnosticsScreen() {
                   <Text style={styles.probeVal} selectable>
                     {probe.hub}
                   </Text>
-                  {report && (
+                  {reports && (
                     <Text style={styles.probeSource}>
-                      {report.split("\n").length} lines captured, including the
-                      cached hub manifests. Use Copy for the whole thing.
+                      {reports.full.split("\n").length} lines captured,
+                      including the cached hub manifests.
+                      &ldquo;Copy summary&rdquo; puts{" "}
+                      {Math.max(1, Math.round(reports.summaryBytes / 1024))} KB on
+                      the clipboard; &ldquo;Share full report&rdquo; sends all{" "}
+                      {Math.max(1, Math.round(reports.fullBytes / 1024))} KB as a
+                      .txt file.
                     </Text>
                   )}
                   {probe.rows.map((r) => (
@@ -509,8 +780,9 @@ export default function DiagnosticsScreen() {
                 <Text style={styles.hint}>
                   Asks the runtime what it makes of each spelling of the model
                   name, and reads the hub manifests it cached under this app&rsquo;s
-                  own data directory. Copy the result — it is the full text,
-                  never the abbreviated one.
+                  own data directory. Afterwards, &ldquo;Copy summary&rdquo; puts a
+                  few KB on the clipboard and &ldquo;Share full report&rdquo; sends
+                  the complete text as a file — the clipboard cannot carry it.
                 </Text>
               )}
               <View style={styles.probeActions}>
@@ -524,15 +796,6 @@ export default function DiagnosticsScreen() {
                     {probing ? "Probing…" : probe ? "Run again" : "Run hub diagnostics"}
                   </Text>
                 </TouchableOpacity>
-                {report && (
-                  <TouchableOpacity
-                    style={styles.probeBtn}
-                    onPress={copyProbe}
-                    activeOpacity={0.7}
-                  >
-                    <Text style={styles.probeBtnText}>{copied ?? "Copy"}</Text>
-                  </TouchableOpacity>
-                )}
               </View>
             </View>
           </>

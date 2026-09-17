@@ -3,6 +3,7 @@ package com.cosmico.vesta
 import android.app.ActivityManager
 import android.app.role.RoleManager
 import android.content.ActivityNotFoundException
+import android.content.ClipData
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
@@ -11,6 +12,7 @@ import android.os.Build
 import android.provider.AlarmClock
 import android.provider.Settings
 import android.provider.CalendarContract
+import androidx.core.content.FileProvider
 import com.facebook.react.bridge.*
 import java.io.File
 import java.net.URLDecoder
@@ -477,6 +479,103 @@ class SystemActionsModule(reactContext: ReactApplicationContext) :
             promise.reject("CREATE_EVENT_ERROR", "Invalid date format: ${e.message}", e)
         } catch (e: Exception) {
             promise.reject("CREATE_EVENT_ERROR", e.message, e)
+        }
+    }
+
+    // ── Sharing a diagnostics file ───────────────────────────────────────
+    // The full diagnostics report leaves the device as a FILE, never as a
+    // clipboard string. `ClipboardManager.setPrimaryClip` is a Binder call and
+    // the report has already been 3.38 MB; the kernel refuses a parcel that
+    // size and the exception is fatal. A content:// URI is a handle, not a
+    // payload — the recipient streams the bytes through ContentResolver, so
+    // the size of the report stops being a transport concern.
+    //
+    // Scoped deliberately: this shares files out of the app's own cache
+    // directory and refuses anything else. It is not a general "share any
+    // path" bridge — one of those would let any future caller hand a share
+    // target the model files or the database.
+
+    /** The authority declared for us in AndroidManifest.xml by the config plugin. */
+    private fun fileProviderAuthority(): String =
+        "${reactApplicationContext.packageName}.fileprovider"
+
+    /**
+     * Hands `path` to the Android share sheet as a content:// URI.
+     *
+     * Resolves with what happened and what was sent, rather than with nothing:
+     * "the chooser opened" and "no app can receive this" are different answers
+     * and the screen says so. Rejects only on a real failure — a missing file,
+     * a path outside the cache, a provider that is not registered.
+     *
+     * No storage permission is involved at any point. FileProvider grants the
+     * recipient read access to this one URI for the life of the activity; the
+     * app itself only ever writes inside its own cache.
+     */
+    @ReactMethod
+    fun shareFile(path: String, mimeType: String, title: String, promise: Promise) {
+        try {
+            val file = File(toFilePath(path)).canonicalFile
+            if (!file.isFile) {
+                // The NAME, not the path: a private app filesystem path is not
+                // something to put in front of a user or into a bug report.
+                promise.reject("SHARE_FILE_ERROR", "No such file: ${file.name}")
+                return
+            }
+            val cacheRoot = reactApplicationContext.cacheDir.canonicalFile
+            if (!file.path.startsWith(cacheRoot.path + File.separator)) {
+                promise.reject(
+                    "SHARE_FILE_ERROR",
+                    "Refusing to share ${file.name}: it is not in the app cache",
+                )
+                return
+            }
+
+            val uri = FileProvider.getUriForFile(
+                reactApplicationContext,
+                fileProviderAuthority(),
+                file,
+            )
+
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_TITLE, title)
+                putExtra(Intent.EXTRA_SUBJECT, title)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                // The read grant is computed from getData() and getClipData(),
+                // NOT from EXTRA_STREAM. The platform does migrate the extra
+                // into ClipData on its way out (Instrumentation.execStartActivity
+                // calls migrateExtraStreamToClipData), so EXTRA_STREAM alone
+                // usually works — but "usually, via a migration step in the
+                // framework" is a poor thing to rest a permission on, and OEM
+                // share sheets have been the exception before. Setting it here
+                // makes the grant explicit and the migration a no-op.
+                clipData = ClipData.newUri(reactApplicationContext.contentResolver, title, uri)
+            }
+
+            // The chooser carries the flag too: it is the Intent actually being
+            // started, and it forwards the grant to whichever target is picked.
+            val chooser = Intent.createChooser(send, title).apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            val result = Arguments.createMap().apply {
+                putString("uri", uri.toString())
+                putString("mimeType", mimeType)
+                putString("fileName", file.name)
+                putBoolean("readPermissionGranted", true)
+            }
+            when (startFromForeground(chooser)) {
+                Launch.STARTED -> result.putString("status", "shared")
+                Launch.NO_ACTIVITY -> result.putString("status", "no-activity")
+                Launch.NO_HANDLER -> result.putString("status", "no-handler")
+            }
+            promise.resolve(result)
+        } catch (e: Exception) {
+            // Includes the IllegalArgumentException FileProvider throws when a
+            // file is outside every declared <cache-path>, which is a
+            // configuration bug worth seeing rather than swallowing.
+            promise.reject("SHARE_FILE_ERROR", e.message, e)
         }
     }
 }
