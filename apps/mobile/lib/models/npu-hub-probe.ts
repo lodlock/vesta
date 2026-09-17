@@ -161,14 +161,24 @@ export interface CacheReportLike {
   env?: Record<string, string | null>;
   dataDir?: string;
   dataDirExists?: boolean;
-  files?: {
-    path: string;
-    sizeBytes: number;
-    modifiedAt: number;
-    content?: string | null;
-    analysis?: ManifestAnalysis;
-  }[];
+  files?: CacheFileLike[];
   error?: string | null;
+}
+
+/**
+ * One file the native side walked in the geniex data directory.
+ *
+ * `analysis` is present when it parsed as a manifest candidate; `content` when
+ * it is small enough JSON to have been read whole. A file with neither — a
+ * weights shard, a `.lock` — is inventory, and after a pull the directory is
+ * mostly inventory. See `hasFinding`.
+ */
+export interface CacheFileLike {
+  path: string;
+  sizeBytes: number;
+  modifiedAt: number;
+  content?: string | null;
+  analysis?: ManifestAnalysis;
 }
 
 /** What the native side found in one cached manifest. */
@@ -228,20 +238,88 @@ export function mentionsModel(content: string, repo: string): string[] {
 /**
  * How much of the cache to render.
  *
- * "summary" is what goes on screen and to the clipboard: every FACT about each
- * file — path, size, mtime, whether it parsed, its top-level keys, its version,
- * its model count, and the three exact-match answers — and none of the bulk.
- * "full" adds the raw manifest entries and the whole content of small JSON
- * files, and belongs only in logcat.
+ * "full" is the complete inventory: every file the native side walked, its raw
+ * manifest entries and the whole content of small JSON files. It goes to the
+ * shared .txt and to logcat, where size is not a constraint.
  *
- * The distinction exists because the bulk form crashed the app. Matched entries
- * are capped at 12 per file and 4000 characters each — 48 KB per JSON file —
- * and the geniex data directory holds dozens of them. That is how a diagnostics
- * report reached 3.38 MB and killed the clipboard's Binder transaction. The
- * counts below say everything those entries said about whether a model is
- * present; only the verbatim JSON is lost, and that is what "full" is for.
+ * "summary" is what goes to the clipboard, and it is an AGGREGATE rather than a
+ * shortened inventory. This distinction has now been got wrong twice, in two
+ * different ways, and both times on the same rock:
+ *
+ *   1. The first version put the raw JSON bodies in. The report reached 3.38 MB
+ *      and `Clipboard.setString` — a Binder call — took the process down with
+ *      TransactionTooLargeException.
+ *   2. The second version dropped the bodies but KEPT a per-file block for
+ *      every file. That reads fine before a hub probe, when the data directory
+ *      is empty. After one, the directory holds the manifests plus every shard
+ *      and tokenizer of a downloaded bundle, and each block carried a
+ *      `topLevelKeys` line — which on a vocabulary file is every token in the
+ *      vocabulary. The summary ballooned past the 64 KiB guard and came back
+ *      cut, which is the guard doing its job over a report that should never
+ *      have been that size.
+ *
+ * So the rule is no longer "the same shape, smaller". A summary states the
+ * FINDINGS and counts everything else:
+ *
+ *   - files that answer the question this report exists for — a manifest with
+ *     models in it, an exact match, a parse failure, a body that mentions the
+ *     model — get a block, at most SUMMARY_FILE_BLOCKS of them
+ *   - every other file is counted, never listed. A bundle's shards and
+ *     tokenizers are not evidence about whether the hub publishes a model
+ *   - inside a block, anything unbounded is counted and sampled:
+ *     `topLevelKeys` and `matchSummaries` both grow with data we do not control
+ *
+ * The result is a size that is a function of the FIELDS rather than of what the
+ * device has downloaded, which is the property that makes "Copy summary never
+ * truncates" true by construction instead of by luck.
  */
 export type CacheDetail = "summary" | "full";
+
+/** Blocks a summary will print before it starts counting instead. */
+const SUMMARY_FILE_BLOCKS = 6;
+/** Top-level keys sampled per file. A vocabulary file has hundreds of thousands. */
+const SUMMARY_KEYS_SHOWN = 8;
+/** Matching manifest entries summarised per file. */
+const SUMMARY_MATCHES_SHOWN = 6;
+
+/**
+ * Whether a file answers the question the cache report exists for.
+ *
+ * Deliberately generous about what counts — a parse failure and an empty models
+ * key are both findings — and deliberately silent about everything else. A
+ * `weights_1.bin` has no analysis and no content; it is inventory, and
+ * inventory belongs in the full report.
+ */
+function hasFinding(file: CacheFileLike, repo: string): boolean {
+  const a = file.analysis;
+  if (a) {
+    return (
+      Boolean(a.parseError) ||
+      Boolean(a.exactDisplayName) ||
+      Boolean(a.exactId) ||
+      (a.matches?.length ?? 0) > 0 ||
+      (a.matchSummaries?.length ?? 0) > 0 ||
+      Boolean(a.modelsKey) ||
+      (a.modelCount ?? 0) > 0 ||
+      Object.keys(a.versionFields ?? {}).length > 0
+    );
+  }
+  if (file.content) return mentionsModel(file.content, repo).length > 0;
+  return false;
+}
+
+/**
+ * The files a summary prints a block for.
+ *
+ * Findings first. When nothing has a finding, the examined files themselves are
+ * the answer — "the manifest is here and mentions nothing" is a result, and a
+ * report that printed only a count would be hiding it.
+ */
+function summaryBlocks(files: CacheFileLike[], repo: string): CacheFileLike[] {
+  const found = files.filter((f) => hasFinding(f, repo));
+  const examined = files.filter((f) => f.analysis || f.content);
+  return (found.length > 0 ? found : examined).slice(0, SUMMARY_FILE_BLOCKS);
+}
 
 export function formatCacheReport(
   report: CacheReportLike,
@@ -262,14 +340,30 @@ export function formatCacheReport(
     lines.push(`${key}: ${env[key] ?? "<unset>"}`);
   }
 
+  const all = report.files ?? [];
+  const totalBytes = all.reduce((sum, f) => sum + (f.sizeBytes || 0), 0);
   lines.push(
     "",
     `dataDir: ${report.dataDir ?? "<none>"}`,
     `dataDirExists: ${report.dataDirExists ?? false}`,
-    `files: ${report.files?.length ?? 0}`,
+    `files: ${all.length}`,
   );
 
-  for (const file of report.files ?? []) {
+  // A summary never walks the directory. After a pull it is mostly bundle —
+  // shards, tokenizers, a lock — and listing that is how this report grew past
+  // the clipboard guard. The aggregate says the same thing in two lines.
+  const printed = detail === "full" ? all : summaryBlocks(all, repo);
+  if (detail === "summary") {
+    lines.push(
+      `total bytes: ${totalBytes}`,
+      `listed below: ${printed.length} of ${all.length}` +
+        (all.length > printed.length
+          ? " (the rest are bundle files and carry no manifest finding — see the full report)"
+          : ""),
+    );
+  }
+
+  for (const file of printed) {
     lines.push(
       "",
       `path: ${file.path}`,
@@ -280,7 +374,7 @@ export function formatCacheReport(
     if (a) {
       if (a.parseError) lines.push(`parseError: ${a.parseError}`);
       lines.push(
-        `topLevelKeys: ${(a.topLevelKeys ?? []).join(", ") || "<none>"}`,
+        `topLevelKeys: ${describeKeys(a.topLevelKeys ?? [], detail)}`,
         `modelsKey: ${a.modelsKey ?? "<none>"}`,
         `modelCount: ${a.modelCount ?? 0}`,
       );
@@ -293,9 +387,16 @@ export function formatCacheReport(
         `exact id match: ${a.exactId ? "YES" : "NO"}`,
         `entries matching needle: ${a.matches?.length ?? 0}`,
       );
-      // Kept in BOTH forms: a few hundred bytes, and the line that says
+      // Kept in BOTH forms: a few hundred bytes each, and the line that says
       // whether an entry carries a geniex_qairt asset for this chipset at all.
-      for (const summary of a.matchSummaries ?? []) lines.push(`  ${summary}`);
+      // Sampled in a summary, because the count is not ours to bound.
+      const summaries = a.matchSummaries ?? [];
+      const shown =
+        detail === "full" ? summaries : summaries.slice(0, SUMMARY_MATCHES_SHOWN);
+      for (const summary of shown) lines.push(`  ${summary}`);
+      if (shown.length < summaries.length) {
+        lines.push(`  (${summaries.length - shown.length} more — see the full report)`);
+      }
       if (detail === "full") {
         for (const match of a.matches ?? []) lines.push(match);
       } else if ((a.matches?.length ?? 0) > 0) {
@@ -314,6 +415,25 @@ export function formatCacheReport(
     }
   }
   return lines.join("\n");
+}
+
+/**
+ * Top-level keys, counted in a summary and listed in full.
+ *
+ * This one line is what made the post-probe summary unsendable. A manifest has
+ * a handful of top-level keys; a `vocab.json` beside the weights has one per
+ * token, and the geniex directory holds several of them. The count is the fact
+ * — "did this parse and what shape is it" — and a sample is enough to
+ * recognise the shape.
+ */
+function describeKeys(keys: string[], detail: CacheDetail): string {
+  if (keys.length === 0) return "<none>";
+  if (detail === "full") return keys.join(", ");
+  if (keys.length <= SUMMARY_KEYS_SHOWN) return keys.join(", ");
+  return (
+    `${keys.length} keys: ${keys.slice(0, SUMMARY_KEYS_SHOWN).join(", ")}, ` +
+    `… (${keys.length - SUMMARY_KEYS_SHOWN} more — see the full report)`
+  );
 }
 
 /** Minimal shape of a hub-list probe, so this module stays testable. */
@@ -419,8 +539,17 @@ export interface GenieXLogLike {
  * level gate, so seeing one proves on-device that the gate is fully open, and
  * that there is no verbosity setting left to look for.
  */
-/** Newest lines kept in a summary. The rest is in logcat by definition. */
-const SUMMARY_LOG_LINES = 60;
+/**
+ * Newest lines kept in a summary. The rest is in logcat by definition.
+ *
+ * Was 60. A threadtime line runs 100-200 characters, so 60 of them is 6-12 KB —
+ * most of a clipboard summary's whole budget, spent on the tail of a log that
+ * is in the shared report AND in logcat AND is rarely what the summary is being
+ * pasted for. 20 still carries the failure and its immediate approach.
+ */
+const SUMMARY_LOG_LINES = 20;
+/** A single line long enough to matter is a dump in disguise. */
+const SUMMARY_LOG_LINE_CHARS = 240;
 
 export function formatGenieXLog(
   report: GenieXLogLike,
@@ -454,8 +583,10 @@ export function formatGenieXLog(
   lines.push("");
   if ((report.lines ?? []).length === 0) {
     lines.push("<no GenieX lines in the buffer>");
-  } else if (detail === "full" || (report.lines ?? []).length <= SUMMARY_LOG_LINES) {
+  } else if (detail === "full") {
     for (const line of report.lines ?? []) lines.push(line);
+  } else if ((report.lines ?? []).length <= SUMMARY_LOG_LINES) {
+    for (const line of report.lines ?? []) lines.push(clip(line));
   } else {
     // The lines that matter for a failure are the last ones, and 400
     // threadtime lines is more than the whole of the rest of a compact
@@ -469,9 +600,16 @@ export function formatGenieXLog(
       } older omitted — see logcat, VestaNpu tag)`,
       "",
     );
-    for (const line of tail) lines.push(line);
+    for (const line of tail) lines.push(clip(line));
   }
   return lines.join("\n");
+}
+
+/** One log line, bounded. A stack trace on one line is still one line. */
+function clip(line: string): string {
+  return line.length <= SUMMARY_LOG_LINE_CHARS
+    ? line
+    : `${line.slice(0, SUMMARY_LOG_LINE_CHARS)}… (+${line.length - SUMMARY_LOG_LINE_CHARS} chars)`;
 }
 
 // ── What the runtime considers installed ──────────────────────────────────
@@ -514,8 +652,17 @@ export interface InstalledReportLike {
  * `checkBundle()` reads as "the download did not finish" — a bundle listed as
  * installed, with paths that resolve, and a zero-byte `.lock` beside the
  * weights is a Vesta false negative rather than a broken download.
+ *
+ * `detail` defaults to "full", which is what this has always produced and what
+ * the shared report wants. "summary" drops the one unbounded thing in here —
+ * the per-file listing of the bundle, which for a 2.4 GB model is every shard
+ * and every tokenizer file. The counts above it (`files: N, B bytes`) and the
+ * zero-length set say what that listing was there to say.
  */
-export function formatInstalledReport(report: InstalledReportLike): string {
+export function formatInstalledReport(
+  report: InstalledReportLike,
+  detail: CacheDetail = "full",
+): string {
   const lines = ["GenieX installed models"];
   if (report.error) lines.push(`error: ${report.error}`);
   lines.push(`list(): ${report.installedCount ?? 0} model(s)`);
@@ -545,7 +692,11 @@ export function formatInstalledReport(report: InstalledReportLike): string {
     lines.push(
       `zero-length files: ${zero.length === 0 ? "none" : zero.join(", ")}`,
     );
-    for (const f of p.files ?? []) lines.push(`  ${f.sizeBytes}\t${f.path}`);
+    if (detail === "full") {
+      for (const f of p.files ?? []) lines.push(`  ${f.sizeBytes}\t${f.path}`);
+    } else if ((p.files ?? []).length > 0) {
+      lines.push(`(${(p.files ?? []).length} files not listed — see the full report)`);
+    }
   }
   return lines.join("\n");
 }

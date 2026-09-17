@@ -736,3 +736,107 @@ describe("the chipset identity block", () => {
     expect(text).toContain("hub chipset keys for this device: <no hub answer yet>");
   });
 });
+
+// The compact forms, pinned where the formatters live — because that is where
+// the next edit to them will land. The end-to-end version of this is
+// lib/diagnostics/__tests__/post-probe-summary.test.ts.
+describe("staying compact on a populated device", () => {
+  const REPO = "Qwen3-4B-Instruct-2507";
+
+  it("counts the data directory rather than walking it", () => {
+    const files = [
+      {
+        path: "aihub/manifest.json",
+        sizeBytes: 311_319,
+        modifiedAt: 0,
+        analysis: { modelsKey: "models", modelCount: 19 },
+      },
+      ...Array.from({ length: 40 }, (_, i) => ({
+        path: `models/qualcomm/${REPO}/weights_${i}.bin`,
+        sizeBytes: 54_090_909,
+        modifiedAt: 0,
+      })),
+    ];
+    const summary = formatCacheReport({ files }, REPO, "summary");
+
+    expect(summary).toContain("files: 41");
+    expect(summary).toContain("listed below: 1 of 41");
+    expect(summary).toContain("aihub/manifest.json");
+    // A weights shard is inventory. It says nothing about whether the hub
+    // publishes this model, and after a pull there are dozens of it.
+    expect(summary).not.toContain("weights_0.bin");
+
+    // The full form still walks everything.
+    const full = formatCacheReport({ files }, REPO, "full");
+    expect(full).toContain("weights_39.bin");
+  });
+
+  // The single line that made the post-probe summary unsendable.
+  it("counts top-level keys instead of printing a vocabulary", () => {
+    const topLevelKeys = Array.from({ length: 50_000 }, (_, i) => `tok_${i}`);
+    const report = {
+      files: [
+        { path: "vocab.json", sizeBytes: 2_776_833, modifiedAt: 0, analysis: { topLevelKeys } },
+      ],
+    };
+    const summary = formatCacheReport(report, REPO, "summary");
+    expect(summary).toContain("topLevelKeys: 50000 keys: tok_0,");
+    expect(summary).toContain("49992 more");
+    expect(summary).not.toContain("tok_49999");
+    expect(summary.length).toBeLessThan(2000);
+
+    expect(formatCacheReport(report, REPO, "full")).toContain("tok_49999");
+  });
+
+  it("keeps a short key list whole — the count is for runaways only", () => {
+    const summary = formatCacheReport(
+      {
+        files: [
+          {
+            path: "aihub/manifest.json",
+            sizeBytes: 10,
+            modifiedAt: 0,
+            analysis: { topLevelKeys: ["models", "version"], modelCount: 1 },
+          },
+        ],
+      },
+      REPO,
+      "summary",
+    );
+    expect(summary).toContain("topLevelKeys: models, version");
+  });
+
+  it("drops the bundle's file listing from an installed summary, and says so", () => {
+    const report: InstalledReportLike = {
+      installed: ["qualcomm/Qwen3-4B-Instruct-2507"],
+      installedCount: 1,
+      probes: [
+        {
+          asked: "qualcomm/Qwen3-4B-Instruct-2507",
+          inList: true,
+          getPaths: true,
+          resolvedName: "qualcomm/Qwen3-4B-Instruct-2507",
+          dirExists: true,
+          fileCount: 48,
+          totalBytes: 2_380_000_000,
+          zeroLengthFiles: [".lock"],
+          files: Array.from({ length: 48 }, (_, i) => ({
+            path: `weights_${i}.bin`,
+            sizeBytes: 54_090_909,
+          })),
+        },
+      ],
+    };
+    const summary = formatInstalledReport(report, "summary");
+
+    // The counts the listing was there to support survive.
+    expect(summary).toContain("files: 48, 2380000000 bytes");
+    expect(summary).toContain("zero-length files: .lock");
+    expect(summary).toContain("48 files not listed");
+    expect(summary).not.toContain("weights_0.bin");
+
+    // And the default is still the complete form, which is what the shared
+    // report and logcat want.
+    expect(formatInstalledReport(report)).toContain("weights_47.bin");
+  });
+});

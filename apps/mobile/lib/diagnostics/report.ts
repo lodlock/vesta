@@ -44,6 +44,24 @@ export interface DiagnosticsSection {
   essential?: boolean;
 }
 
+/**
+ * What one section's compact form may weigh.
+ *
+ * A backstop, not a budget to spend. Every section here should come in well
+ * under it — the realistic whole summary is a few KB — and the number exists
+ * because the first version of this had no such floor and a single section
+ * (the cache report's per-file inventory) grew until the whole-report guard
+ * cut the summary in half. The failure mode that produced was the worst
+ * available: the report came back mutilated and said nothing about which
+ * section did it.
+ *
+ * Now an overgrown section is trimmed alone, by name, and everything after it
+ * survives intact. Ten sections at this size is 60 KiB, which is still inside
+ * CLIPBOARD_MAX_BYTES — so this does not replace the whole-report guard, it
+ * makes reaching it require every section to misbehave at once instead of one.
+ */
+export const SECTION_SUMMARY_MAX_BYTES = 6 * 1024;
+
 export interface DiagnosticsReports {
   /** Clipboard-safe. Within `limitBytes` whatever the sections contained. */
   summary: string;
@@ -55,6 +73,13 @@ export interface DiagnosticsReports {
   /** Complete. Never trimmed, never capped, never abbreviated. */
   full: string;
   fullBytes: number;
+  /**
+   * Sections whose compact form exceeded SECTION_SUMMARY_MAX_BYTES on its own.
+   *
+   * Always empty in normal operation. A name here is a bug report about that
+   * section's summary form, not a device that had a lot to say.
+   */
+  oversized: string[];
 }
 
 const FULL_HEADER =
@@ -72,9 +97,10 @@ export function buildReports(
   sections: DiagnosticsSection[],
   limitBytes: number = CLIPBOARD_MAX_BYTES,
 ): DiagnosticsReports {
+  const oversized: string[] = [];
   const compactSections: ReportSection[] = sections.map((s) => ({
     name: s.name,
-    body: s.summary,
+    body: boundSection(s.name, s.summary, oversized),
     essential: s.essential,
   }));
   const compact = assembleReport(compactSections, limitBytes);
@@ -91,7 +117,44 @@ export function buildReports(
     omitted: compact.omitted,
     full,
     fullBytes: utf8ByteLength(full),
+    oversized,
   };
+}
+
+/**
+ * Caps one section's compact form, and says which section it was.
+ *
+ * Cut on a line boundary so the tail is never half a field, and marked with the
+ * section's own name — the point of this is that the next person reading a
+ * trimmed summary knows immediately where to look, which the whole-report cut
+ * never told them.
+ *
+ * Does nothing at all in normal operation; a summary section runs a few hundred
+ * bytes to a couple of KB.
+ */
+function boundSection(name: string, body: string, oversized: string[]): string {
+  if (utf8ByteLength(body) <= SECTION_SUMMARY_MAX_BYTES) return body;
+  oversized.push(name);
+
+  const notice =
+    `\n--- SECTION TRIMMED: the compact form of "${name}" was ` +
+    `${Math.round(utf8ByteLength(body) / 1024)} KB, over the ` +
+    `${SECTION_SUMMARY_MAX_BYTES / 1024} KB a summary section may weigh. That is a ` +
+    "bug in that section, not a size this report should reach — it is the full " +
+    "form leaking into the compact one. The complete section is in the shared " +
+    "full report. ---";
+
+  const room = SECTION_SUMMARY_MAX_BYTES - utf8ByteLength(notice);
+  // One slice to get inside the budget — a character is never fewer than one
+  // byte, so `room` characters is never more than `room` bytes — then back to a
+  // line boundary so the tail is not half a field. Walking off the end a line
+  // at a time is the obvious version and is quadratic on the input that
+  // actually reaches here, which is by definition a large one.
+  let out = body.slice(0, Math.max(0, room));
+  while (utf8ByteLength(out) > room) out = out.slice(0, Math.floor(out.length / 2));
+  const lastLine = out.lastIndexOf("\n");
+  if (lastLine > 0) out = out.slice(0, lastLine);
+  return out + notice;
 }
 
 /** The prefix every diagnostics file carries, and what cleanup recognises. */

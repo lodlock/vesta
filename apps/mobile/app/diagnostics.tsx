@@ -41,11 +41,7 @@ import { breakDownHubModels } from "../lib/models/npu-hub";
 import {
   probeHubIdentity,
   formatProbe,
-  formatCacheReport,
-  formatListProbe,
   formatChipsetIdentity,
-  formatGenieXLog,
-  formatInstalledReport,
   type HubIdentityProbe,
 } from "../lib/models/npu-hub-probe";
 import {
@@ -63,12 +59,15 @@ import {
   type DiagnosticsSection,
 } from "../lib/diagnostics/report";
 import { copySummary, shareFullReport } from "../lib/diagnostics/deliver";
+// The summary/full pairing for every probe section lives out of this file, so a
+// test can feed it a populated device and measure what the compact form weighs.
+// That is the bug this module was extracted for — see its header.
 import {
-  countPullability,
-  describePullabilityCounts,
-  pullabilityIndex,
-  type PullabilityCounts,
-} from "../lib/models/npu-pullability";
+  probeSections,
+  formatHubState,
+  type HubDiag,
+} from "../lib/diagnostics/sections";
+import { countPullability, pullabilityIndex } from "../lib/models/npu-pullability";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
 import { formatBytes } from "../lib/models/format";
@@ -90,33 +89,6 @@ interface Diag {
   assistTurns: number;
   /** Hub state, or null on a build with no NPU bridge in it. */
   hub: HubDiag | null;
-}
-
-/**
- * What is worth knowing about the hub without reprinting it.
- *
- * Counts and a timestamp, not a model list: the list belongs on the Models
- * screen, and these values are what EXPLAIN it — in particular why a catalogue
- * of many models can show as none here.
- */
-interface HubDiag {
-  checkedAt: number | null;
-  cached: boolean;
-  total: number;
-  compatible: number;
-  /** Right model type, wrong silicon. Counted because it explains an empty list. */
-  otherChipsets: number;
-  /** Right silicon, a type this app has no runtime for. Same reason. */
-  unsupportedType: number;
-  /**
-   * How the compatible models divide into downloadable / manual-export /
-   * unknown. Null before any manifest has been read — which is "unknown",
-   * not "none".
-   */
-  pullability: PullabilityCounts | null;
-  canonicalSoc: string | null;
-  error: string | null;
-  activeNpuModel: string | null;
 }
 
 async function gather(): Promise<Diag> {
@@ -290,32 +262,6 @@ function formatCacheHealth(diag: Diag | null): string {
 }
 
 /**
- * What the hub said, as counts.
- *
- * The models themselves live on the Models screen and in the listing section
- * below; what belongs here is the arithmetic that explains an empty list —
- * how many the hub returned, how many survive the chipset filter, how many
- * survive the model-type filter, and how many of the survivors Qualcomm
- * actually distributes a bundle for.
- */
-function formatHubState(hub: HubDiag | null): string {
-  if (!hub) return "";
-  const lines = [
-    "Qualcomm Hub state",
-    `last check: ${hub.checkedAt === null ? "never" : new Date(hub.checkedAt).toISOString()}${hub.cached ? " (cached)" : ""}`,
-    `models returned: ${hub.total}`,
-    `compatible here: ${hub.compatible}`,
-    `excluded — other chipsets: ${hub.otherChipsets}`,
-    `excluded — unsupported model type: ${hub.unsupportedType}`,
-    `filtering on: ${hub.canonicalSoc ?? "unknown chipset"}`,
-    `pullability: ${hub.pullability ? describePullabilityCounts(hub.pullability) : "unknown (no manifest read yet)"}`,
-    `active NPU model: ${hub.activeNpuModel ?? "none"}`,
-  ];
-  if (hub.error) lines.push(`last hub error: ${hub.error}`);
-  return lines.join("\n");
-}
-
-/**
  * The whole report, in the order a reader wants it.
  *
  * Identity first, then whatever the hub probe turned up (the open question on
@@ -351,7 +297,7 @@ export default function DiagnosticsScreen() {
   const [sharing, setSharing] = useState(false);
   // What the hub probe turned up, if it has been run. Empty on every build
   // without an NPU bridge, and until the button is pressed on one that has it.
-  const [probeSections, setProbeSections] = useState<DiagnosticsSection[]>([]);
+  const [probeParts, setProbeParts] = useState<DiagnosticsSection[]>([]);
 
   // Gathered state. It lives ABOVE runProbe because the report leads with the
   // device's identity, and a probe result with no device attached to it is
@@ -375,8 +321,8 @@ export default function DiagnosticsScreen() {
   // for the clipboard and the complete one for the file. See lib/diagnostics/
   // report.ts for why there are two and what separates them.
   const reports: DiagnosticsReports | null = useMemo(
-    () => (diag ? buildReports(reportSections(diag, capturedAt, probeSections)) : null),
-    [diag, capturedAt, probeSections],
+    () => (diag ? buildReports(reportSections(diag, capturedAt, probeParts)) : null),
+    [diag, capturedAt, probeParts],
   );
 
   // Explicitly triggered, never on render: this calls into the runtime, and a
@@ -479,51 +425,24 @@ export default function DiagnosticsScreen() {
       // ONE list of sections, TWO artefacts, and the difference is not
       // cosmetic.
       //
-      // Each section declares a compact form and, where it has bulk, a
-      // complete one. The compact forms become the clipboard summary; the
-      // complete ones become the file that goes out through the share sheet.
-      // Copy used to hand the whole thing to `Clipboard.setString`, which is a
-      // Binder call, and at 3.38 MB the kernel refused the transaction and took
-      // the process with it:
-      //
-      //   android.os.TransactionTooLargeException: data parcel size 3377296
-      //
-      // Capping the clipboard payload stopped the crash but could cut the
-      // answer off, so the full report stopped travelling that way at all. See
-      // lib/diagnostics/deliver.ts.
-      //
-      // Ordered most-wanted first, because that is the order the clipboard-safe
-      // assembler drops things in. reportSections() puts the device identity
-      // ahead of all of these.
-      const gathered: DiagnosticsSection[] = [
-        { name: "pull trace", summary: pullTrace, essential: true },
-        { name: "identity probe", summary: formatProbe(result), essential: true },
-        { name: "chipset identity", summary: chipsetIdentity, essential: true },
-        {
-          name: "hub cache",
-          summary: cache
-            ? formatCacheReport(cache, repo, "summary")
-            : "Hub cache report\nunavailable (no NPU bridge in this build)",
-          full: cache
-            ? formatCacheReport(cache, repo, "full")
-            : "Hub cache report\nunavailable (no NPU bridge in this build)",
-          essential: true,
-        },
-        {
-          name: "hub listing",
-          summary: listAll ? formatListProbe(listAll, repo) : "",
-        },
-        {
-          name: "installed",
-          summary: installed ? formatInstalledReport(installed) : "",
-        },
-        {
-          name: "native log",
-          summary: genieXLog ? formatGenieXLog(genieXLog, "summary") : "",
-          full: genieXLog ? formatGenieXLog(genieXLog, "full") : "",
-        },
-      ];
-      setProbeSections(gathered);
+      // Which form of each section goes where is decided in
+      // lib/diagnostics/sections.ts, not here. That is not tidying: the rule a
+      // section has to obey — a compact form that stays compact on a FULL
+      // device — is only checkable against a populated fixture, and a rule
+      // living inside a screen component is a rule nothing tests. It was got
+      // wrong twice before it moved, both times invisibly until a real device
+      // with a real bundle produced a summary that hit the 64 KiB guard.
+      const gathered: DiagnosticsSection[] = probeSections({
+        repo,
+        pullTrace,
+        identityProbe: formatProbe(result),
+        chipsetIdentity,
+        cache,
+        listProbe: listAll,
+        installed,
+        genieXLog,
+      });
+      setProbeParts(gathered);
 
       // Still logged in full. `npuLogDiagnostic` splits on newlines and writes
       // one Log.i per line, so it has no Binder ceiling — and a report already
