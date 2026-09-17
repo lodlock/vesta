@@ -78,7 +78,11 @@ import {
   probeSections,
   formatHubState,
   describeLoadedRuntime,
+  describeHubCheck,
+  describeNpuCapability,
+  npuCapabilityState,
   type HubDiag,
+  type NpuCapability,
 } from "../lib/diagnostics/sections";
 import { countPullability, pullabilityIndex } from "../lib/models/npu-pullability";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
@@ -105,11 +109,34 @@ interface Diag {
   startup: StartupTrace;
   assist: AssistTurnTrace | null;
   assistTurns: number;
-  /** Hub state, or null on a build with no NPU bridge in it. */
-  hub: HubDiag | null;
+  /**
+   * Hub state, always — including "never checked", which is a state and not an
+   * absence. Whether it is worth PRINTING is decided by `npu.inBuild`.
+   */
+  hub: HubDiag;
+  /**
+   * Whether this build HAS a Qualcomm runtime, and whether it started.
+   *
+   * What the Qualcomm sections are gated on. They used to be gated on `hub`,
+   * which meant they existed only once somebody had run a hub query — so the
+   * backend and GenieX sections, which have nothing to do with the hub,
+   * appeared for the first time after an unrelated network call. Capability is
+   * the right gate and it is established locally.
+   */
+  npu: NpuCapability;
 }
 
 async function gather(): Promise<Diag> {
+  // Establish the Qualcomm runtime's state before reading anything that
+  // describes it. Both calls are local: the first is a device-info read plus
+  // the process-cached native probe, the second is a file read of the snapshot
+  // the last hub query left behind. Neither goes to the network — opening this
+  // screen must not decide, on the user's behalf, to make a request.
+  const store = useModelStore.getState();
+  const [npu] = await Promise.all([
+    store.ensureNpuReadiness(),
+    store.loadCachedNpuHub(),
+  ]);
   const [active, cache, dbBytes] = await Promise.all([
     getActiveModel(),
     getSessionCacheInfo(),
@@ -133,6 +160,12 @@ async function gather(): Promise<Diag> {
     assist: getLastAssistTurn(),
     assistTurns: getAssistModelTurns(),
     hub: gatherHub(active),
+    npu: {
+      inBuild: npu.inBuild,
+      probed: npu.probed,
+      available: npu.available,
+      reason: npu.reason,
+    },
   };
 }
 
@@ -143,9 +176,11 @@ async function gather(): Promise<Diag> {
  * app currently believes, and a screen that went and fetched a fresh answer
  * would be describing a state the rest of the app was never in.
  */
-function gatherHub(active: InstalledModel | null): HubDiag | null {
+function gatherHub(active: InstalledModel | null): HubDiag {
+  // No `inBuild` gate. It had one, and that was the coupling: a screen cannot
+  // report "the hub has never been checked" if the object describing the hub
+  // does not exist until something has checked it.
   const store = useModelStore.getState();
-  if (!store.npu.inBuild) return null;
   const snapshot = store.npuHub.snapshot;
   const breakdown = snapshot
     ? breakDownHubModels(snapshot.models, store.npu.soc, store.npu.chipsets)
@@ -307,7 +342,15 @@ function reportSections(
       essential: true,
     },
     ...probe,
-    { name: "hub state", summary: formatHubState(diag?.hub ?? null), essential: true },
+    // Printed only where there is a Qualcomm runtime to have a hub for. An
+    // empty summary drops the section, which is what a phone with no NPU
+    // should produce — but the emptiness is decided by the BUILD, never by
+    // whether anyone has run a query.
+    {
+      name: "hub state",
+      summary: diag?.npu.inBuild ? formatHubState(diag.hub) : "",
+      essential: true,
+    },
     { name: "cache health", summary: formatCacheHealth(diag), essential: true },
   ];
 }
@@ -338,7 +381,14 @@ export default function DiagnosticsScreen() {
 
   const refresh = useCallback(() => {
     gather()
-      .then(setDiag)
+      .then((next) => {
+        setDiag(next);
+        // After gather, not at mount: gather is what establishes readiness, and
+        // readiness is what puts the REMEMBERED compute unit back on the
+        // backend. Reading it any earlier shows the class default and makes the
+        // selector disagree with what the next load would actually use.
+        setSpikeCompute(genieXLlamaCpp().getComputeUnit());
+      })
       .catch(() => setDiag(null));
   }, []);
 
@@ -696,21 +746,56 @@ export default function DiagnosticsScreen() {
           )}
         </View>
 
-        {/* Qualcomm's catalogue, as state rather than as a list. The models
-            themselves live on the Models screen; what belongs here is whether
-            the query worked, when, and how much of the answer this device can
-            actually use — the four numbers that explain an empty list. */}
-        {diag.hub && (
+        {/* Everything below is gated on the BUILD having a Qualcomm runtime,
+            and on nothing else. It used to be gated on hub state, so a screen
+            that had never queried the hub showed none of it — including the
+            two sections that describe the local runtime and have no business
+            depending on a network call. */}
+        {diag.npu.inBuild && (
           <>
+            {/* The capability itself, said plainly and first: compiled in,
+                probed or not, started or not. The Backends list below reports
+                the same runtime through each backend that uses it; this is the
+                one place that answers "is there a Qualcomm runtime here at
+                all", which is the question every section under it assumes. */}
+            <Text style={styles.sectionTitle}>Qualcomm runtime</Text>
+            <View style={styles.card}>
+              <Row label="Runtime" value={describeNpuCapability(diag.npu)} />
+              {npuCapabilityState(diag.npu) === "unprobed" && (
+                <Text style={styles.hint}>
+                  The native probe runs once per launch, on the first thing that
+                  needs it. Nothing has needed it yet — this is not a failure,
+                  and no model has been refused because of it.
+                </Text>
+              )}
+              {npuCapabilityState(diag.npu) === "failed" && (
+                <Text style={styles.hint}>
+                  The runtime is in this build but did not start, so GGUF models
+                  run on llama.cpp (CPU) and a model registered for a Qualcomm
+                  runtime will refuse to load rather than silently run there.
+                </Text>
+              )}
+            </View>
+
+            {/* Qualcomm's catalogue, as state rather than as a list. The models
+                themselves live on the Models screen; what belongs here is
+                whether the query worked, when, and how much of the answer this
+                device can actually use — the numbers that explain an empty
+                list. Present from the first open, saying "never checked" when
+                that is the truth, because an absent section and an unasked
+                question look identical and are not. */}
             <Text style={styles.sectionTitle}>Qualcomm Hub</Text>
             <View style={styles.card}>
+              {/* One sentence covering all five states — never, failed,
+                  cached, stale, checked — so that "never checked" is a visible
+                  answer rather than an absent section, and a failure is never
+                  mistaken for a query that was simply not made. The text report
+                  renders the same states through the same function. */}
               <Row
                 label="Last check"
-                value={
-                  diag.hub.checkedAt === null
-                    ? "never"
-                    : `${new Date(diag.hub.checkedAt).toLocaleString()}${diag.hub.cached ? " (cached)" : ""}`
-                }
+                value={describeHubCheck(diag.hub, (ms) =>
+                  new Date(ms).toLocaleString(),
+                )}
               />
               <Row label="Models returned" value={String(diag.hub.total)} />
               <Row
@@ -725,11 +810,6 @@ export default function DiagnosticsScreen() {
                 label="Active NPU model"
                 value={diag.hub.activeNpuModel ?? "none"}
               />
-              {diag.hub.error && (
-                <Text style={styles.hint}>
-                  Last hub error: {diag.hub.error}
-                </Text>
-              )}
               <Text style={styles.hint}>
                 &ldquo;Compatible here&rdquo; counts models the hub offers for this
                 device&rsquo;s canonical chipset class AND in a model type this

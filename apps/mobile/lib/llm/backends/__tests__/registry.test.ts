@@ -29,6 +29,10 @@ jest.mock("../../llm-engine", () => ({
     timings: { predictedPerSecond: 12 },
   })),
   isLoaded: jest.fn(() => false),
+  // Which lane owns the live session. The llama.cpp backend reports on itself
+  // through this rather than through the engine-wide isLoaded(), so that it
+  // stays quiet while another lane holds the one native context.
+  loadedBackendId: jest.fn(() => null),
   getModelInfo: jest.fn(() => ({ loaded: false })),
   getLastCompletion: jest.fn(() => null),
 }));

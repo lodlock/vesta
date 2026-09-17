@@ -14,7 +14,7 @@ import {
   loadModel,
   unloadModel,
   generate,
-  isLoaded,
+  loadedBackendId,
   getModelInfo,
   getLastCompletion,
 } from "../llm-engine";
@@ -95,18 +95,40 @@ export class LlamaCppBackend implements ModelBackend {
     return unloadModel();
   }
 
+  /**
+   * What llama.rn itself is holding — not what the engine is holding.
+   *
+   * This read `isLoaded()`, which is true whenever ANY runtime has a session,
+   * and `getModelInfo().path`, which is the engine's one current path whichever
+   * lane set it. So while the GenieX lane held a Hexagon session, this backend
+   * reported "loaded" against the GenieX model's own file, and a diagnostics
+   * report showed two backends loaded with one model between them. It was the
+   * line that made a genuine mis-restore look like the normal state, and it was
+   * never a second session: llm-engine keeps one `LlamaContext` and one path,
+   * and both are shared low-level state that only one lane at a time owns.
+   *
+   * `loadedBackendId()` names the owner, so these fields describe this backend
+   * or say nothing at all. Diagnostics-only — nothing routes on this.
+   */
   getDiagnostics(): BackendDiagnostics {
+    const mine = loadedBackendId() === "llama_cpp";
     const info = getModelInfo();
     const stats = getLastCompletion();
     return {
       id: this.id,
       displayName: this.displayName,
       available: true, // bundled; there is no device on which it is missing
-      loaded: isLoaded(),
+      loaded: mine,
       unavailableReason: null,
       details: {
-        modelPath: info.path ?? "",
-        lastTokensPerSecond: stats?.predictedPerSecond ?? 0,
+        // Blank rather than the engine's path when another lane owns the
+        // session: an empty value is dropped from the report, and a path here
+        // is a claim that llama.rn has that file open.
+        modelPath: mine ? (info.path ?? "") : "",
+        // Likewise. The last completion is whoever's ran last, and attributing
+        // a Hexagon turn's rate to the CPU backend is how a fast run gets
+        // filed as a slow one.
+        lastTokensPerSecond: mine ? (stats?.predictedPerSecond ?? 0) : 0,
       },
     };
   }

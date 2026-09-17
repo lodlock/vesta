@@ -48,6 +48,7 @@ jest.mock("../../native/system-actions", () => ({
 }));
 jest.mock("../../native/npu", () => ({
   isNpuBuild: () => mockIsNpuBuild(),
+  npuProbeHasRun: jest.fn(() => true),
   probeNpuRuntime: () => mockProbe(),
   npuUnavailableReason: jest.fn(() => "The QAIRT plugin did not register."),
   npuDeviceChipset: () => mockDeviceChipset(),

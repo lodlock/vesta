@@ -30,6 +30,7 @@ jest.mock("../../native/system-actions", () => ({
 }));
 jest.mock("../../native/npu", () => ({
   isNpuBuild: jest.fn(() => true),
+  npuProbeHasRun: jest.fn(() => true),
   isNpuRuntimeAvailable: jest.fn(() => true),
   probeNpuRuntime: jest.fn(async () => ({ version: "0.4.0" })),
   npuUnavailableReason: jest.fn(() => null),

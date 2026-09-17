@@ -90,7 +90,12 @@ import {
   loadedBackendId,
   sessionMatches,
 } from "../llm-engine";
-import { backendModelRef, setDeviceSoc, genieXLlamaCpp } from "../backends/registry";
+import {
+  backendDiagnostics,
+  backendModelRef,
+  setDeviceSoc,
+  genieXLlamaCpp,
+} from "../backends/registry";
 import { routeModel } from "../backends/routing";
 
 // The rows as the registry stores them, restored verbatim by the startup path.
@@ -275,6 +280,33 @@ describe("the live session's runtime identity is reported, not assumed", () => {
 
     await loadModel(GENIEX_PATH, { backendModel: genieXRow() });
     expect(loadedBackendId()).toBe("geniex_llama_cpp");
+  });
+
+  it("does not report llama.cpp as loaded while the GenieX lane owns the session", async () => {
+    // Shared low-level state, not a second session: llm-engine keeps one
+    // LlamaContext and one current path, and `LlamaCppBackend.getDiagnostics()`
+    // read the engine-wide `isLoaded()` and path. So a report of a working
+    // Hexagon session showed BOTH backends loaded, with one model between them
+    // — which is indistinguishable from the mis-restore it was hiding.
+    await loadModel(GENIEX_PATH, { backendModel: genieXRow() });
+
+    const byId = Object.fromEntries(
+      backendDiagnostics().map((b) => [b.id, b]),
+    );
+    expect(byId.geniex_llama_cpp.loaded).toBe(true);
+    expect(byId["llama.cpp"].loaded).toBe(false);
+    // And it does not name a file it does not have open.
+    expect(byId["llama.cpp"].details.modelPath).toBe("");
+  });
+
+  it("does report llama.cpp as loaded when llama.cpp is what is loaded", async () => {
+    await loadModel(ordinaryGgufRow().filePath, { backendModel: ordinaryGgufRow() });
+
+    const byId = Object.fromEntries(
+      backendDiagnostics().map((b) => [b.id, b]),
+    );
+    expect(byId["llama.cpp"].loaded).toBe(true);
+    expect(byId.geniex_llama_cpp.loaded).toBe(false);
   });
 
   it("does not call a CPU session a match for a GenieX model on the same path", async () => {

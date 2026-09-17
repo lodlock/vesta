@@ -28,6 +28,7 @@ import { getDeviceInfo } from "../native/system-actions";
 import {
   isNpuBuild,
   probeNpuRuntime,
+  npuProbeHasRun,
   npuUnavailableReason,
   npuDeviceChipset,
 } from "../native/npu";
@@ -39,6 +40,15 @@ import {
 export interface NpuReadiness {
   /** The bridge was compiled in (VESTA_ENABLE_NPU=1). */
   inBuild: boolean;
+  /**
+   * …and the one-time runtime probe has finished, whatever it found.
+   *
+   * Separate from `available` because "it did not start" and "nothing has
+   * asked yet" are different facts and only one of them is about the device.
+   * Reported so a screen can say which it is instead of printing the pessimistic
+   * reading of both.
+   */
+  probed: boolean;
   /** …and the runtime actually started on this device. */
   available: boolean;
   /** …or, when it didn't, the SDK's own words for why. */
@@ -67,6 +77,7 @@ export interface NpuReadiness {
 
 const UNAVAILABLE: NpuReadiness = {
   inBuild: false,
+  probed: false,
   available: false,
   reason: null,
   runtimeVersion: null,
@@ -145,6 +156,7 @@ export async function prepareNpuBackend(
 
   cached = {
     inBuild: true,
+    probed: npuProbeHasRun(),
     available: runtime !== null,
     reason: runtime ? null : npuUnavailableReason(),
     runtimeVersion: runtime?.version ?? null,

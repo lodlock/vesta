@@ -443,6 +443,19 @@ export function isNpuBuild(): boolean {
   return moduleAvailable();
 }
 
+/**
+ * Whether the one-time probe has finished, whatever it decided.
+ *
+ * The distinction `isNpuRuntimeAvailable()` cannot express. That returns false
+ * both for "the runtime failed to start" and for "nobody has asked yet", and
+ * a diagnostics screen that conflates the two tells a user their hardware is
+ * broken when in fact nothing has looked at it. Callers deciding whether to
+ * RUN anything still use the availability answer; this is for describing state.
+ */
+export function npuProbeHasRun(): boolean {
+  return probeDone;
+}
+
 export function npuRuntimeInfo(): NpuRuntimeInfo | null {
   return probed;
 }

@@ -247,7 +247,30 @@ interface ModelState {
   activationErrors: Record<string, string>;
 
   refresh: () => Promise<void>;
+  /**
+   * The Qualcomm runtime's own state, and nothing else.
+   *
+   * Exists because the Diagnostics screen needs it and had no way to get it:
+   * `npu` was populated only by `refresh()`, which the Models screen owns, so
+   * every Qualcomm section was invisible until the user had been to Models.
+   * A screen that reports on a capability must be able to establish that
+   * capability itself.
+   *
+   * Local and cheap — a device-info read and the process-cached native probe.
+   * It queries no network, installs nothing, and does not touch the catalogue,
+   * which is the Models screen's business.
+   */
+  ensureNpuReadiness: () => Promise<NpuStatus>;
   loadNpuHub: (force?: boolean) => Promise<HubState>;
+  /**
+   * The last hub snapshot as it was left on disk, and never a query.
+   *
+   * The counterpart to `loadNpuHub()`, split off it so that a screen can show
+   * what is already known without deciding, on the user's behalf, to go to the
+   * network. Offline-first is the whole premise: opening Diagnostics must cost
+   * nothing but a file read.
+   */
+  loadCachedNpuHub: () => Promise<HubState>;
   installHubModel: (m: CompatibleHubModel) => Promise<void>;
   installNpuModel: (model: NpuCatalogModel) => Promise<void>;
   importNpuBundle: (model: NpuCatalogModel, uri: string) => Promise<void>;
@@ -942,6 +965,7 @@ export const useModelStore = create<ModelState>((set, get) => ({
   error: null,
   npu: {
     inBuild: false,
+    probed: false,
     available: false,
     reason: null,
     runtimeVersion: null,
@@ -973,6 +997,23 @@ export const useModelStore = create<ModelState>((set, get) => ({
    *   - nothing is ever final. `force` re-queries, and the screen always
    *     offers that, because Qualcomm can publish at any time
    */
+  ensureNpuReadiness: async () => {
+    const npu = await prepareNpuBackend();
+    set({ npu });
+    return npu;
+  },
+
+  loadCachedNpuHub: async () => {
+    const current = get().npuHub;
+    // A snapshot already in state is at least as fresh as the file it was
+    // written from, so re-reading it would only risk replacing a live answer
+    // with an older one.
+    if (current.snapshot) return current;
+    const cached = parseSnapshot(await readHubCache());
+    if (cached) set({ npuHub: { ...current, snapshot: cached } });
+    return get().npuHub;
+  },
+
   loadNpuHub: async (force = false) => {
     const current = get().npuHub;
     if (!force && current.snapshot && !current.snapshot.cached) return current;

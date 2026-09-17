@@ -71,6 +71,107 @@ export interface HubDiag {
 }
 
 /**
+ * Whether a Qualcomm section should EXIST, and what it should say about itself.
+ *
+ * Four states, kept apart because collapsing them is what made the Diagnostics
+ * screen misleading in both directions at once:
+ *
+ *   absent    no Qualcomm bridge in this build. Nothing to show, and nothing
+ *             wrong.
+ *   unprobed  the bridge is compiled in and the one-time native probe has not
+ *             run. NOT a failure — the honest answer is "nobody has looked".
+ *   failed    the probe ran and the runtime did not start. The SDK's own
+ *             sentence says why, and this must never be dressed up as
+ *             "available".
+ *   ready     the runtime started.
+ *
+ * `available` alone answers false for three of these, which is why a screen
+ * driven by it told a user with working silicon that they had none.
+ */
+export type NpuCapabilityState = "absent" | "unprobed" | "failed" | "ready";
+
+export interface NpuCapability {
+  /** The bridge is compiled into this build. */
+  inBuild: boolean;
+  /** The one-time native probe has finished, whatever it concluded. */
+  probed: boolean;
+  /** The runtime started. */
+  available: boolean;
+  /** The runtime's own words when it did not. */
+  reason: string | null;
+}
+
+export function npuCapabilityState(cap: NpuCapability): NpuCapabilityState {
+  if (!cap.inBuild) return "absent";
+  if (cap.available) return "ready";
+  return cap.probed ? "failed" : "unprobed";
+}
+
+/** The capability line, in words. */
+export function describeNpuCapability(cap: NpuCapability): string {
+  switch (npuCapabilityState(cap)) {
+    case "absent":
+      return "not in this build — models run on llama.cpp (CPU)";
+    case "unprobed":
+      return "compiled in, not probed yet";
+    case "failed":
+      // The runtime's own sentence, never a paraphrase and never an omission:
+      // it is the only part of this that says what actually happened.
+      return `probe failed — ${cap.reason ?? "the runtime did not start, and reported no reason"}`;
+    case "ready":
+      return "probed and running";
+  }
+}
+
+/**
+ * Whether the hub has ever been asked, and how that went.
+ *
+ * Deliberately independent of {@link npuCapabilityState}: a hub query is a
+ * NETWORK act the user performs, and whether they have performed it says
+ * nothing about whether this build has a Qualcomm runtime. Tying the two
+ * together is what made unrelated sections appear only after a hub check.
+ *
+ *   never    no snapshot, no error. Nobody has asked.
+ *   failed   asked, it did not work, and nothing was ever obtained.
+ *   cached   a snapshot restored from disk; nothing asked this session.
+ *   stale    a snapshot AND a later failure — the rows are real but old.
+ *   checked  a snapshot obtained this session.
+ */
+export type HubCheckState = "never" | "failed" | "cached" | "stale" | "checked";
+
+export function hubCheckState(hub: HubDiag): HubCheckState {
+  if (hub.checkedAt === null) return hub.error ? "failed" : "never";
+  if (hub.error) return "stale";
+  return hub.cached ? "cached" : "checked";
+}
+
+/**
+ * The hub's "last check" line.
+ *
+ * `at` formats the timestamp — ISO for the text report, a locale string on the
+ * screen — so the two callers can differ there and nowhere else.
+ */
+export function describeHubCheck(
+  hub: HubDiag,
+  at: (ms: number) => string,
+): string {
+  switch (hubCheckState(hub)) {
+    case "never":
+      // Says what to do about it. The check lives on the Models screen, and a
+      // bare "never" reads as a defect rather than as an action not taken.
+      return "never — run Check Qualcomm Hub on the Models screen";
+    case "failed":
+      return `never completed — ${hub.error}`;
+    case "cached":
+      return `${at(hub.checkedAt as number)} (cached from an earlier session)`;
+    case "stale":
+      return `${at(hub.checkedAt as number)} — a later refresh failed: ${hub.error}`;
+    case "checked":
+      return at(hub.checkedAt as number);
+  }
+}
+
+/**
  * What the hub said, as counts.
  *
  * The models themselves live on the Models screen and in the listing section;
@@ -86,7 +187,7 @@ export function formatHubState(hub: HubDiag | null): string {
   if (!hub) return "";
   const lines = [
     "Qualcomm Hub state",
-    `last check: ${hub.checkedAt === null ? "never" : new Date(hub.checkedAt).toISOString()}${hub.cached ? " (cached)" : ""}`,
+    `last check: ${describeHubCheck(hub, (ms) => new Date(ms).toISOString())}`,
     `models returned: ${hub.total}`,
     `compatible here: ${hub.compatible}`,
     `excluded — other chipsets: ${hub.otherChipsets}`,
@@ -95,7 +196,9 @@ export function formatHubState(hub: HubDiag | null): string {
     `pullability: ${hub.pullability ? describePullabilityCounts(hub.pullability) : "unknown (no manifest read yet)"}`,
     `active NPU model: ${hub.activeNpuModel ?? "none"}`,
   ];
-  if (hub.error) lines.push(`last hub error: ${hub.error}`);
+  // No separate error line: every state that carries an error — failed, stale
+  // — already says so on the "last check" line above, and printing the same
+  // sentence twice made one failure look like two.
   return lines.join("\n");
 }
 
