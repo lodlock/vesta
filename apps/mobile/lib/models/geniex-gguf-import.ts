@@ -40,13 +40,17 @@ import type { NewModel } from "./model-registry";
 import type { NpuBundleInfo } from "../native/npu";
 
 /**
- * The only quantization this spike accepts.
+ * The quantization this spike pulls by.
  *
- * Q4_0 is the one llama.cpp quant the Hexagon backend has kernels for. The
- * shipped `libggml-htp-v81.so` carries repacked matmul/vecdot kernels for
+ * Q4_0 is the llama.cpp quant the Hexagon backend actually has kernels for.
+ * The shipped `libggml-htp-v81.so` carries repacked matmul/vecdot kernels for
  * q4_0, q4_1, q8_0, iq4_nl and mxfp4 — and no K-quant at all — which is why
  * Qualcomm's own table marks `Q4_0` "Hexagon NPU" and `Q4_K_M` "GPU / CPU,
  * not optimized for Hexagon NPU" (docs/en/models/supported.mdx, v0.4.0).
+ *
+ * This string is also what the model manager matches on. `extract_quant()`
+ * reads it out of the FILE NAME, so "the manifest says Q4_0" means "the file
+ * was named Q4_0" and nothing stronger — see {@link pickSpikeGguf}.
  */
 export const GENIEX_SPIKE_PRECISION = "Q4_0";
 
@@ -128,9 +132,12 @@ export function genieXImportedRow(
     contextSize: opts.contextSize ?? 4096,
     role: "primary",
     state: "ready",
+    // Recorded from the filename, not from the weights — the diagnostics label
+    // "GGUF Q4_0" is therefore as good as the name was. See pickSpikeGguf.
     quant: GENIEX_SPIKE_PRECISION,
     // No digest, and none to compare against: the user supplied the file. Said
-    // plainly rather than dressed up as a baseline.
+    // plainly rather than dressed up as a baseline. It also covers the
+    // quantization, which nothing here has verified either.
     trust: "unverified",
     backend: "geniex_llama_cpp",
     artifact: "gguf",
@@ -160,11 +167,26 @@ export type SpikeGgufPick =
  * Which GGUF in the push directory the spike will import, or why it will not.
  *
  * Every refusal here is one the import would otherwise hit later and more
- * obscurely — and one of them is the hard stop this spike is built around:
- * a GGUF that is not Q4_0 will import happily and then run its matmuls off the
- * Hexagon DSP, which would look like a working experiment and prove nothing.
- * So an unsuitable quantization is refused by NAME, before any bytes move,
- * rather than substituted.
+ * obscurely — and one of them is the condition this spike is built around: a
+ * GGUF that is not Q4_0 imports happily and then runs its matmuls off the
+ * Hexagon DSP, which looks like a working experiment and proves nothing. So an
+ * unsuitable quantization is refused up front rather than substituted.
+ *
+ * ## This is a FILENAME HEURISTIC, not verification. SPIKE ONLY.
+ *
+ * It reads the tag out of the name and believes it. A file called
+ * `model-q4_0.gguf` holding Q4_K_M weights passes here, passes the model
+ * manager's own `extract_quant()` for exactly the same reason, and produces a
+ * run labelled Q4_0 that never touches the DSP. That is an acceptable risk
+ * while the file is one a developer pushed over adb on purpose. It is not
+ * acceptable for anything a user supplies.
+ *
+ * The real answer is `general.file_type` in the GGUF metadata, and it is not
+ * available yet: lib/models/gguf-header.ts reads only the 24-byte magic,
+ * version and section counts, so getting the quantization means parsing the
+ * metadata KV section — real work, and deliberately not part of this spike.
+ * Production code that offers this lane to users has to do it, and has to
+ * treat the filename as a hint that can disagree rather than as the answer.
  */
 export function pickSpikeGguf(names: string[]): SpikeGgufPick {
   const ggufs = names.filter((n) => n.toLowerCase().endsWith(".gguf"));
@@ -191,9 +213,10 @@ export function pickSpikeGguf(names: string[]): SpikeGgufPick {
     return {
       ok: false,
       reason:
-        `${file} is not a Q4_0 artifact. Q4_0 is the only quantization the ` +
-        "Hexagon backend has kernels for — rename the file if it IS Q4_0, " +
-        "otherwise fetch the Q4_0 build. Nothing else will be substituted.",
+        `${file} is not named as a Q4_0 build, and Q4_0 is the only ` +
+        "quantization the Hexagon backend has kernels for. Fetch the Q4_0 " +
+        "build — nothing else will be substituted. (This checks the NAME, " +
+        "not the weights.)",
     };
   }
   return {

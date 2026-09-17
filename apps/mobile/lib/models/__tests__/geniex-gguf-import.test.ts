@@ -9,7 +9,14 @@
 //   2. the artifact must be Q4_0. It is the only llama.cpp quantization the
 //      Hexagon backend has kernels for, so any other one would import cleanly,
 //      run off the DSP, and produce a measurement that looks like a result and
-//      proves nothing. It is refused by name rather than substituted.
+//      proves nothing. It is refused rather than substituted.
+//
+// What is asserted about (2) is deliberately narrow: the guard reads the tag
+// out of the FILE NAME and believes it, which is a spike heuristic and not
+// quantization verification. `spike-guard-is-name-only` below pins that
+// limitation in place so it is discovered by reading the tests rather than by
+// trusting a label. The real check is `general.file_type` in the GGUF
+// metadata, which lib/models/gguf-header.ts does not parse yet.
 
 import {
   genieXLocalModelName,
@@ -54,7 +61,17 @@ describe("the import request", () => {
   });
 });
 
-describe("the Q4_0 guard", () => {
+describe("the Q4_0 spike guard (filename only)", () => {
+  it("spike-guard-is-name-only: believes a name that could be lying", () => {
+    // Pinned deliberately. A file NAMED q4_0 that holds K-quant weights is
+    // accepted here, would be accepted by the model manager's extract_quant()
+    // for the same reason, and would run off the DSP under a "Q4_0" label.
+    // That is the known limit of a developer-pushed spike, not a bug to fix
+    // here — the fix is reading general.file_type out of the GGUF metadata,
+    // and this test is what should fail when someone does that work.
+    expect(pickSpikeGguf(["definitely-not-really-q4_0.gguf"]).ok).toBe(true);
+  });
+
   it("accepts a Q4_0 GGUF, in either case", () => {
     expect(pickSpikeGguf(["gemma-4-E2B-it-q4_0.gguf"])).toEqual({
       ok: true,
@@ -67,7 +84,10 @@ describe("the Q4_0 guard", () => {
   it("refuses Q4_K_M rather than substituting it", () => {
     const pick = pickSpikeGguf(["qwen3-4b-Q4_K_M.gguf"]);
     expect(pick.ok).toBe(false);
-    expect(pick.ok === false && pick.reason).toMatch(/not a Q4_0 artifact/);
+    expect(pick.ok === false && pick.reason).toMatch(/not named as a Q4_0 build/);
+    // And the refusal says what it actually checked, so nobody reads it as a
+    // statement about the weights.
+    expect(pick.ok === false && pick.reason).toMatch(/checks the NAME/);
   });
 
   it("refuses a GGUF with no quant tag at all", () => {

@@ -1871,10 +1871,16 @@ export const useModelStore = create<ModelState>((set, get) => ({
     // believing it has the model.
     //
     // The test is OWNERSHIP — a `runtime_model_name` — not the artifact type.
-    // It used to be `isNpuModel(model) && …`, which was the same set while
-    // every GenieX-owned row was a QAIRT bundle. A GenieX llama.cpp GGUF is
-    // artifact `gguf` and would have fallen to the unlink branch, quietly
-    // removing one file out of the manager's model directory.
+    // It used to be `isNpuModel(model) && …`, which described the same set only
+    // because every GenieX-owned row was a QAIRT bundle, whose artifact is
+    // `qairt_context`. A GenieX llama.cpp model breaks that coincidence: its
+    // artifact is `gguf`, so isNpuModel() is false, and its file_path points at
+    // a .gguf INSIDE the manager's own model directory. The old branch would
+    // have unlinked that one file and left geniex.json, the tokenizer and the
+    // .lock behind — with the manager still listing the model and getPaths()
+    // still resolving to a path that no longer exists. The next load would then
+    // fail inside the runtime instead of at a check Vesta could explain.
+    // Pinned in both directions by lib/store/__tests__/geniex-gguf-lifecycle.
     if (model.runtimeModelName) {
       await npuRemoveBundle(model.runtimeModelName).catch(() => {});
     } else {

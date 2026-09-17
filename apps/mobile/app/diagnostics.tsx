@@ -837,6 +837,11 @@ export default function DiagnosticsScreen() {
                 applies to the NEXT load, so switch it before activating.
                 &ldquo;hybrid&rdquo; is HTP + CPU by design and logs no device
                 list; &ldquo;npu&rdquo; pins HTP0 and says so in the log.
+                {"\n\n"}
+                Q4_0 is required — it is the only quantization the Hexagon
+                backend has kernels for. That is checked against the FILE NAME
+                only, which is a spike shortcut and not verification: the
+                weights themselves are never inspected.
               </Text>
             </View>
           </>
