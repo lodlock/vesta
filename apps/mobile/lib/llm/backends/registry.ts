@@ -12,12 +12,25 @@
 
 import { LlamaCppBackend } from "./llamacpp-backend";
 import { npuBackend } from "./npu-instance";
+import { genieXLlamaCppBackend } from "./geniex-llamacpp-instance";
 import type { BackendDiagnostics, BackendModelRef, ModelBackend } from "./types";
 import type { InstalledModel } from "../../models/types";
 import type { RuntimeChipset } from "../../models/chipset-identity";
 
 // Accelerated first, general-purpose last.
-const backends: ModelBackend[] = [npuBackend, new LlamaCppBackend()];
+//
+// The GenieX llama.cpp lane sits BETWEEN the two, and the order is the policy
+// in both directions. Above the CPU backend, because it claims a GGUF that
+// backend would otherwise take and can run it on the Hexagon DSP. Below QAIRT,
+// because the two runtimes take different artifacts and QAIRT's is the
+// stronger claim where both could apply — and because a lane that can only
+// ever be reached by falling past the one above it is the lane whose ordering
+// nobody has to think about again.
+const backends: ModelBackend[] = [
+  npuBackend,
+  genieXLlamaCppBackend,
+  new LlamaCppBackend(),
+];
 
 /** Tells the NPU backend what chipset it is running on. */
 export function setDeviceSoc(soc: string | null): void {
@@ -38,6 +51,11 @@ export function setRuntimeChipsets(
 /** The NPU backend itself, for the paths that must address it by name. */
 export function qualcommNpuBackend() {
   return npuBackend;
+}
+
+/** The GenieX llama.cpp backend, for the paths that must address it by name. */
+export function genieXLlamaCpp() {
+  return genieXLlamaCppBackend;
 }
 
 /** Exposed for tests and the diagnostics screen. */

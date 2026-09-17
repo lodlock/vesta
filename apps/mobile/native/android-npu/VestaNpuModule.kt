@@ -144,6 +144,18 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
     /** The bundle name behind the current session, or null when none. */
     @Volatile private var loadedModelName: String? = null
 
+    /**
+     * What the LIVE session was created with, or null when there is none.
+     *
+     * Two GenieX runtimes now share this module's single wrapper, so "which
+     * runtime is loaded" stopped being a constant. [probe] reports these when a
+     * session exists and falls back to the QAIRT pair otherwise — which is what
+     * it always answered, so a QAIRT session and an idle module both read
+     * exactly as they did before.
+     */
+    @Volatile private var loadedRuntimeId: String? = null
+    @Volatile private var loadedComputeUnit: String? = null
+
     private var generateJob: Job? = null
     private var pullJob: Job? = null
 
@@ -170,6 +182,88 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
 
         /** The plugin GenieX loads for the Hexagon path, as a file name. */
         private const val QAIRT_PLUGIN_LIB = "libgeniex_plugin_qairt.so"
+
+        // ── The llama.cpp lane (SPIKE) ───────────────────────────────────
+        //
+        // A SECOND GenieX runtime, sharing this module's single LlmWrapper and
+        // its lifecycle, and nothing else. It is not the QAIRT path and must
+        // never be described as one — see [loadLlamaCpp].
+
+        /** The plugin GenieX loads for the GGUF path, as a file name. */
+        private const val LLAMA_CPP_PLUGIN_LIB = "libgeniex_plugin_llama_cpp.so"
+
+        /**
+         * The compute-unit aliases this SDK accepts, taken from the SDK's own
+         * enum rather than written out — `sdk/src/device.cpp` rejects anything
+         * else with GENIEX_ERROR_COMMON_INVALID_DEVICE, and a list that drifted
+         * from [ComputeUnitValue] would turn a typo here into that error on
+         * device instead of a readable one here.
+         */
+        private val LLAMA_CPP_COMPUTE_UNITS: Set<String> =
+            ComputeUnitValue.values().mapNotNull { it.value }.toSet()
+
+        /**
+         * What an omitted compute unit means for THIS lane: `hybrid`.
+         *
+         * Not null, and the difference is the whole point. `LlmCreateInput`'s
+         * KDoc says null selects HYBRID for llama_cpp; the SDK does not. In
+         * `sdk/src/device.cpp` an empty or "auto" alias becomes `npu`:
+         *
+         *     if (alias.empty() || alias == kAliasAuto) { alias = kAliasNPU; }
+         *
+         * which pins the model to a single HTP0 session. `hybrid` instead
+         * leaves device_id empty and lets llama.cpp schedule per tensor across
+         * HTP and CPU — Qualcomm's documented fast path. So the alias is always
+         * sent explicitly and null is never used as a stand-in for it.
+         */
+        private val DEFAULT_LLAMA_CPP_COMPUTE_UNIT: String =
+            ComputeUnitValue.HYBRID.value ?: "hybrid"
+
+        /** llama.cpp's own default when `nCtx` is 0; stated rather than implied. */
+        private const val DEFAULT_LLAMA_CPP_CTX = 4096
+
+        /**
+         * The lines that say which devices llama.cpp actually bound, verbatim
+         * from the GenieX sources this was written against:
+         *
+         *   plugins/llama_cpp/src/params.cpp   "Found device: {}"
+         *                                      "Using {} device(s): {}"
+         *                                      "Device '{}' not found, skipping"
+         *                                      "No valid devices found in '{}'"
+         *   plugins/llama_cpp/src/plugin.cpp   "[Optimise] …" param dumps
+         *   plugins/llama_cpp/src/htp_session.cpp
+         *                                      "Reacquiring HTP sessions …"
+         *                                      "Releasing HTP sessions …"
+         *   ggml-hexagon backend               every "ggml-hex: …" line
+         *
+         * Note what is NOT here: with `compute_unit = hybrid` the resolved
+         * device_id is EMPTY, `resolve_devices()` returns before it logs
+         * anything, and no "Found device" line is produced at all. Hybrid is
+         * therefore evidenced by the `ggml-hex:` session lines and by
+         * llama.cpp's own per-device buffer lines, not by a device list. Load
+         * once with `npu` if you want the explicit "HTP0" sentence.
+         */
+        private val DEVICE_LOG_MARKERS =
+            arrayOf(
+                "Found device: ",
+                "device(s): ",
+                " not found, skipping",
+                "No valid devices found in ",
+                "[Optimise] ",
+                // Broad on purpose, and safe: the capture is already narrowed
+                // to GenieX's own tag and to one load. It catches the device
+                // names ("HTP0"), the session handoff lines ("… HTP sessions")
+                // and llama.cpp's own per-buffer allocation lines, which are
+                // the only HTP evidence hybrid produces.
+                "HTP",
+                "ggml-hex: ",
+            )
+
+        /** An `HTP0`-shaped ggml device name anywhere in a captured line. */
+        private val HTP_DEVICE_NAME = Regex("""\bHTP\d+\b""")
+
+        /** Bound on the device-selection capture. One load's worth of lines. */
+        private const val DEVICE_LOG_LINES = 200
 
         /**
          * Files small enough to hash at install time. A context bundle's weight
@@ -313,11 +407,24 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         return true
     }
 
-    private fun runtimeInfo(extra: (WritableMap) -> Unit = {}): WritableMap {
+    /**
+     * The facts a caller may repeat about a session, with the two that decide
+     * what it may be CALLED passed in.
+     *
+     * They default to the QAIRT pair, so every existing call site — all of
+     * which use the trailing-lambda form — is unchanged. The llama.cpp lane
+     * passes its own, because a session created on the llama_cpp plugin with
+     * compute_unit = hybrid must not be described with QAIRT's words.
+     */
+    private fun runtimeInfo(
+        runtimeId: String? = RuntimeIdValue.QAIRT.value,
+        computeUnit: String? = ComputeUnitValue.NPU.value,
+        extra: (WritableMap) -> Unit = {},
+    ): WritableMap {
         val info = Arguments.createMap()
         info.putString("version", pluginVersion)
-        info.putString("computeUnit", ComputeUnitValue.NPU.value)
-        info.putString("runtimeId", RuntimeIdValue.QAIRT.value)
+        info.putString("computeUnit", computeUnit)
+        info.putString("runtimeId", runtimeId)
         info.putString("soc", socModel())
         info.putString("dataDir", File(reactApplicationContext.filesDir, "geniex").absolutePath)
         extra(info)
@@ -355,7 +462,10 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
                 promise.resolve(
-                    runtimeInfo {
+                    runtimeInfo(
+                        loadedRuntimeId ?: RuntimeIdValue.QAIRT.value,
+                        loadedComputeUnit ?: ComputeUnitValue.NPU.value,
+                    ) {
                         it.putBoolean("available", true)
                         // What the currently loaded session was created with, if
                         // there is one. Diagnostics reads this rather than
@@ -1828,6 +1938,8 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
                     }
                 llm = wrapper
                 loadedModelName = modelName
+                loadedRuntimeId = RuntimeIdValue.QAIRT.value
+                loadedComputeUnit = ComputeUnitValue.NPU.value
 
                 // Everything a diagnostics screen may claim about this session,
                 // assembled at the moment it was created. Each field is something
@@ -1856,6 +1968,277 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
             } catch (e: Throwable) {
                 promise.reject("NPU_LOAD_FAILED", e.message, e)
             }
+        }
+    }
+
+    // ── Load: the llama.cpp lane (SPIKE) ─────────────────────────────────
+
+    /**
+     * Creates a GenieX **llama.cpp** session over an imported GGUF.
+     *
+     * A separate entrypoint on purpose. [load] is the QAIRT path and its
+     * settings are wrong here in both directions: QAIRT rejects a non-zero
+     * `nCtx`/`nGpuLayers` because the bundle compiles them in, while llama.cpp
+     * needs a real context size and needs `nGpuLayers` left at its own default
+     * of -1 ("all layers"). Merging the two would mean one of them silently
+     * getting the other's numbers.
+     *
+     * What this lane may and may not claim:
+     *
+     * - `runtime_id = llama_cpp`, and the manifest must agree. `ModelPaths`
+     *   carries the manifest's own `plugin_id` — "llama_cpp" for a GGUF
+     *   (`manifest_builder.rs` sets it literally), "qairt" for an AI Hub
+     *   bundle — so a bundle that is not a GGUF is refused here rather than
+     *   being run by the wrong plugin.
+     * - `compute_unit` is sent EXPLICITLY, defaulting to `hybrid`. Never null:
+     *   see [DEFAULT_LLAMA_CPP_COMPUTE_UNIT] for what null actually does.
+     * - `hybrid` is HTP **and** CPU by design — llama.cpp's per-tensor
+     *   scheduler — so nothing on this path may say "ran on the NPU". The
+     *   device-selection lines captured below are what is actually known.
+     *
+     * No fallback: a failed create is reported, exactly as on the QAIRT path.
+     */
+    @ReactMethod
+    fun loadLlamaCpp(configJson: String, promise: Promise) {
+        scope.launch {
+            try {
+                if (!ensureSdk()) {
+                    promise.reject(
+                        "NPU_UNAVAILABLE",
+                        initError ?: "No usable Qualcomm GenieX runtime on this device",
+                    )
+                    return@launch
+                }
+
+                // The llama.cpp plugin registers alongside QAIRT in
+                // GenieXSdk.init() — it loops BOTH RuntimeIdValue entries — but
+                // only if the .so is a real file, which is the same legacy
+                // packaging requirement the QAIRT probe already checks for. A
+                // missing file here means this lane cannot work at all, and
+                // saying so beats a create that fails with a plugin error.
+                val libDir = reactApplicationContext.applicationInfo.nativeLibraryDir
+                if (!File(libDir, LLAMA_CPP_PLUGIN_LIB).exists()) {
+                    promise.reject(
+                        "NPU_LLAMA_CPP_PLUGIN_MISSING",
+                        "$LLAMA_CPP_PLUGIN_LIB is not present as a file in $libDir.",
+                    )
+                    return@launch
+                }
+
+                val config = JSONObject(configJson)
+                val modelName = config.stringOrNull("modelName")
+                if (modelName == null) {
+                    promise.reject(
+                        "NPU_LLAMA_CPP_NO_NAME",
+                        "This lane loads a model the GenieX model manager owns, by name.",
+                    )
+                    return@launch
+                }
+
+                // Same resolution as the QAIRT path: the manager owns the files
+                // and answers with the paths AND the manifest's runtime.
+                val paths = ModelManagerWrapper.getPaths(modelName)
+                val modelPath = stripScheme(paths?.model_path ?: "")
+                // A GGUF embeds its own tokenizer, so the manifest usually has
+                // no tokenizer file and this stays null. Null is passed through
+                // as null — defaultTokenizerPath() is a QAIRT-bundle rule and
+                // guessing a sibling path here would hand the plugin a file
+                // that does not exist.
+                val tokenizerPath =
+                    paths?.tokenizer_path?.takeIf { it.isNotBlank() }?.let { stripScheme(it) }
+
+                val computeUnit =
+                    (config.stringOrNull("computeUnit") ?: DEFAULT_LLAMA_CPP_COMPUTE_UNIT)
+                        .trim()
+                        .lowercase()
+                if (computeUnit !in LLAMA_CPP_COMPUTE_UNITS) {
+                    // Refused here rather than at the FFI, which answers this
+                    // with a bare INVALID_DEVICE code and no list.
+                    promise.reject(
+                        "NPU_LLAMA_CPP_BAD_COMPUTE_UNIT",
+                        "compute_unit '$computeUnit' is not one of " +
+                            LLAMA_CPP_COMPUTE_UNITS.sorted().joinToString(", "),
+                    )
+                    return@launch
+                }
+                val contextSize =
+                    config.optInt("contextSize", DEFAULT_LLAMA_CPP_CTX).coerceAtLeast(0)
+
+                android.util.Log.i(
+                    TAG,
+                    "loadLlamaCpp: asked=${quoted(modelName)} getPaths=${paths != null}" +
+                        " | ModelPaths model_name=${quoted(paths?.model_name)}" +
+                        " model_dir=${quoted(paths?.model_dir)}" +
+                        " model_path=${quoted(paths?.model_path)}" +
+                        " tokenizer_path=${quoted(paths?.tokenizer_path)}" +
+                        " runtime_id=${quoted(paths?.runtime_id)}" +
+                        " model_type=${quoted(paths?.model_type?.name)}" +
+                        " | LlmCreateInput model_path=${quoted(modelPath)}" +
+                        " tokenizer_path=${quoted(tokenizerPath)}" +
+                        " runtime_id=${quoted(RuntimeIdValue.LLAMA_CPP.value)}" +
+                        " compute_unit=${quoted(computeUnit)} n_ctx=$contextSize",
+                )
+
+                if (paths == null) {
+                    promise.reject(
+                        "NPU_MODEL_MISSING",
+                        "The GenieX model manager does not know $modelName — import it first.",
+                    )
+                    return@launch
+                }
+                if (modelPath.isBlank() || !File(modelPath).exists()) {
+                    promise.reject(
+                        "NPU_MODEL_MISSING",
+                        "Model artifact not found: ${modelPath.ifBlank { modelName }}",
+                    )
+                    return@launch
+                }
+
+                // The manifest's own word, and the mirror image of the QAIRT
+                // guard in [load]. Without it a QAIRT bundle handed to this
+                // entrypoint would be created on the wrong plugin.
+                val manifestRuntime = paths.runtime_id.takeIf { it.isNotBlank() }
+                if (manifestRuntime != RuntimeIdValue.LLAMA_CPP.value) {
+                    promise.reject(
+                        "NPU_WRONG_RUNTIME",
+                        "$modelName is a ${manifestRuntime ?: "runtime-less"} model, " +
+                            "not a GenieX llama.cpp (GGUF) model.",
+                    )
+                    return@launch
+                }
+
+                // One LlmWrapper per process, whichever lane owns it. This is
+                // also what keeps the two plugins off each other: llama.cpp and
+                // QAIRT collide on the same CDSP domain, and the SDK only hands
+                // HTP sessions over when no llama.cpp session is still holding
+                // one (htp_session.cpp, release_sessions_if_idle).
+                releaseLlm()
+
+                // llama.cpp's own defaults, stated where they differ from
+                // QAIRT's: a real context, and nGpuLayers LEFT ALONE at -1.
+                val modelConfig = ModelConfig().apply { nCtx = contextSize }
+
+                // Written under GenieX's own tag so the capture below can find
+                // where this load began, rather than reporting device lines
+                // left in the ring buffer by an earlier one.
+                val marker = "VESTA_LLAMA_CPP_LOAD_${System.nanoTime()}"
+                android.util.Log.i(GENIEX_LOG_TAG, marker)
+
+                val started = System.currentTimeMillis()
+                val input =
+                    LlmCreateInput(
+                        modelPath,
+                        tokenizerPath,
+                        modelConfig,
+                        RuntimeIdValue.LLAMA_CPP.value,
+                        computeUnit,
+                    )
+                val built = LlmWrapper.builder().llmCreateInput(input).build()
+                val wrapper =
+                    built.getOrElse { error ->
+                        logBundleInventory(paths.model_dir)
+                        promise.reject(
+                            "NPU_LLAMA_CPP_LOAD_FAILED",
+                            error.message
+                                ?: "GenieX could not create a llama.cpp session",
+                            error,
+                        )
+                        return@launch
+                    }
+                llm = wrapper
+                loadedModelName = modelName
+                loadedRuntimeId = RuntimeIdValue.LLAMA_CPP.value
+                loadedComputeUnit = computeUnit
+
+                val attestation =
+                    runtimeInfo(RuntimeIdValue.LLAMA_CPP.value, computeUnit) {
+                        it.putBoolean("available", true)
+                        it.putString("modelPath", modelPath)
+                        it.putString("tokenizerPath", tokenizerPath)
+                        it.putString("manifestRuntimeId", manifestRuntime)
+                        it.putString("resolvedModelName", paths.model_name)
+                        it.putString("modelDir", paths.model_dir)
+                        it.putString("manifestModelPath", paths.model_path)
+                        it.putString("manifestTokenizerPath", paths.tokenizer_path)
+                        it.putString("manifestModelType", paths.model_type.name)
+                        it.putInt("contextSize", contextSize)
+                        it.putDouble("loadMs", (System.currentTimeMillis() - started).toDouble())
+                        // What the runtime SAID about device binding, as
+                        // opposed to what was asked for. The only evidence
+                        // available on this path.
+                        it.putMap("deviceSelection", deviceSelectionReport(marker))
+                    }
+                promise.resolve(attestation)
+            } catch (e: Throwable) {
+                promise.reject("NPU_LLAMA_CPP_LOAD_FAILED", e.message, e)
+            }
+        }
+    }
+
+    /**
+     * The device-selection lines GenieX emitted during the load that wrote
+     * [marker], and the two booleans worth reading off them.
+     *
+     * Diagnostic only, and deliberately not a gate: a load is not failed here
+     * for want of an "HTP0". The ring buffer can roll, a device line can be
+     * absent by design (hybrid logs none — see [DEVICE_LOG_MARKERS]), and
+     * refusing a working session on missing evidence would be the same mistake
+     * as claiming NPU on missing evidence. The screen shows what was seen.
+     */
+    private fun deviceSelectionReport(marker: String): WritableMap {
+        val out = Arguments.createMap()
+        val captured: WritableArray = Arguments.createArray()
+        var sawHtpDevice = false
+        var sawHexagonBackend = false
+        var sawNoValidDevices = false
+        var scoped = false
+        try {
+            val argv = arrayOf("logcat", "-d", "-v", "threadtime", "-s", "$GENIEX_LOG_TAG:V")
+            val (raw, _) = readOwnLogcat(argv, MAX_LOG_LINES)
+            val from = raw.indexOfLast { it.contains(marker) }
+            scoped = from >= 0
+            val window = if (scoped) raw.drop(from + 1) else raw
+            val matched =
+                window
+                    .filter { line -> DEVICE_LOG_MARKERS.any { line.contains(it) } }
+                    .takeLast(DEVICE_LOG_LINES)
+            for (line in matched) {
+                val safe = redactSecrets(line)
+                captured.pushString(safe)
+                if (HTP_DEVICE_NAME.containsMatchIn(safe)) sawHtpDevice = true
+                if (safe.contains("ggml-hex: ")) sawHexagonBackend = true
+                if (safe.contains("No valid devices found in ")) sawNoValidDevices = true
+            }
+        } catch (e: Throwable) {
+            android.util.Log.w(TAG, "deviceSelectionReport failed", e)
+            out.putString("error", e.message ?: e.toString())
+        }
+        out.putArray("lines", captured)
+        out.putBoolean("sawHtpDevice", sawHtpDevice)
+        out.putBoolean("sawHexagonBackend", sawHexagonBackend)
+        out.putBoolean("sawNoValidDevices", sawNoValidDevices)
+        // False means the capture could not be narrowed to this load — the
+        // lines may predate it. Shown, so a stale "HTP0" is never read as fresh.
+        out.putBoolean("scopedToThisLoad", scoped)
+        return out
+    }
+
+    /**
+     * A directory on this device that `adb push` can write and this app can
+     * read without any runtime permission — app-specific external storage.
+     *
+     * For the llama.cpp spike only: the GGUF has to reach a path the model
+     * manager can open, and `/data/local/tmp` is not one (SELinux keeps an
+     * untrusted app out of `shell_data_file`). Returned rather than hardcoded
+     * because the path contains the package name and the user id.
+     */
+    @ReactMethod
+    fun externalImportDir(promise: Promise) {
+        try {
+            promise.resolve(reactApplicationContext.getExternalFilesDir(null)?.absolutePath)
+        } catch (e: Throwable) {
+            android.util.Log.w(TAG, "externalImportDir failed", e)
+            promise.resolve(null)
         }
     }
 
@@ -2008,6 +2391,8 @@ class VestaNpuModule(reactContext: ReactApplicationContext) :
         }
         llm = null
         loadedModelName = null
+        loadedRuntimeId = null
+        loadedComputeUnit = null
     }
 
     override fun invalidate() {

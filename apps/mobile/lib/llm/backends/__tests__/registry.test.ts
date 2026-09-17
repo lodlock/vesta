@@ -40,10 +40,12 @@ jest.mock("../../../native/npu", () => ({
   npuUnavailableReason: jest.fn(() => null),
   npuRuntimeInfo: jest.fn(() => null),
   npuLoad: jest.fn(),
+  npuLoadLlamaCpp: jest.fn(),
   npuGenerate: jest.fn(),
   npuUnload: jest.fn(async () => {}),
   npuCancel: jest.fn(),
   onNpuToken: jest.fn(() => () => {}),
+  DEFAULT_GENIEX_COMPUTE_UNIT: "hybrid",
 }));
 
 const mockRuntime = isNpuRuntimeAvailable as jest.MockedFunction<
@@ -200,6 +202,16 @@ describe("diagnostics name the backend and the reason", () => {
   it("keeps the NPU backend present in every build", () => {
     // It exists even when unusable, so diagnostics can say WHY rather than
     // staying silent about the NPU on a device that has one.
-    expect(allBackends().map((b) => b.id)).toEqual(["qualcomm_npu", "llama.cpp"]);
+    //
+    // The ORDER is the routing policy, so it is asserted whole rather than by
+    // membership: accelerated first, and the one runtime that can always run a
+    // GGUF last. A GenieX llama.cpp lane that drifted below llama.rn would
+    // never be reached, and one that drifted above QAIRT would be asked about
+    // context bundles it cannot run.
+    expect(allBackends().map((b) => b.id)).toEqual([
+      "qualcomm_npu",
+      "geniex_llama_cpp",
+      "llama.cpp",
+    ]);
   });
 });

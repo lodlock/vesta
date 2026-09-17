@@ -50,7 +50,11 @@ export type ModelTrust =
   | "unverified";
 
 // Which runtime a model belongs to. Not a preference — a fact about the file.
-export type ModelBackendId = "llama_cpp" | "qualcomm_npu";
+//
+// `geniex_llama_cpp` is a GGUF the GenieX model manager owns and runs through
+// its own llama.cpp plugin on Hexagon. Same file format as `llama_cpp`,
+// different owner — which is why the pair are two values and not one.
+export type ModelBackendId = "llama_cpp" | "qualcomm_npu" | "geniex_llama_cpp";
 
 // The on-disk shape. `gguf` is one portable file; the Qualcomm formats are
 // compiled for a specific SoC and usually arrive as a directory of files.

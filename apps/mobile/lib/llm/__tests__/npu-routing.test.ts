@@ -45,6 +45,15 @@ const mockNpuGenerate = jest.fn(async () => ({
   stopReason: "eos",
 }));
 const mockNpuUnload = jest.fn(async () => {});
+const mockNpuLoadLlamaCpp = jest.fn(async () => ({
+  version: "0.4.0",
+  computeUnit: "hybrid",
+  runtimeId: "llama_cpp",
+  soc: "SM8850",
+  manifestRuntimeId: "llama_cpp",
+  contextSize: 4096,
+  deviceSelection: { sawHtpDevice: true, scopedToThisLoad: true },
+}));
 
 jest.mock("../../native/npu", () => ({
   isNpuBuild: jest.fn(() => true),
@@ -52,10 +61,12 @@ jest.mock("../../native/npu", () => ({
   npuUnavailableReason: jest.fn(() => null),
   npuRuntimeInfo: jest.fn(() => ({ version: "0.4.0", computeUnit: "npu", soc: "SM8850" })),
   npuLoad: (...args: unknown[]) => mockNpuLoad(...(args as [])),
+  npuLoadLlamaCpp: (...args: unknown[]) => mockNpuLoadLlamaCpp(...(args as [])),
   npuGenerate: (...args: unknown[]) => mockNpuGenerate(...(args as [])),
   npuUnload: () => mockNpuUnload(),
   npuCancel: jest.fn(),
   onNpuToken: jest.fn(() => () => {}),
+  DEFAULT_GENIEX_COMPUTE_UNIT: "hybrid",
 }));
 
 import { loadModel, generate, unloadModel, isNpuSession, supportsKvSessionCache } from "../llm-engine";
@@ -204,5 +215,105 @@ describe("switching between the two", () => {
     await loadModel("/files/geniex/models/qwen3/model", { backendModel: bundle() });
     expect(mockLlamaContext.release).toHaveBeenCalled();
     expect(isNpuSession()).toBe(true);
+  });
+});
+
+// ── The third lane (SPIKE) ────────────────────────────────────────────────
+//
+// A GGUF the GENIEX model manager owns. Same file format as the one above and
+// a completely different runtime, so the engine has to tell them apart from
+// the row alone — and it has to keep telling QAIRT apart from both.
+
+const genieXGguf = () =>
+  backendModelRef({
+    filePath: "/files/geniex/models/local/gemma/gemma-4-E2B-it-q4_0.gguf",
+    artifact: "gguf",
+    contextSize: 4096,
+    displayName: "gemma-4-E2B-it-q4_0",
+    quant: "Q4_0",
+    runtimeModelName: "local/gemma-4-e2b-it-q4_0",
+  });
+
+describe("a GenieX-owned GGUF goes to the GenieX llama.cpp lane", () => {
+  it("never touches llama.rn, and never touches QAIRT", async () => {
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    expect(mockNpuLoadLlamaCpp).toHaveBeenCalledTimes(1);
+    expect(mockInitLlama).not.toHaveBeenCalled();
+    expect(mockNpuLoad).not.toHaveBeenCalled();
+  });
+
+  it("does not make isNpuSession() true", async () => {
+    // The label this lane may not wear. `hybrid` is HTP AND CPU by design, and
+    // isNpuSession() is read by everything that says "Hexagon HTP / NPU".
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    expect(isNpuSession()).toBe(false);
+  });
+
+  it("offers no KV session cache either", async () => {
+    // GenieX exposes no state save/load from Kotlin at 0.4.0, on either lane.
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    expect(supportsKvSessionCache()).toBe(false);
+  });
+
+  it("generates through GenieX and records its own labels", async () => {
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    const result = await generate([{ role: "user", content: "hi" }]);
+
+    expect(mockNpuGenerate).toHaveBeenCalledTimes(1);
+    expect(mockLlamaContext.completion).not.toHaveBeenCalled();
+    expect(result.text).toBe("Providence.");
+
+    const run = getLastRun();
+    expect(run?.backend).toBe("geniex_llama_cpp");
+    expect(run?.computeLabel).toBe("Hexagon HTP + CPU (hybrid)");
+    expect(run?.artifactLabel).toBe("GGUF Q4_0");
+  });
+
+  it("refuses rather than falling back to the CPU", async () => {
+    mockNpuLoadLlamaCpp.mockRejectedValueOnce(new Error("HTP0 not found"));
+    await expect(
+      loadModel(genieXGguf().filePath, { backendModel: genieXGguf() }),
+    ).rejects.toThrow("HTP0 not found");
+    // The one thing that must never happen: the same file quietly on llama.rn.
+    expect(mockInitLlama).not.toHaveBeenCalled();
+  });
+
+  it("leaves an ordinary GGUF to llama.rn", async () => {
+    // The whole distinction is the runtimeModelName; without it this row is
+    // the portable file it looks like.
+    await loadModel(gguf().filePath, { backendModel: gguf() });
+    expect(mockNpuLoadLlamaCpp).not.toHaveBeenCalled();
+    expect(mockInitLlama).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("handing the runtime over between the two GenieX lanes", () => {
+  // One native LlmWrapper serves both, and the two plugins collide on the same
+  // CDSP domain — GenieX only hands HTP sessions over when no llama.cpp
+  // session still holds one. So the previous session must always be released
+  // before the next is created, in BOTH directions.
+  it("releases QAIRT before creating a llama.cpp session", async () => {
+    await loadModel("/files/geniex/models/qwen3/model", { backendModel: bundle() });
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    expect(mockNpuUnload).toHaveBeenCalled();
+    expect(isNpuSession()).toBe(false);
+  });
+
+  it("releases llama.cpp before creating a QAIRT session", async () => {
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    await loadModel("/files/geniex/models/qwen3/model", { backendModel: bundle() });
+    expect(mockNpuUnload).toHaveBeenCalled();
+    expect(isNpuSession()).toBe(true);
+  });
+
+  it("survives a round trip back to llama.cpp", async () => {
+    // The device protocol's step I, in miniature: QAIRT → llama.cpp → QAIRT →
+    // llama.cpp must leave exactly one session standing.
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    await loadModel("/files/geniex/models/qwen3/model", { backendModel: bundle() });
+    await loadModel(genieXGguf().filePath, { backendModel: genieXGguf() });
+    expect(mockNpuLoadLlamaCpp).toHaveBeenCalledTimes(2);
+    expect(isNpuSession()).toBe(false);
+    expect(mockInitLlama).not.toHaveBeenCalled();
   });
 });

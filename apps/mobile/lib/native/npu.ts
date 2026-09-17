@@ -35,6 +35,8 @@ interface NpuNativeModule {
   bundleInfo(modelName: string): Promise<NpuBundleInfo | null>;
   removeBundle(modelName: string): Promise<void>;
   load(configJson: string): Promise<NpuRuntimeInfo>;
+  loadLlamaCpp(configJson: string): Promise<NpuRuntimeInfo>;
+  externalImportDir(): Promise<string | null>;
   generate(messagesJson: string, optionsJson: string): Promise<NpuRawResult>;
   cancel(): void;
   unload(): Promise<void>;
@@ -67,6 +69,54 @@ export interface NpuLoadConfig {
   modelPath?: string | null;
   /** Where the tokenizer is, when it isn't beside the weights. */
   tokenizerPath?: string | null;
+}
+
+/**
+ * A load on the GenieX **llama.cpp** lane (spike). Separate from
+ * {@link NpuLoadConfig} because the two runtimes take different settings and
+ * neither set is valid for the other: QAIRT rejects a non-zero `nCtx`, and
+ * llama.cpp needs one.
+ */
+export interface NpuLlamaCppLoadConfig {
+  /**
+   * The GenieX model name the import registered ("local/gemma-4-e2b-q4-0").
+   * Required: this lane only loads a model the model manager owns, because
+   * only the manager can say which runtime the model is for.
+   */
+  modelName: string;
+  /**
+   * `"hybrid"` (default), `"npu"`, `"gpu"` or `"cpu"`.
+   *
+   * Never omitted on the wire — see {@link npuLoadLlamaCppRequest}.
+   */
+  computeUnit?: GenieXComputeUnit;
+  /** llama.cpp's `n_ctx`. Defaults to 4096 on the native side. */
+  contextSize?: number;
+}
+
+/** The compute-unit aliases `sdk/src/device.cpp` accepts. */
+export type GenieXComputeUnit = "cpu" | "gpu" | "npu" | "hybrid";
+
+/**
+ * What GenieX said about device binding during a llama.cpp load.
+ *
+ * Evidence, not a verdict. `hybrid` resolves to an EMPTY device id, and
+ * `resolve_devices()` returns before logging anything in that case — so an
+ * absent "HTP0" under hybrid means nothing was logged, not that nothing bound.
+ * Load once with `computeUnit: "npu"` to get the explicit sentence.
+ */
+export interface NpuDeviceSelection {
+  /** The matching GenieX log lines, verbatim. */
+  lines?: string[];
+  /** An `HTP0`-shaped ggml device name appeared. */
+  sawHtpDevice?: boolean;
+  /** The ggml Hexagon backend logged at all (`ggml-hex: …`). */
+  sawHexagonBackend?: boolean;
+  /** GenieX resolved a device list and none of it existed. */
+  sawNoValidDevices?: boolean;
+  /** False when the capture could not be narrowed to this load. */
+  scopedToThisLoad?: boolean;
+  error?: string | null;
 }
 
 export interface NpuRuntimeInfo {
@@ -103,6 +153,10 @@ export interface NpuRuntimeInfo {
   loadMs?: number;
   loaded?: boolean;
   loadedModel?: string | null;
+  /** Set only on a llama.cpp load: `n_ctx` the session was created with. */
+  contextSize?: number;
+  /** Set only on a llama.cpp load: what the runtime logged about devices. */
+  deviceSelection?: NpuDeviceSelection;
 }
 
 /** What `probe()` resolves with — either a runtime, or a reason there isn't one. */
@@ -467,6 +521,60 @@ export async function npuLoad(config: NpuLoadConfig): Promise<NpuRuntimeInfo> {
  */
 export function npuLoadRequest(config: NpuLoadConfig): NpuLoadConfig {
   return withoutNulls(config);
+}
+
+/** The compute unit an omitted one means on the llama.cpp lane. */
+export const DEFAULT_GENIEX_COMPUTE_UNIT: GenieXComputeUnit = "hybrid";
+
+/**
+ * The llama.cpp load request as it will be serialised.
+ *
+ * The one rule that is not shared with {@link npuLoadRequest}: `computeUnit` is
+ * always present. GenieX treats an absent or null compute unit as `npu` —
+ *
+ *     if (alias.empty() || alias == kAliasAuto) { alias = kAliasNPU; }
+ *     — sdk/src/device.cpp, v0.4.0
+ *
+ * — which pins one HTP0 session, NOT the hybrid scheduler the SDK's own KDoc
+ * claims null selects. So the alias is filled in here and sent explicitly, and
+ * null is never used as a stand-in for hybrid.
+ *
+ * Exported for the tests.
+ */
+export function npuLoadLlamaCppRequest(
+  config: NpuLlamaCppLoadConfig,
+): NpuLlamaCppLoadConfig {
+  return withoutNulls({
+    ...config,
+    computeUnit: config.computeUnit ?? DEFAULT_GENIEX_COMPUTE_UNIT,
+  });
+}
+
+/**
+ * Creates a GenieX llama.cpp session over an imported GGUF.
+ *
+ * Distinct from {@link npuLoad}, which is the QAIRT path. Both end up holding
+ * the same single native `LlmWrapper`, so loading either releases the other.
+ */
+export async function npuLoadLlamaCpp(
+  config: NpuLlamaCppLoadConfig,
+): Promise<NpuRuntimeInfo> {
+  if (!moduleAvailable()) throw new Error("No Qualcomm GenieX runtime in this build.");
+  return Npu!.loadLlamaCpp(JSON.stringify(npuLoadLlamaCppRequest(config)));
+}
+
+/**
+ * A directory `adb push` can write and this app can read without a runtime
+ * permission, for side-loading a GGUF into the spike. Null when there is no
+ * runtime in this build, or when external storage is unavailable.
+ */
+export async function npuExternalImportDir(): Promise<string | null> {
+  if (!moduleAvailable()) return null;
+  try {
+    return await Npu!.externalImportDir();
+  } catch {
+    return null;
+  }
 }
 
 /**

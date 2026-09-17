@@ -11,6 +11,7 @@ import {
 } from "llama.rn";
 import type { LlmOptions, GenerateOptions, ModelInfo } from "./types";
 import { npuBackend } from "./backends/npu-instance";
+import { genieXLlamaCppBackend } from "./backends/geniex-llamacpp-instance";
 import { isNpuModel } from "../models/npu-compat";
 
 export interface CompletionMessage {
@@ -86,6 +87,11 @@ let currentModelPath: string | null = null;
 // loading either releases the other, because both are multi-gigabyte
 // allocations and a phone that holds two of them holds neither for long.
 let npuModel: import("./backends/types").BackendModelRef | null = null;
+// The GenieX llama.cpp session (spike), when one is loaded. Kept in its OWN
+// variable rather than folded into `npuModel`: the two share the native
+// wrapper and its lifecycle, but not their claims. `isNpuSession()` means
+// QAIRT, and a GGUF running across HTP and CPU must not turn it true.
+let genieXLlamaModel: import("./backends/types").BackendModelRef | null = null;
 let currentContextSize: number = DEFAULT_OPTIONS.contextSize;
 // Set by stopGeneration(), read+cleared by the active generate(). Distinguishes a
 // user-initiated Stop from a natural finish (the native layer exposes no such flag).
@@ -134,13 +140,31 @@ export function estimatePromptTokens(messages: CompletionMessage[]): number {
 
 export function getModelInfo(): ModelInfo {
   return {
-    loaded: context !== null || npuModel !== null,
+    loaded: context !== null || genieXSession() !== null,
     path: currentModelPath ?? undefined,
   };
 }
 
 export function isLoaded(): boolean {
-  return context !== null || npuModel !== null;
+  return context !== null || genieXSession() !== null;
+}
+
+/**
+ * The GenieX session that is loaded, with the backend that owns it.
+ *
+ * One native `LlmWrapper` serves both GenieX lanes, so at most one of these is
+ * ever set — but they are tracked separately because they answer to different
+ * backends and may claim different things about the hardware.
+ */
+function genieXSession(): {
+  model: import("./backends/types").BackendModelRef;
+  backend: import("./backends/types").ModelBackend;
+} | null {
+  if (npuModel) return { model: npuModel, backend: npuBackend };
+  if (genieXLlamaModel) {
+    return { model: genieXLlamaModel, backend: genieXLlamaCppBackend };
+  }
+  return null;
 }
 
 /**
@@ -190,6 +214,26 @@ export function loadModel(
       currentContextSize = backendModel.contextSize;
       // The Qualcomm path has no llama.cpp KV cache to describe, and saying
       // "f16" about one that doesn't exist would be a made-up fact.
+      currentKvCacheType = "n/a";
+      kvStateDirty = false;
+      return;
+    }
+
+    // A GGUF the GenieX model manager owns goes to the GenieX llama.cpp lane.
+    // Asked of the backend rather than decided here, so the one definition of
+    // "this row belongs to that runtime" lives with the backend that has to
+    // honour it. Every other GGUF falls through to llama.rn below — which is
+    // the fallback, and is reached by falling through rather than by any
+    // catch: a failed GenieX load throws, it does not quietly land on the CPU.
+    if (backendModel && genieXLlamaCppBackend.supports(backendModel)) {
+      if (genieXLlamaModel && genieXLlamaModel.filePath === modelPath) return;
+      await releaseAll();
+      await genieXLlamaCppBackend.load(backendModel);
+      genieXLlamaModel = backendModel;
+      currentModelPath = modelPath;
+      currentContextSize = backendModel.contextSize;
+      // GenieX exposes no KV state save/load from Kotlin at 0.4.0, so there is
+      // no session cache on this path either — see supportsKvSessionCache.
       currentKvCacheType = "n/a";
       kvStateDirty = false;
       return;
@@ -277,6 +321,10 @@ async function releaseAll(): Promise<void> {
     await npuBackend.unload().catch(() => {});
     npuModel = null;
   }
+  if (genieXLlamaModel) {
+    await genieXLlamaCppBackend.unload().catch(() => {});
+    genieXLlamaModel = null;
+  }
   currentModelPath = null;
 }
 
@@ -289,8 +337,9 @@ export function generate(
     // Fresh turn: clear any stale stop request so it can't leak across turns.
     stopRequested = false;
 
-    if (npuModel) {
-      const result = await npuBackend.generate(
+    const gx = genieXSession();
+    if (gx) {
+      const result = await gx.backend.generate(
         messages,
         {
           maxTokens: options?.maxTokens,
@@ -519,8 +568,9 @@ export function stopGeneration(): Promise<void> {
   if (context) {
     return Promise.resolve(context.stopCompletion());
   }
-  if (npuModel) {
-    npuBackend.stop();
+  const gx = genieXSession();
+  if (gx) {
+    gx.backend.stop?.();
   }
   return Promise.resolve();
 }

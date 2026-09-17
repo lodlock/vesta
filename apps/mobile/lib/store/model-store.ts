@@ -54,6 +54,10 @@ import {
 } from "../models/npu-bundle";
 import { isNpuModel } from "../models/npu-compat";
 import {
+  genieXImportRequest,
+  genieXImportedRow,
+} from "../models/geniex-gguf-import";
+import {
   pullabilityIndex,
   pullabilityOf,
   MANUAL_EXPORT_EXPLANATION,
@@ -240,6 +244,15 @@ interface ModelState {
   installHubModel: (m: CompatibleHubModel) => Promise<void>;
   installNpuModel: (model: NpuCatalogModel) => Promise<void>;
   importNpuBundle: (model: NpuCatalogModel, uri: string) => Promise<void>;
+  /**
+   * SPIKE: registers a side-loaded GGUF directory with the GenieX model
+   * manager and adds it as a `geniex_llama_cpp` row.
+   *
+   * Deliberately not on the Models screen and not fed by a catalog — it exists
+   * so the llama.cpp lane can be driven on a real device. See
+   * lib/models/geniex-gguf-import.
+   */
+  importGenieXGguf: (localPath: string, displayName: string) => Promise<void>;
   cancelNpuInstall: (id: string) => Promise<void>;
   verifyNpuBundle: (id: string) => Promise<void>;
   downloadFromCatalog: (model: CatalogModel) => Promise<void>;
@@ -1500,6 +1513,57 @@ export const useModelStore = create<ModelState>((set, get) => ({
   //      the trust decision. We hash it anyway and keep that as a baseline, so
   //      an unexpected change to the file later is detectable. That is
   //      integrity from import onwards; it says nothing about provenance.
+  importGenieXGguf: async (localPath: string, displayName: string) => {
+    set({ busy: true, error: null });
+    const request = genieXImportRequest(localPath, displayName);
+    try {
+      if (
+        get().installed.some((m) => m.runtimeModelName === request.modelName)
+      ) {
+        set({ error: `${displayName} is already imported.` });
+        return;
+      }
+
+      // The same native import the QAIRT path uses, with GGUF-shaped
+      // arguments. `hub` is pinned to LOCALFS by the native side.
+      const bundle = await npuImportBundle({
+        modelName: request.modelName,
+        localPath: request.localPath,
+        displayName: request.displayName,
+        precision: request.precision,
+      });
+
+      // The manifest's own word, before a row exists. The manager infers
+      // `plugin_id = "llama_cpp"` for any directory of GGUFs; anything else
+      // means this is not the lane that should own it, and the import is undone
+      // rather than left behind as a row nothing can load.
+      if (bundle.runtimeId !== "llama_cpp") {
+        await npuRemoveBundle(request.modelName).catch(() => {});
+        set({
+          error:
+            `${displayName} imported as a ${bundle.runtimeId ?? "runtime-less"} ` +
+            "model, not a GenieX llama.cpp GGUF. It has been removed.",
+        });
+        return;
+      }
+
+      await insertModel(
+        genieXImportedRow(bundle, {
+          displayName,
+          modelName: request.modelName,
+        }),
+      );
+      await get().refresh();
+    } catch (err) {
+      // Nothing half-imported is left behind: the manager's copy goes even if
+      // it was the row insert that failed.
+      await npuRemoveBundle(request.modelName).catch(() => {});
+      set({ error: `${displayName}: ${describeGenieXFailure(err)}` });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
   importLocalModel: async (
     uri: string,
     name: string,
@@ -1805,7 +1869,13 @@ export const useModelStore = create<ModelState>((set, get) => ({
     // file_path points INTO the GenieX cache, and unlinking one file out of a
     // multi-file bundle would leave the rest stranded and the manager still
     // believing it has the model.
-    if (isNpuModel(model) && model.runtimeModelName) {
+    //
+    // The test is OWNERSHIP — a `runtime_model_name` — not the artifact type.
+    // It used to be `isNpuModel(model) && …`, which was the same set while
+    // every GenieX-owned row was a QAIRT bundle. A GenieX llama.cpp GGUF is
+    // artifact `gguf` and would have fallen to the unlink branch, quietly
+    // removing one file out of the manager's model directory.
+    if (model.runtimeModelName) {
       await npuRemoveBundle(model.runtimeModelName).catch(() => {});
     } else {
       await deleteModelFile(model.filePath);

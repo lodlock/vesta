@@ -25,7 +25,7 @@ import {
   type SessionCacheInfo,
 } from "../lib/llm/session-cache";
 import { getLastRun, reportedOr, type RunRecord } from "../lib/llm/run-record";
-import { backendDiagnostics } from "../lib/llm/backends/registry";
+import { backendDiagnostics, genieXLlamaCpp } from "../lib/llm/backends/registry";
 import type { BackendDiagnostics } from "../lib/llm/backends/types";
 import { getStartupTrace, type StartupTrace } from "../lib/dev/startup-trace";
 import {
@@ -33,6 +33,7 @@ import {
   getAssistModelTurns,
   type AssistTurnTrace,
 } from "../lib/assist/assist-trace";
+import * as FileSystem from "expo-file-system/legacy";
 import { getDatabaseSizeBytes } from "../lib/storage/database";
 import { getActiveModel } from "../lib/models/model-registry";
 import type { InstalledModel } from "../lib/models/types";
@@ -51,7 +52,13 @@ import {
   npuHubListProbe,
   npuGenieXLogReport,
   npuInstalledReport,
+  npuExternalImportDir,
+  type GenieXComputeUnit,
 } from "../lib/native/npu";
+import {
+  pickSpikeGguf,
+  GENIEX_SPIKE_DIR,
+} from "../lib/models/geniex-gguf-import";
 import { formatPullTrace, lastPulledModelName } from "../lib/models/npu-pull-trace";
 import {
   buildReports,
@@ -299,6 +306,15 @@ export default function DiagnosticsScreen() {
   // without an NPU bridge, and until the button is pressed on one that has it.
   const [probeParts, setProbeParts] = useState<DiagnosticsSection[]>([]);
 
+  // GenieX llama.cpp spike. Local to this screen because the lane has no other
+  // entry point and is not meant to acquire one yet.
+  const [spikeDir, setSpikeDir] = useState<string | null>(null);
+  const [spikeBusy, setSpikeBusy] = useState(false);
+  const [spikeNote, setSpikeNote] = useState<string | null>(null);
+  const [spikeCompute, setSpikeCompute] = useState<GenieXComputeUnit>(
+    genieXLlamaCpp().getComputeUnit(),
+  );
+
   // Gathered state. It lives ABOVE runProbe because the report leads with the
   // device's identity, and a probe result with no device attached to it is
   // most of a page about a machine the reader cannot name.
@@ -311,6 +327,59 @@ export default function DiagnosticsScreen() {
   }, []);
 
   useEffect(refresh, [refresh]);
+
+  // Where `adb push` should put the GGUF. Asked once: it is a property of the
+  // install (package name and user id), not something this screen can compose.
+  useEffect(() => {
+    let live = true;
+    npuExternalImportDir()
+      .then((dir) => {
+        if (live) setSpikeDir(dir);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  /**
+   * Imports the one GGUF sitting in the push directory.
+   *
+   * The directory is listed HERE, before the native side is called, so the two
+   * refusals that matter arrive as sentences rather than as a manifest
+   * inference failure several seconds later: nothing to import, and — the one
+   * this spike exists to enforce — an artifact that is not Q4_0.
+   */
+  const importSpikeGguf = useCallback(async () => {
+    if (!spikeDir) return;
+    setSpikeBusy(true);
+    setSpikeNote(null);
+    const dir = `file://${spikeDir}/${GENIEX_SPIKE_DIR}`;
+    try {
+      let names: string[] = [];
+      try {
+        names = await FileSystem.readDirectoryAsync(dir);
+      } catch {
+        setSpikeNote(`Nothing at ${spikeDir}/${GENIEX_SPIKE_DIR}/ — create it and push a GGUF.`);
+        return;
+      }
+      const pick = pickSpikeGguf(names);
+      if (!pick.ok) {
+        setSpikeNote(pick.reason);
+        return;
+      }
+      // The DIRECTORY is what LOCALFS takes — a bare .gguf path is refused as
+      // "a file but not a .zip". See lib/models/geniex-gguf-import.
+      await useModelStore
+        .getState()
+        .importGenieXGguf(`${spikeDir}/${GENIEX_SPIKE_DIR}`, pick.displayName);
+      const err = useModelStore.getState().error;
+      setSpikeNote(err ?? `Imported ${pick.file}. Activate it from Models.`);
+      refresh();
+    } finally {
+      setSpikeBusy(false);
+    }
+  }, [spikeDir, refresh]);
 
   // Stamped when the state was gathered, not when the button was pressed: the
   // report's "captured" line should name the moment the numbers are from.
@@ -717,6 +786,59 @@ export default function DiagnosticsScreen() {
                 </TouchableOpacity>
               </View>
             </View>
+
+            {/* ── GenieX llama.cpp lane (SPIKE) ──────────────────────────
+                A test harness, not a feature. It exists so the second GenieX
+                runtime can be driven on a real device; there is no catalog
+                behind it and nothing on the Models screen offers it. The
+                compute-unit buttons are here and ONLY here for the same
+                reason — `npu` is the alias that makes GenieX log the explicit
+                "Found device: HTP0" sentence, so it is the one that proves
+                binding, while `hybrid` is the one that should be fast. */}
+            <Text style={styles.sectionTitle}>GenieX llama.cpp (spike)</Text>
+            <View style={styles.card}>
+              <Text style={styles.probeKey}>Push a Q4_0 GGUF here:</Text>
+              <Text style={styles.probeVal} selectable>
+                {spikeDir ? `${spikeDir}/${GENIEX_SPIKE_DIR}/` : "…"}
+              </Text>
+              <Row label="Compute unit" value={spikeCompute} />
+              {spikeNote && <Text style={styles.hint}>{spikeNote}</Text>}
+              <View style={styles.probeActions}>
+                {(["hybrid", "npu"] as const).map((unit) => (
+                  <TouchableOpacity
+                    key={unit}
+                    style={styles.probeBtn}
+                    onPress={() => {
+                      setSpikeCompute(unit);
+                      genieXLlamaCpp().setComputeUnit(unit);
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.probeBtnText}>
+                      {spikeCompute === unit ? `• ${unit}` : unit}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+                <TouchableOpacity
+                  style={styles.probeBtn}
+                  onPress={importSpikeGguf}
+                  disabled={spikeBusy || !spikeDir}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.probeBtnText}>
+                    {spikeBusy ? "Importing…" : "Import GGUF"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={styles.hint}>
+                Registers the directory with the GenieX model manager
+                (HubSource.LOCALFS) and adds it as a geniex_llama_cpp row —
+                then activate it from Models like any other. The compute unit
+                applies to the NEXT load, so switch it before activating.
+                &ldquo;hybrid&rdquo; is HTP + CPU by design and logs no device
+                list; &ldquo;npu&rdquo; pins HTP0 and says so in the log.
+              </Text>
+            </View>
           </>
         )}
 
@@ -805,6 +927,74 @@ export default function DiagnosticsScreen() {
                       exists at all is an NPU session.
                     </Text>
                   )}
+                </>
+              )}
+              {backend.id === "geniex_llama_cpp" && (
+                <>
+                  <Row
+                    label="Requested runtime"
+                    value={String(backend.details.requestedRuntime)}
+                  />
+                  <Row
+                    label="Requested compute"
+                    value={String(backend.details.requestedComputeUnit)}
+                  />
+                  <Row
+                    label="Manifest runtime"
+                    value={String(backend.details.manifestRuntime)}
+                  />
+                  <Row
+                    label="Context"
+                    value={reportedOr(
+                      Number(backend.details.contextSize),
+                      "tokens",
+                    )}
+                  />
+                  {/* The device-binding evidence. Read the caveat below before
+                      reading a false here as a negative. */}
+                  <Row
+                    label="Saw HTPn device"
+                    value={backend.details.sawHtpDevice ? "yes" : "no"}
+                  />
+                  <Row
+                    label="Saw ggml-hexagon"
+                    value={backend.details.sawHexagonBackend ? "yes" : "no"}
+                  />
+                  {backend.details.sawNoValidDevices === true && (
+                    <Text style={styles.hint}>
+                      GenieX resolved a device list and found none of it. This
+                      session is NOT on the Hexagon DSP.
+                    </Text>
+                  )}
+                  {String(backend.details.deviceLines) !== "" && (
+                    <>
+                      <Text style={styles.probeKey}>
+                        Device lines{" "}
+                        {backend.details.deviceEvidenceScoped
+                          ? "(this load)"
+                          : "(UNSCOPED — may predate this load)"}
+                        :
+                      </Text>
+                      <Text style={styles.probeVal} selectable>
+                        {String(backend.details.deviceLines)}
+                      </Text>
+                    </>
+                  )}
+                  {String(backend.details.lastError) !== "" && (
+                    <Text style={styles.hint}>
+                      Last error: {String(backend.details.lastError)}
+                    </Text>
+                  )}
+                  <Text style={styles.hint}>
+                    This lane is not an NPU claim. With compute_unit = hybrid
+                    GenieX passes an EMPTY device id and llama.cpp schedules per
+                    tensor across the Hexagon DSP and the CPU — so some of the
+                    work is on the CPU by design, and `resolve_devices()`
+                    returns before logging a device list at all. An absent
+                    &ldquo;HTPn&rdquo; under hybrid is silence, not a negative;
+                    load once with compute_unit = npu for the explicit
+                    &ldquo;Found device: HTP0&rdquo; line.
+                  </Text>
                 </>
               )}
             </View>

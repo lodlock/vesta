@@ -11,7 +11,7 @@
 // and the screen shows only what it was told. A field the runtime does not
 // report stays undefined and is displayed as "not reported", never as zero.
 
-export type RunBackendId = "llama_cpp" | "qualcomm_npu";
+export type RunBackendId = "llama_cpp" | "qualcomm_npu" | "geniex_llama_cpp";
 
 export interface RunRecord {
   backend: RunBackendId;
