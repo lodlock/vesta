@@ -29,9 +29,19 @@ const mockDeviceChipset = jest.fn(async () => ({
 const mockIsNpuBuild = jest.fn(() => true);
 const mockGetDeviceInfo = jest.fn(async () => ({ soc: "SM8850" }));
 
+const mockSetComputeUnit = jest.fn();
+
 jest.mock("../../llm/backends/registry", () => ({
   setDeviceSoc: (...a: unknown[]) => mockSetDeviceSoc(...a),
   setRuntimeChipsets: (...a: unknown[]) => mockSetRuntimeChipsets(...a),
+  genieXLlamaCpp: () => ({ setComputeUnit: mockSetComputeUnit }),
+}));
+// Readiness also puts the remembered GenieX compute unit back on the backend.
+// Mocked at the module rather than at the database it reads, so this file stays
+// about ORDERING and does not acquire a SQLite dependency —
+// __tests__/geniex-compute.test.ts owns the storage half.
+jest.mock("../geniex-compute", () => ({
+  loadGenieXComputeUnit: jest.fn(async () => "npu"),
 }));
 jest.mock("../../native/system-actions", () => ({
   getDeviceInfo: () => mockGetDeviceInfo(),
@@ -52,6 +62,11 @@ beforeEach(() => {
 });
 
 describe("on an NPU build with a working runtime", () => {
+  it("restores the remembered compute unit, so a load is not built on a default", async () => {
+    await prepareNpuBackend();
+    expect(mockSetComputeUnit).toHaveBeenCalledWith("npu");
+  });
+
   it("tells the backend the chipset before anything else", async () => {
     await prepareNpuBackend();
     expect(mockSetDeviceSoc).toHaveBeenCalledWith("SM8850");

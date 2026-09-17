@@ -12,8 +12,9 @@ import {
 import type { LlmOptions, GenerateOptions, ModelInfo } from "./types";
 import { npuBackend } from "./backends/npu-instance";
 import { genieXLlamaCppBackend } from "./backends/geniex-llamacpp-instance";
-import { isNpuModel } from "../models/npu-compat";
+import { routeModel } from "./backends/routing";
 import type { BackendModelRef, ModelBackend } from "./backends/types";
+import type { ModelBackendId } from "../models/types";
 
 export interface CompletionMessage {
   role: "system" | "user" | "assistant";
@@ -173,6 +174,14 @@ function fingerprintFor(
  * hardware they did not select, labelled as the hardware they did.
  */
 export function sessionMatches(model: BackendModelRef): boolean {
+  // A session on the WRONG runtime never matches, whatever its path says.
+  // The GenieX lane and llama.rn address the same bytes on disk, so a file-path
+  // comparison alone called a CPU session a match for a Hexagon model and left
+  // re-activation with nothing to do — the state that turned a one-off bad
+  // restore into one that could not be corrected from the Models screen.
+  if (loadedBackendId() !== null && loadedBackendId() !== routeModel(model).lane) {
+    return false;
+  }
   if (npuModel) {
     return (
       npuModel.filePath === model.filePath &&
@@ -199,6 +208,20 @@ export function getModelInfo(): ModelInfo {
 
 export function isLoaded(): boolean {
   return context !== null || genieXSession() !== null;
+}
+
+/**
+ * Which runtime actually owns the live session, or null when nothing is loaded.
+ *
+ * Not "which runtime should own it" — that is `routeModel()`, and the whole
+ * point of having both is that they can disagree. Diagnostics prints them side
+ * by side, because "loaded: yes" under a model registered for Hexagon while
+ * llama.rn holds the session is the exact shape of the bug this answers.
+ */
+export function loadedBackendId(): ModelBackendId | null {
+  if (npuModel) return "qualcomm_npu";
+  if (genieXLlamaModel) return "geniex_llama_cpp";
+  return context !== null ? "llama_cpp" : null;
 }
 
 /**
@@ -250,12 +273,17 @@ export function loadModel(
 ): Promise<void> {
   return withLock(async () => {
     const backendModel = options?.backendModel;
+    // Which lane this model BELONGS to — its row's own `backend` where it has
+    // one, the artifact-and-capability order where it does not. Asked once,
+    // before anything is loaded, so that no branch below can be reached by a
+    // model that a different lane has a claim on. See backends/routing.ts.
+    const lane = backendModel ? routeModel(backendModel).lane : "llama_cpp";
 
-    // An NPU bundle goes to the Qualcomm backend and nowhere else. The decision
-    // is made from the registry row's ARTIFACT, not from the path or the file
-    // name — a `.bin` could be anything, and guessing here is how a context
-    // binary ends up being handed to llama.cpp.
-    if (backendModel && isNpuModel(backendModel)) {
+    // A Qualcomm bundle goes to the QAIRT backend and nowhere else. The
+    // decision comes from the registry row, not from the path or the file name
+    // — a `.bin` could be anything, and guessing here is how a context binary
+    // ends up being handed to llama.cpp.
+    if (backendModel && lane === "qualcomm_npu") {
       const fingerprint = fingerprintFor(npuBackend, backendModel);
       // Same model AND same load configuration. QAIRT declares no fingerprint
       // (its compute unit is pinned in Kotlin), so both sides are null and this
@@ -283,12 +311,16 @@ export function loadModel(
     }
 
     // A GGUF the GenieX model manager owns goes to the GenieX llama.cpp lane.
-    // Asked of the backend rather than decided here, so the one definition of
-    // "this row belongs to that runtime" lives with the backend that has to
-    // honour it. Every other GGUF falls through to llama.rn below — which is
-    // the fallback, and is reached by falling through rather than by any
-    // catch: a failed GenieX load throws, it does not quietly land on the CPU.
-    if (backendModel && genieXLlamaCppBackend.supports(backendModel)) {
+    //
+    // This used to ask `genieXLlamaCppBackend.supports()` directly, and that
+    // was the restore bug: `supports()` is false until the runtime probe has
+    // finished, so on a cold start a GenieX-managed GGUF fell through to
+    // llama.rn — which loaded the same file happily, on the CPU, under the
+    // accelerated model's name. Routing now reads the row's declared runtime,
+    // which does not move between boots, and a declared row that this lane
+    // cannot load fails here with the lane's own words rather than landing
+    // below. Every other GGUF still reaches llama.rn by falling through.
+    if (backendModel && lane === "geniex_llama_cpp") {
       const fingerprint = fingerprintFor(genieXLlamaCppBackend, backendModel);
       // The reason this is not a path comparison: the compute unit is chosen
       // per load, so the same file loaded as `npu` and as `hybrid` are two

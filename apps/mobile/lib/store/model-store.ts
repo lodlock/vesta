@@ -907,6 +907,7 @@ async function runActivation(
       backendModel: backendModelRef({
         filePath: model.filePath,
         artifact: model.artifact,
+        backend: model.backend,
         contextSize: model.contextSize,
         displayName: model.displayName,
         chatTemplate: model.chatTemplate,

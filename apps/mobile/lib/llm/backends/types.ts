@@ -12,12 +12,18 @@
 // can. A model no accelerated backend claims falls back to llama.cpp, which is
 // the one that can always run — that fallback is a requirement, not a nicety.
 
-import type { ModelArtifact } from "../../models/types";
+import type { ModelArtifact, ModelBackendId } from "../../models/types";
 
 /** What a backend needs to know about a model to answer `supports()`. */
 export interface BackendModelRef {
   filePath: string;
   artifact: ModelArtifact;
+  // The runtime the REGISTRY ROW declares — written at install or import, and
+  // a fact about the file rather than about this boot. Routing reads it first
+  // and binds the model to that lane; see backends/routing.ts for why a
+  // capability answer alone was not enough. Undefined for a caller that has a
+  // path and nothing else, and for rows written before the column existed.
+  backend?: ModelBackendId;
   contextSize: number;
   displayName: string;
   // The SoC the artifact was compiled for ("SM8850"). Null for portable

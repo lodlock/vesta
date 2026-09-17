@@ -114,7 +114,19 @@ describe("what the lane claims", () => {
     mockRuntimeAvailable = false;
     const backend = new GenieXLlamaCppBackend();
     expect(backend.supports(owned())).toBe(false);
-    expect(backend.refusalFor(owned())).toBe("The runtime did not start.");
+    // The runtime's own sentence, kept verbatim — it is the only part that says
+    // anything specific about what went wrong.
+    expect(backend.refusalFor(owned())).toContain("The runtime did not start.");
+  });
+
+  it("does not offer the CPU as a fallback for a model it owns", () => {
+    // Routing binds a GenieX-managed row to this lane, so a refusal here is a
+    // load failure. Words promising that the model "runs on llama.cpp (CPU)"
+    // described the behaviour that was the bug — see backends/routing.ts.
+    mockRuntimeAvailable = false;
+    const refusal = new GenieXLlamaCppBackend().refusalFor(owned());
+    expect(refusal).toContain("can only run on the GenieX llama.cpp runtime");
+    expect(refusal).not.toMatch(/llama\.cpp \(CPU\)/);
   });
 });
 

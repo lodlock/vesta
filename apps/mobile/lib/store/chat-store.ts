@@ -36,6 +36,7 @@ import { clearPrefixSessionCache } from "../llm/session-cache";
 import { persistFailureNotice, modelLoadFailureNotice } from "./notices";
 import { startVestaService } from "../native/vesta-service";
 import { prepareNpuBackend } from "../models/npu-ready";
+import { needsQualcommRuntime } from "../models/npu-compat";
 import { backendModelRef } from "../llm/backends/registry";
 import { timePhase, markSkippedModel } from "../dev/startup-trace";
 import * as FileSystem from "expo-file-system/legacy";
@@ -181,7 +182,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         // the assistant would otherwise reach this line with neither and turn
         // a working NPU model into "this device doesn't report its chipset".
         // A no-op in a default build; cached for the process in an NPU one.
-        if (active.artifact !== "gguf") await prepareNpuBackend();
+        //
+        // Asked of the row's RUNTIME, not its artifact. A GenieX llama.cpp
+        // model is a GGUF, so the artifact test skipped the probe for exactly
+        // the model that most needed it — see needsQualcommRuntime.
+        if (needsQualcommRuntime(active)) await prepareNpuBackend();
         // An NPU bundle is a directory the GenieX model manager owns and
         // resolves by name; `file_path` points inside it, so a plain
         // file-exists check is the wrong question — the backend's own load
@@ -203,6 +208,9 @@ export const useChatStore = create<ChatState>((set, get) => {
             backendModel: backendModelRef({
               filePath: active.filePath,
               artifact: active.artifact,
+              // The row's own runtime. Without it a restored GenieX model is
+              // indistinguishable from a portable GGUF and lands on the CPU.
+              backend: active.backend,
               contextSize: active.contextSize,
               displayName: active.displayName,
               chatTemplate: active.chatTemplate,

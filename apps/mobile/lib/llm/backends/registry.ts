@@ -14,7 +14,7 @@ import { LlamaCppBackend } from "./llamacpp-backend";
 import { npuBackend } from "./npu-instance";
 import { genieXLlamaCppBackend } from "./geniex-llamacpp-instance";
 import type { BackendDiagnostics, BackendModelRef, ModelBackend } from "./types";
-import type { InstalledModel } from "../../models/types";
+import type { InstalledModel, ModelBackendId } from "../../models/types";
 import type { RuntimeChipset } from "../../models/chipset-identity";
 
 // Accelerated first, general-purpose last.
@@ -86,6 +86,7 @@ export function backendModelRef(model: {
   contextSize: number;
   displayName?: string;
   artifact?: InstalledModel["artifact"];
+  backend?: ModelBackendId;
   chatTemplate?: string | null;
   targetSoc?: string | null;
   runtimeVersion?: string | null;
@@ -98,6 +99,10 @@ export function backendModelRef(model: {
     // Rows carry their artifact type; the extension is only a fallback for a
     // caller that has a path and nothing else.
     artifact: model.artifact ?? "gguf",
+    // Carried through UNDEFAULTED. "llama_cpp" here would be a declaration,
+    // and a caller that simply does not know which runtime a path belongs to
+    // must not make one on the row's behalf — see backends/routing.ts.
+    backend: model.backend,
     contextSize: model.contextSize,
     displayName: model.displayName ?? model.filePath.split("/").pop() ?? "model",
     chatTemplate: model.chatTemplate ?? null,

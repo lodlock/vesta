@@ -170,3 +170,24 @@ export function checkNpuCompatibility(
 export function isNpuModel(model: Pick<InstalledModel, "artifact">): boolean {
   return NPU_ARTIFACTS.has(model.artifact);
 }
+
+/**
+ * Whether loading this row needs a Qualcomm runtime to be ready first.
+ *
+ * NOT the same question as `isNpuModel()`, and that is the whole reason it
+ * exists. A GenieX llama.cpp model's artifact is `gguf` — correctly, it IS a
+ * GGUF — so every check shaped like "artifact !== 'gguf'" reads it as an
+ * ordinary portable file. The startup restore was one of those checks: it
+ * awaited the runtime probe only for non-GGUF artifacts, so a GenieX-managed
+ * model reached its load with the probe still in flight, the lane reporting
+ * itself unavailable, and llama.rn quietly taking the file.
+ *
+ * The honest question is about OWNERSHIP, which the `backend` column records.
+ * The artifact test stays beside it for rows written before that column, where
+ * a Qualcomm artifact is the only evidence there is.
+ */
+export function needsQualcommRuntime(
+  model: Pick<InstalledModel, "artifact" | "backend">,
+): boolean {
+  return model.backend !== "llama_cpp" || isNpuModel(model);
+}

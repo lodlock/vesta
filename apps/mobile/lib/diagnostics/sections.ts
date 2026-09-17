@@ -41,6 +41,7 @@ import {
   type PullabilityCounts,
 } from "../models/npu-pullability";
 import type { DiagnosticsSection } from "./report";
+import type { ModelBackendId } from "../models/types";
 
 /**
  * What is worth knowing about the hub without reprinting it.
@@ -169,4 +170,39 @@ export function probeSections(input: ProbeSectionInput): DiagnosticsSection[] {
       full: genieXLog ? formatGenieXLog(genieXLog, "full") : "",
     },
   ];
+}
+
+/** How each runtime is named on the device-state line. */
+const RUNTIME_LABELS: Record<ModelBackendId, string> = {
+  llama_cpp: "llama.cpp (CPU)",
+  geniex_llama_cpp: "Qualcomm GenieX / llama.cpp",
+  qualcomm_npu: "Qualcomm NPU (QAIRT)",
+};
+
+/**
+ * The "loaded:" line — which runtime actually owns the session, and whether
+ * that is the one the active row is registered for.
+ *
+ * "loaded: yes" on its own was the line that hid this bug for a whole session.
+ * It is true of ANY live session, so a GenieX-registered model restored onto
+ * llama.rn read as a working accelerated model; the only contradiction was a
+ * token rate in a different section, several screens down. A claim about
+ * loading now has to name the runtime making it, and a disagreement between
+ * the live session and the row is stated as one rather than left to be
+ * inferred.
+ *
+ * @param owner   the runtime holding the session, null when nothing is loaded
+ * @param declared the runtime the active row is registered for, when it has one
+ */
+export function describeLoadedRuntime(
+  owner: ModelBackendId | null,
+  declared: ModelBackendId | null,
+): string {
+  if (!owner) return "no";
+  const running = RUNTIME_LABELS[owner];
+  if (!declared || declared === owner) return `yes — on ${running}`;
+  return (
+    `yes — on ${running}, but the active model is registered for ` +
+    `${RUNTIME_LABELS[declared]} (BACKEND MISMATCH)`
+  );
 }

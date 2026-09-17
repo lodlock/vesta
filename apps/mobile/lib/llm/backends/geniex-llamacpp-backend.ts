@@ -184,10 +184,19 @@ export class GenieXLlamaCppBackend implements ModelBackend {
       return "This GGUF is not registered with the GenieX model manager, so it runs on llama.cpp (CPU).";
     }
     if (!this.isAvailable()) {
-      return isNpuBuild()
+      // Reached only by a model this lane OWNS — the runtimeModelName guard
+      // above has already sent every portable GGUF to llama.cpp. So these words
+      // must not promise a CPU fallback: routing binds a GenieX-managed row to
+      // this lane, and a refusal here is a load failure, not a redirection.
+      // The runtime's own sentence is kept whole and put after ours, rather
+      // than spliced into the middle of it: it is the only part of this that
+      // says anything specific, and reshaping it is how it stops matching what
+      // the SDK actually reported.
+      const why = isNpuBuild()
         ? (npuUnavailableReason() ??
           "The Qualcomm GenieX runtime has not been probed yet.")
-        : "No Qualcomm GenieX runtime in this build — models run on llama.cpp (CPU).";
+        : "There is no Qualcomm GenieX runtime in this build.";
+      return `${model.displayName} is managed by the GenieX model manager and can only run on the GenieX llama.cpp runtime. ${why}`;
     }
     return null;
   }

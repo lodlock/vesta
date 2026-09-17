@@ -18,7 +18,12 @@
 // native module and it returns immediately; on an NPU build the probe is cached
 // for the process, so only the first call pays for the SDK's init.
 
-import { setDeviceSoc, setRuntimeChipsets } from "../llm/backends/registry";
+import {
+  genieXLlamaCpp,
+  setDeviceSoc,
+  setRuntimeChipsets,
+} from "../llm/backends/registry";
+import { loadGenieXComputeUnit } from "./geniex-compute";
 import { getDeviceInfo } from "../native/system-actions";
 import {
   isNpuBuild,
@@ -76,6 +81,25 @@ const UNAVAILABLE: NpuReadiness = {
 // rest, so calling prepare on every boot path is free after the first.
 let cached: NpuReadiness | null = null;
 
+// Whether the remembered compute unit has been put back on the backend this
+// process. Once only: after that the Diagnostics selector owns the value, and
+// re-reading the row would undo a choice made since.
+let computeUnitRestored = false;
+
+/**
+ * Puts the remembered GenieX compute unit back on the backend.
+ *
+ * Part of readiness rather than of startup, because it answers the same
+ * question the rest of this module does: what the backend needs to know before
+ * it is asked to load anything. A session built before this runs is a session
+ * built on a default the user did not choose.
+ */
+async function restoreComputeUnit(): Promise<void> {
+  if (computeUnitRestored) return;
+  computeUnitRestored = true;
+  genieXLlamaCpp().setComputeUnit(await loadGenieXComputeUnit());
+}
+
 /**
  * Tells the NPU backend what device it is on, and whether its runtime works.
  *
@@ -90,6 +114,11 @@ export async function prepareNpuBackend(
   // to report. Returning early also keeps a GGUF-only boot from paying for a
   // device-info call it has no use for.
   if (!isNpuBuild()) return UNAVAILABLE;
+
+  // Before the early return below: prepare is called from the load paths, and
+  // a cached readiness must not mean the pending compute unit is still whatever
+  // the class field was initialised to.
+  await restoreComputeUnit();
 
   if (cached && (soc === undefined || soc === cached.soc)) return cached;
 
@@ -130,4 +159,5 @@ export async function prepareNpuBackend(
 /** Forgets the cached readiness. Only for tests. */
 export function resetNpuReadinessForTests(): void {
   cached = null;
+  computeUnitRestored = false;
 }

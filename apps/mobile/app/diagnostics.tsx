@@ -18,6 +18,7 @@ import {
   getContextSize,
   getKvCacheType,
   getLastCompletion,
+  loadedBackendId,
   type LastCompletionStats,
 } from "../lib/llm/llm-engine";
 import {
@@ -40,7 +41,7 @@ import {
 import * as FileSystem from "expo-file-system/legacy";
 import { getDatabaseSizeBytes } from "../lib/storage/database";
 import { getActiveModel } from "../lib/models/model-registry";
-import type { InstalledModel } from "../lib/models/types";
+import type { InstalledModel, ModelBackendId } from "../lib/models/types";
 import { useModelStore } from "../lib/store/model-store";
 import { breakDownHubModels } from "../lib/models/npu-hub";
 import {
@@ -76,11 +77,13 @@ import { copySummary, shareFullReport } from "../lib/diagnostics/deliver";
 import {
   probeSections,
   formatHubState,
+  describeLoadedRuntime,
   type HubDiag,
 } from "../lib/diagnostics/sections";
 import { countPullability, pullabilityIndex } from "../lib/models/npu-pullability";
 import { NPU_CATALOG } from "../lib/models/npu-catalog";
 import { isNpuModel } from "../lib/models/npu-compat";
+import { saveGenieXComputeUnit } from "../lib/models/geniex-compute";
 import { formatBytes } from "../lib/models/format";
 import { colors, spacing, typography, radii } from "../lib/theme";
 
@@ -88,6 +91,10 @@ interface Diag {
   modelLoaded: boolean;
   modelName: string | null;
   modelPath: string | null;
+  /** Which runtime holds the live session, null when nothing is loaded. */
+  runtimeOwner: ModelBackendId | null;
+  /** Which runtime the active row is registered for. */
+  declaredBackend: ModelBackendId | null;
   contextSize: number;
   kvType: string;
   last: LastCompletionStats | null;
@@ -113,6 +120,8 @@ async function gather(): Promise<Diag> {
     modelLoaded: info.loaded,
     modelName: active?.displayName ?? null,
     modelPath: info.path ?? null,
+    runtimeOwner: loadedBackendId(),
+    declaredBackend: active?.backend ?? null,
     contextSize: getContextSize(),
     kvType: getKvCacheType(),
     last: getLastCompletion(),
@@ -200,7 +209,9 @@ function formatDeviceState(
 
   lines.push(`active model: ${diag.modelName ?? "<none>"}`);
   lines.push(`model file: ${diag.modelPath?.split("/").pop() ?? "<none>"}`);
-  lines.push(`loaded: ${diag.modelLoaded ? "yes" : "no"}`);
+  lines.push(
+    `loaded: ${describeLoadedRuntime(diag.runtimeOwner, diag.declaredBackend)}`,
+  );
   lines.push(`context: ${diag.contextSize} tokens, KV ${diag.kvType}`);
 
   const run = diag.run;
@@ -827,6 +838,9 @@ export default function DiagnosticsScreen() {
                     onPress={() => {
                       setSpikeCompute(unit);
                       genieXLlamaCpp().setComputeUnit(unit);
+                      // Remembered, so the next launch restores the session
+                      // with the unit that was chosen rather than the default.
+                      saveGenieXComputeUnit(unit).catch(() => {});
                     }}
                     activeOpacity={0.7}
                   >
@@ -1075,7 +1089,14 @@ export default function DiagnosticsScreen() {
 
       <Text style={styles.sectionTitle}>Model</Text>
       <View style={styles.card}>
-        <Row label="Status" value={diag?.modelLoaded ? "Loaded" : "Not loaded"} />
+        <Row
+          label="Status"
+          value={
+            diag
+              ? describeLoadedRuntime(diag.runtimeOwner, diag.declaredBackend)
+              : "no"
+          }
+        />
         <Row label="Name" value={diag?.modelName ?? "—"} />
         <Row label="File" value={fileName} />
         <Row label="Context" value={diag ? `${diag.contextSize} tokens` : "—"} />
