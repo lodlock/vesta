@@ -18,11 +18,29 @@
 // So the test is OWNERSHIP, `runtime_model_name`, and both directions of it
 // are pinned here: a managed model is deleted by asking the manager, and an
 // ordinary GGUF is still unlinked.
+//
+// The third section is the INTEGRITY half of the same ownership fact. This file
+// lives in the manager's directory rather than Vesta's, the user put it there
+// by hand, and no repository published it — so no external checksum exists for
+// it and none ever will. The import used to treat that permanent condition as a
+// missing piece: no digest recorded, `unverified` on the row, and a card
+// reading "No checksum on record", which reads as a verdict on the model. It
+// also left the row with nothing for `canVerify()` to compare against, so the
+// one model whose bytes sit outside Vesta's own directory was the only one that
+// could never be checked for change.
 
 import { useModelStore } from "../model-store";
-import { getModelById, insertModel, removeModel } from "../../models/model-registry";
+import {
+  getModelById,
+  insertModel,
+  removeModel,
+  setModelIntegrity,
+  setModelState,
+} from "../../models/model-registry";
 import { npuImportBundle, npuRemoveBundle } from "../../native/npu";
 import { deleteModelFile } from "../../models/download-manager";
+import { checkGgufFile } from "../../models/gguf-header";
+import { sha256File } from "../../native/file-hash";
 import type { InstalledModel } from "../../models/types";
 
 jest.mock("../../storage/database", () => ({
@@ -69,6 +87,10 @@ jest.mock("../../models/download-manager", () => ({
 jest.mock("../../models/gguf-header", () => ({
   checkGgufFile: jest.fn(async () => ({ ok: true })),
 }));
+jest.mock("../../native/file-hash", () => ({
+  ...jest.requireActual("../../native/file-hash"),
+  sha256File: jest.fn(async () => null),
+}));
 jest.mock("../../llm/llm-engine", () => ({
   loadModel: jest.fn(async () => {}),
   unloadModel: jest.fn(async () => {}),
@@ -93,6 +115,15 @@ const mockGetById = getModelById as jest.MockedFunction<typeof getModelById>;
 const mockInsert = insertModel as jest.MockedFunction<typeof insertModel>;
 const mockRemoveRow = removeModel as jest.MockedFunction<typeof removeModel>;
 const mockDeleteFile = deleteModelFile as jest.MockedFunction<typeof deleteModelFile>;
+const mockHeader = checkGgufFile as jest.MockedFunction<typeof checkGgufFile>;
+const mockSha = sha256File as jest.MockedFunction<typeof sha256File>;
+const mockIntegrity = setModelIntegrity as jest.MockedFunction<typeof setModelIntegrity>;
+const mockSetState = setModelState as jest.MockedFunction<typeof setModelState>;
+
+/** The digest the imported bytes hash to. */
+const AT_IMPORT = "d".repeat(64);
+/** …and what they hash to after something edited the file underneath us. */
+const AFTER_EDIT = "e".repeat(64);
 
 const PUSH_DIR = "/storage/emulated/0/Android/data/com.cosmico.vesta/files/geniex-spike";
 
@@ -129,6 +160,8 @@ const managedRow = (over: Partial<InstalledModel> = {}): InstalledModel =>
 beforeEach(() => {
   jest.clearAllMocks();
   useModelStore.setState({ installed: [], error: null, busy: false });
+  mockHeader.mockResolvedValue({ ok: true });
+  mockSha.mockResolvedValue(AT_IMPORT);
 });
 
 describe("importing a side-loaded GGUF", () => {
@@ -239,5 +272,178 @@ describe("deleting what the manager owns", () => {
 
     expect(mockDeleteFile).toHaveBeenCalledWith("file:///docs/models/qwen3-4b-Q4_K_M.gguf");
     expect(mockRemoveBundle).not.toHaveBeenCalled();
+  });
+});
+
+// ── The local integrity baseline ────────────────────────────────────────────
+//
+// What this path may and may not claim:
+//
+//   source        a local file the user supplied
+//   integrity     verified against a baseline computed at import
+//   authenticity  NOT established, and never described as established
+//
+// A digest computed over bytes you were handed cannot say who produced them —
+// the only witness to that is the file itself. It can say what the file WAS at
+// import, which makes a later change detectable, and that is a real property
+// and the strongest true one available here.
+
+/** A bare filesystem path, which is how the manager reports one. */
+const MODEL_PATH = imported().modelPath;
+/** The same file, addressed the way expo-file-system addresses files. */
+const MODEL_URI = `file://${MODEL_PATH}`;
+
+describe("the local integrity baseline", () => {
+  it("computes a SHA-256 at import and persists it as the baseline", async () => {
+    mockImport.mockResolvedValueOnce(imported());
+    await useModelStore.getState().importGenieXGguf(PUSH_DIR, "Qwen3-Q4_0");
+
+    expect(mockSha).toHaveBeenCalledWith(MODEL_URI);
+    expect(mockInsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sha256: AT_IMPORT,
+        // Not "verified": nothing external was consulted, and the word for
+        // that is a baseline.
+        trust: "user_supplied_baseline",
+      }),
+    );
+    expect(useModelStore.getState().error).toBeNull();
+  });
+
+  it("marks the model usable immediately — no second step, no confirmation", async () => {
+    // The absence of a supplied checksum is not grounds for an "are you sure".
+    // There was never a checksum to be had, so a prompt would only ask the user
+    // to reconfirm a decision they already made by pushing the file.
+    mockImport.mockResolvedValueOnce(imported());
+    await useModelStore.getState().importGenieXGguf(PUSH_DIR, "Qwen3-Q4_0");
+
+    expect(mockInsert).toHaveBeenCalledWith(expect.objectContaining({ state: "ready" }));
+    expect(useModelStore.getState().error).toBeNull();
+  });
+
+  it("establishes that it is a usable GGUF before recording anything", async () => {
+    // The manager infers its manifest from FILE NAMES and never opens the
+    // weights, so a renamed .zip or a truncated adb push imports perfectly
+    // happily and only fails much later, inside llama.cpp.
+    mockImport.mockResolvedValueOnce(imported());
+    mockHeader.mockResolvedValueOnce({
+      ok: false,
+      error: "Not a GGUF file (bad magic bytes).",
+    });
+    await useModelStore.getState().importGenieXGguf(PUSH_DIR, "Qwen3-Q4_0");
+
+    expect(mockHeader).toHaveBeenCalledWith(MODEL_URI);
+    expect(mockInsert).not.toHaveBeenCalled();
+    // And nothing half-imported is left in the cache of the manager.
+    expect(mockRemoveBundle).toHaveBeenCalledWith("local/qwen3-q4_0");
+    expect(useModelStore.getState().error).toMatch(/bad magic/i);
+  });
+
+  it("stores the path as a URI, so the file can be found again", async () => {
+    // A bare path reads as a MISSING FILE to expo-file-system — which is the
+    // activation size check and the first thing Verify does.
+    mockImport.mockResolvedValueOnce(imported());
+    await useModelStore.getState().importGenieXGguf(PUSH_DIR, "Qwen3-Q4_0");
+
+    expect(mockInsert).toHaveBeenCalledWith(
+      expect.objectContaining({ filePath: MODEL_URI }),
+    );
+  });
+
+  it("imports anyway, as unverified, when hashing is unavailable", async () => {
+    // No expected digest exists for the failure to contradict, so nothing is in
+    // doubt. Fail-closed belongs where a SUPPLIED checksum disagreed, which
+    // cannot happen on this path.
+    mockImport.mockResolvedValueOnce(imported());
+    mockSha.mockResolvedValueOnce(null);
+    await useModelStore.getState().importGenieXGguf(PUSH_DIR, "Qwen3-Q4_0");
+
+    expect(mockInsert).toHaveBeenCalledWith(
+      expect.objectContaining({ sha256: null, trust: "unverified", state: "ready" }),
+    );
+    expect(useModelStore.getState().error).toBeNull();
+  });
+
+  it("imports anyway when hashing throws", async () => {
+    mockImport.mockResolvedValueOnce(imported());
+    mockSha.mockRejectedValueOnce(new Error("EIO"));
+    await useModelStore.getState().importGenieXGguf(PUSH_DIR, "Qwen3-Q4_0");
+
+    expect(mockInsert).toHaveBeenCalledWith(
+      expect.objectContaining({ sha256: null, trust: "unverified" }),
+    );
+    expect(useModelStore.getState().error).toBeNull();
+  });
+
+  it("never dresses the baseline up as independent verification", async () => {
+    mockImport.mockResolvedValueOnce(imported());
+    await useModelStore.getState().importGenieXGguf(PUSH_DIR, "Qwen3-Q4_0");
+
+    const row = mockInsert.mock.calls[0][0];
+    // Those two values mean a digest came from OUTSIDE these bytes — a
+    // repository published one, or the user supplied one. Neither happened.
+    expect(row.trust).not.toBe("verified_upstream");
+    expect(row.trust).not.toBe("verified_user_checksum");
+    // And no repo is recorded, which is what stops verifyIntegrity() from ever
+    // reporting this model as upstream-verified later.
+    expect(row.hfRepo ?? null).toBeNull();
+  });
+});
+
+describe("Verify, against the baseline the import recorded", () => {
+  const withBaseline = (over: Partial<InstalledModel> = {}) =>
+    managedRow({
+      filePath: MODEL_URI,
+      sha256: AT_IMPORT,
+      trust: "user_supplied_baseline",
+      hfRepo: null,
+      hfFile: null,
+      ...over,
+    });
+
+  it("passes while the file still hashes to what it did at import", async () => {
+    mockGetById.mockResolvedValueOnce(withBaseline());
+    mockSha.mockResolvedValueOnce(AT_IMPORT);
+
+    await useModelStore.getState().verifyIntegrity("row1");
+
+    expect(mockIntegrity).toHaveBeenCalledWith(
+      "row1",
+      expect.objectContaining({ state: "ready" }),
+    );
+    expect(useModelStore.getState().error).toMatch(/still matches/i);
+  });
+
+  it("FAILS once the file is modified underneath the app", async () => {
+    // The whole point of recording a baseline. These bytes live outside the
+    // private directory of Vesta: anything with access can replace them, and
+    // with no digest on record that change was invisible.
+    mockGetById.mockResolvedValueOnce(withBaseline());
+    mockSha.mockResolvedValueOnce(AFTER_EDIT);
+
+    await useModelStore.getState().verifyIntegrity("row1");
+
+    expect(mockSetState).toHaveBeenCalledWith("row1", "error");
+    expect(useModelStore.getState().error).toMatch(/has CHANGED/);
+    // NOT silently re-baselined to the new bytes, which would make the check
+    // pass forever and mean nothing.
+    expect(mockIntegrity).not.toHaveBeenCalled();
+  });
+
+  it("keeps an externally vouched-for digest distinct from a local baseline", async () => {
+    // A model whose digest came from a repository is a STRONGER claim and must
+    // not be flattened into the baseline case just because both compare a hash.
+    // Here the recorded digest still matches, and the row keeps the trust it
+    // earned rather than being rewritten to a local baseline.
+    mockGetById.mockResolvedValueOnce(withBaseline({ trust: "verified_upstream" }));
+    mockSha.mockResolvedValueOnce(AT_IMPORT);
+
+    await useModelStore.getState().verifyIntegrity("row1");
+
+    // State is refreshed; trust is NOT rewritten.
+    expect(mockIntegrity).toHaveBeenCalledWith(
+      "row1",
+      expect.not.objectContaining({ trust: expect.anything() }),
+    );
   });
 });

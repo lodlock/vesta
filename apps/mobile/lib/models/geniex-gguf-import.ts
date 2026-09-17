@@ -37,7 +37,9 @@
 // what makes a silent substitution impossible.
 
 import type { NewModel } from "./model-registry";
+import type { ModelTrust } from "./types";
 import type { NpuBundleInfo } from "../native/npu";
+import { normalizeSha256 } from "../native/file-hash";
 
 /**
  * The quantization this spike pulls by.
@@ -120,36 +122,85 @@ export function genieXImportRequest(
  * `sizeBytes` is the MODEL FILE's size, not the directory total: activation
  * re-stats `filePath` and compares, and a total covering a tokenizer and a
  * manifest alongside it would fail that check on every load.
+ *
+ * ## `sha256` is a LOCAL BASELINE, and is not evidence of provenance
+ *
+ * The digest passed in is one Vesta computed over the imported bytes itself.
+ * It cannot say who published them — there is no external digest to compare
+ * against and the user chose the file — so it establishes exactly one thing:
+ * what the file was AT IMPORT, which makes a later change detectable. That is
+ * `user_supplied_baseline`, and the label for it must not be read as
+ * verification against a source.
+ *
+ * It is still worth recording, and NOT recording it was the bug this argument
+ * exists for. A row with no digest offers no Verify (`canVerify()` has nothing
+ * to compare against), so the one model in the app that most needs a change
+ * detector was the only one that could never get one.
+ *
+ * `null` — hashing unavailable on this build — falls back to `unverified`,
+ * which is the honest word for a file with no digest of any kind on record.
+ * Either way the row is `ready`: a missing baseline is a missing DETECTOR, not
+ * a reason to refuse a file the user deliberately supplied.
  */
 export function genieXImportedRow(
   bundle: NpuBundleInfo,
-  opts: { displayName: string; modelName: string; contextSize?: number },
+  opts: {
+    displayName: string;
+    modelName: string;
+    contextSize?: number;
+    /** What Vesta hashed the imported file to, or null when it could not. */
+    sha256?: string | null;
+  },
 ): NewModel {
+  // Normalized here rather than trusted: a malformed digest recorded as a
+  // baseline would fail every future Verify on a file that never changed.
+  const baseline = normalizeSha256(opts.sha256);
+  const trust: ModelTrust = baseline ? "user_supplied_baseline" : "unverified";
   return {
     displayName: opts.displayName,
-    filePath: bundle.modelPath,
+    filePath: genieXModelUri(bundle.modelPath),
     sizeBytes: modelFileSize(bundle),
     contextSize: opts.contextSize ?? 4096,
     role: "primary",
+    // Usable the moment the import and the hash succeed. Nothing here waits on
+    // a checksum arriving from somewhere else, because none ever will.
     state: "ready",
     // Recorded from the filename, not from the weights — the diagnostics label
     // "GGUF Q4_0" is therefore as good as the name was. See pickSpikeGguf.
     quant: GENIEX_SPIKE_PRECISION,
-    // No digest, and none to compare against: the user supplied the file. Said
-    // plainly rather than dressed up as a baseline. It also covers the
-    // quantization, which nothing here has verified either.
-    trust: "unverified",
+    sha256: baseline,
+    trust,
     backend: "geniex_llama_cpp",
     artifact: "gguf",
     runtimeModelName: opts.modelName,
     // A GGUF embeds its own tokenizer, so this is usually null and stays null.
     tokenizerPath: bundle.tokenizerPath ?? null,
-    // Deliberately empty. A recorded manifest is what makes `canVerify()` offer
-    // Verify, and Verify on this row would run the QAIRT bundle check — which
-    // demands metadata.json and .bin shards and would reject a perfectly good
-    // GGUF. The spike does not need it.
+    // Deliberately empty, and NOT the thing that decides whether Verify is
+    // offered here. A recorded manifest routes Verify to the QAIRT bundle
+    // check, which demands metadata.json and .bin shards and would reject a
+    // perfectly good GGUF; this row's `artifact` is `gguf`, so Verify routes to
+    // the single-file digest check instead — which is the one that can actually
+    // compare `sha256` above against the bytes on disk.
     bundleFiles: [],
   };
+}
+
+/**
+ * The model path as a `file://` URI.
+ *
+ * `ModelPaths.model_path` comes from the GenieX manager and may or may not
+ * carry a scheme — the native side calls `stripScheme()` on it everywhere it
+ * touches the filesystem, precisely because it cannot assume. Vesta's side has
+ * the opposite requirement: `expo-file-system` addresses files by URI, so the
+ * bare path a manifest sometimes hands back reads as a missing file to
+ * `getInfoAsync()`. Stored as a URI once, both the activation size check and
+ * Verify see the same file. (`sha256File` strips the scheme again natively, so
+ * it is indifferent either way.)
+ */
+export function genieXModelUri(path: string): string {
+  if (!path) return path;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(path)) return path;
+  return path.startsWith("/") ? `file://${path}` : path;
 }
 
 /**

@@ -56,6 +56,7 @@ import { isNpuModel } from "../models/npu-compat";
 import {
   genieXImportRequest,
   genieXImportedRow,
+  genieXModelUri,
 } from "../models/geniex-gguf-import";
 import {
   pullabilityIndex,
@@ -1494,25 +1495,26 @@ export const useModelStore = create<ModelState>((set, get) => ({
     });
   },
 
-  // Import an arbitrary local .gguf — one the user downloaded elsewhere, merged
-  // themselves, or quantized by hand. No HuggingFace repo, no catalog entry and
-  // no filename convention is required; the file comes in through the system
-  // file picker (SAF) exactly as before.
+  // SPIKE: hand a side-loaded GGUF directory to the GenieX model manager.
   //
-  // STORAGE: the picked URI is used ONCE, as a copy source. The bytes land in
-  // the app-private models directory and everything afterwards — the header
-  // check, the hash, llama.cpp, every later load — reads that copy. Nothing
-  // outside the app can rewrite it, which is why an import-time baseline plus
-  // a size check on load is enough and no multi-GB re-hash happens at startup.
+  // The user chose these bytes — pushed over adb into the spike directory — so
+  // no external digest exists for them and none ever will. That is the whole
+  // reason this has its own integrity policy rather than borrowing the
+  // downloader's, and the reason it may not borrow the downloader's CONCLUSION
+  // either:
   //
-  // Checksum policy, in order:
-  //   1. a digest the user supplied (pasted, or an adjacent `.sha256`) → the
-  //      file MUST match it. Mismatch, or hashing that fails, rejects the
-  //      import — same fail-closed rule as a HuggingFace download.
-  //   2. no digest → the import proceeds, because explicitly picking a file IS
-  //      the trust decision. We hash it anyway and keep that as a baseline, so
-  //      an unexpected change to the file later is detectable. That is
-  //      integrity from import onwards; it says nothing about provenance.
+  //   source        a local file the user supplied.
+  //   integrity     established here, against a baseline computed at import.
+  //   authenticity  NOT established. Nothing on this path can say who built
+  //                 the file, and a locally computed hash cannot be made to.
+  //
+  // So the absence of a supplied checksum is not a reason to refuse, to warn,
+  // or to withhold the model: there was never a checksum to be had, and
+  // treating "the user gave us a file" as suspicious would make the only
+  // import path this lane has unusable for the thing it was built to do. What
+  // it IS a reason for is recording our own digest, which is what turns "we
+  // know nothing about this file" into "we know what it was at import" — a
+  // real, checkable property, and the strongest true one available.
   importGenieXGguf: async (localPath: string, displayName: string) => {
     set({ busy: true, error: null });
     const request = genieXImportRequest(localPath, displayName);
@@ -1547,10 +1549,47 @@ export const useModelStore = create<ModelState>((set, get) => ({
         return;
       }
 
+      // The file the manager now owns, addressed the way expo-file-system
+      // addresses files. Everything below and every later Verify reads THIS,
+      // so the structural check, the baseline and the activation size check
+      // are all about the same bytes.
+      const modelUri = genieXModelUri(bundle.modelPath);
+
+      // "Usable GGUF" established before the row exists, exactly as the SAF
+      // import does it. The manager infers its manifest from FILE NAMES and
+      // never opens the weights, so a renamed .zip or a truncated adb push
+      // imports perfectly happily and only fails later, inside llama.cpp.
+      const header = await checkGgufFile(modelUri);
+      if (!header.ok) {
+        await npuRemoveBundle(request.modelName).catch(() => {});
+        set({
+          error: `${displayName}: ${header.error ?? "not a valid GGUF file."} It has been removed.`,
+        });
+        return;
+      }
+
+      // The integrity baseline, computed over the imported copy. This is the
+      // ONLY digest that can exist for this model: the user supplied the file,
+      // so there is no published checksum to check it against and never will
+      // be. It therefore establishes integrity FROM NOW ON — a later change is
+      // detectable — and says nothing whatever about who published the bytes.
+      //
+      // A hash failure is not an import failure. There is no expected digest
+      // for it to disagree with, so nothing is in doubt; the row simply records
+      // no baseline and says so. Fail-closed belongs where a checksum was
+      // supplied and did not match, which cannot happen on this path.
+      let baseline: string | null = null;
+      try {
+        baseline = await sha256File(modelUri);
+      } catch {
+        baseline = null;
+      }
+
       await insertModel(
         genieXImportedRow(bundle, {
           displayName,
           modelName: request.modelName,
+          sha256: baseline,
         }),
       );
       await get().refresh();
@@ -1564,6 +1603,31 @@ export const useModelStore = create<ModelState>((set, get) => ({
     }
   },
 
+  // Import an arbitrary local .gguf — one the user downloaded elsewhere, merged
+  // themselves, or quantized by hand. No HuggingFace repo, no catalog entry and
+  // no filename convention is required; the file comes in through the system
+  // file picker (SAF) exactly as before.
+  //
+  // STORAGE: the picked URI is used ONCE, as a copy source. The bytes land in
+  // the app-private models directory and everything afterwards — the header
+  // check, the hash, llama.cpp, every later load — reads that copy. Nothing
+  // outside the app can rewrite it, which is why an import-time baseline plus
+  // a size check on load is enough and no multi-GB re-hash happens at startup.
+  //
+  // Checksum policy, in order:
+  //   1. a digest the user supplied (pasted, or an adjacent `.sha256`) → the
+  //      file MUST match it. Mismatch, or hashing that fails, rejects the
+  //      import — same fail-closed rule as a HuggingFace download. This is the
+  //      stronger claim, and stays distinct: the user vouched for a specific
+  //      digest and the bytes agreed with it.
+  //   2. no digest → the import proceeds, because explicitly picking a file IS
+  //      the trust decision. We hash it anyway and keep that as a baseline, so
+  //      an unexpected change to the file later is detectable. That is
+  //      integrity from import onwards; it says nothing about provenance.
+  //
+  // (2) is NOT a weaker version of (1) that could be upgraded by asking harder.
+  // It is a different claim about a different thing, which is why the two get
+  // different trust values and different words on the card.
   importLocalModel: async (
     uri: string,
     name: string,

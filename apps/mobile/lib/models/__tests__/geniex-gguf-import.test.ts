@@ -22,9 +22,13 @@ import {
   genieXLocalModelName,
   genieXImportRequest,
   genieXImportedRow,
+  genieXModelUri,
   pickSpikeGguf,
   GENIEX_SPIKE_PRECISION,
 } from "../geniex-gguf-import";
+import { canActivate, canVerify } from "../activation";
+import type { InstalledModel } from "../types";
+import type { NewModel } from "../model-registry";
 import type { NpuBundleInfo } from "../../native/npu";
 
 describe("the cache key", () => {
@@ -164,23 +168,140 @@ describe("the registry row", () => {
     expect(row.sizeBytes).toBe(0);
   });
 
-  it("records no bundle manifest, so Verify is never offered", () => {
-    // Verify on this row would run the QAIRT bundle check, which demands
-    // metadata.json and .bin shards and would reject a healthy GGUF.
+  it("records no bundle manifest, so Verify runs the single-FILE check", () => {
+    // Not "so Verify is never offered", which is what this used to say and was
+    // wrong in both halves. `artifact` is "gguf", so isNpuModel() is false and
+    // Verify routes to verifyIntegrity() — the digest check — never to the
+    // QAIRT bundle check that demands metadata.json and .bin shards. An empty
+    // manifest keeps it that way; the sha256 below is what it compares.
     const row = genieXImportedRow(bundle, {
       displayName: "g",
       modelName: "local/g",
+      sha256: DIGEST,
     });
     expect(row.bundleFiles).toEqual([]);
+    expect(row.artifact).toBe("gguf");
+    expect(canVerify(installed(row))).toBe(true);
   });
 
-  it("is ready, and honest about its trust", () => {
-    const row = genieXImportedRow(bundle, {
-      displayName: "g",
-      modelName: "local/g",
-    });
-    expect(row.state).toBe("ready");
-    expect(row.trust).toBe("unverified");
-    expect(row.quant).toBe("Q4_0");
+  it("stores the path as a URI, so expo-file-system can find the file", () => {
+    // The manager hands back a bare path as readily as a file:// one — the
+    // native side calls stripScheme() on it everywhere for that reason. A bare
+    // path reads as a MISSING FILE to getInfoAsync(), which is the activation
+    // size check and the first thing Verify does.
+    const row = genieXImportedRow(bundle, { displayName: "g", modelName: "local/g" });
+    expect(row.filePath).toBe(
+      "file:///files/geniex/models/local/gemma/gemma-4-E2B-it-q4_0.gguf",
+    );
+    // Idempotent: a path that already has a scheme is left exactly alone.
+    expect(genieXModelUri("file:///a/b.gguf")).toBe("file:///a/b.gguf");
+    expect(genieXModelUri("content://x/y")).toBe("content://x/y");
   });
 });
+
+// ── The integrity baseline ──────────────────────────────────────────────────
+//
+// The bug: this row went in with no digest and `unverified`, which made the
+// model say "No checksum on record" and — because a row with no digest and no
+// repo has nothing to compare against — took its Verify button away too. So the
+// one model in the app whose file lives outside Vesta's own directory, pushed
+// there by hand, was the only one that could never get a change detector.
+//
+// A digest computed here cannot establish who published the file. It can
+// establish what the file WAS at import, which is a real property and the
+// strongest true one available for a file the user supplied.
+
+const DIGEST = "a".repeat(64);
+
+describe("the local integrity baseline", () => {
+  const bundle: NpuBundleInfo = {
+    modelName: "local/gemma-4-e2b-it-q4_0",
+    modelPath: "/files/geniex/models/local/gemma/gemma-4-E2B-it-q4_0.gguf",
+    modelDir: "/files/geniex/models/local/gemma",
+    tokenizerPath: null,
+    runtimeId: "llama_cpp",
+    files: [{ path: "gemma-4-E2B-it-q4_0.gguf", sizeBytes: 1_700_000_000 }],
+    totalBytes: 1_700_000_000,
+  };
+
+  const row = (sha256?: string | null) =>
+    genieXImportedRow(bundle, { displayName: "g", modelName: "local/g", sha256 });
+
+  it("records a computed digest as the baseline", () => {
+    expect(row(DIGEST).sha256).toBe(DIGEST);
+    expect(row(DIGEST).trust).toBe("user_supplied_baseline");
+  });
+
+  it("is usable immediately — no second step, no confirmation", () => {
+    // The import IS the trust decision. Nothing waits for a checksum to arrive
+    // from somewhere else, because for a file the user supplied none ever will.
+    const imported = installed(row(DIGEST));
+    expect(imported.state).toBe("ready");
+    expect(canActivate(imported)).toEqual({ ok: true });
+  });
+
+  it("is usable with NO baseline too, because trust never gates activation", () => {
+    // Hashing unavailable on this build. The row is honest about having no
+    // digest and still loads: a missing baseline is a missing DETECTOR, not a
+    // reason to withhold a file the user deliberately supplied.
+    const unhashed = row(null);
+    expect(unhashed.sha256).toBeNull();
+    expect(unhashed.trust).toBe("unverified");
+    expect(unhashed.state).toBe("ready");
+    expect(canActivate(installed(unhashed))).toEqual({ ok: true });
+  });
+
+  it("offers Verify once there is a baseline, and cannot before", () => {
+    // This is the half that actually broke. canVerify() needs something to
+    // compare against; with no digest and no repo there is nothing.
+    expect(canVerify(installed(row(DIGEST)))).toBe(true);
+    expect(canVerify(installed(row(null)))).toBe(false);
+  });
+
+  it("refuses to record a malformed digest as a baseline", () => {
+    // A bad digest on record is worse than none: every future Verify would
+    // fail on a file that never changed, and the model would be marked errored.
+    for (const bad of ["", "not-a-digest", "abc", "A".repeat(63), "z".repeat(64)]) {
+      expect(row(bad).sha256).toBeNull();
+      expect(row(bad).trust).toBe("unverified");
+    }
+    // Case and a "sha256:" prefix are normalized, not rejected.
+    expect(row(`SHA256:${"A".repeat(64)}`).sha256).toBe("a".repeat(64));
+  });
+
+  it("never claims the baseline verifies a publisher", () => {
+    // user_supplied_baseline, never verified_upstream or verified_user_checksum
+    // — those two mean a digest came from OUTSIDE these bytes, and none did.
+    expect(row(DIGEST).trust).not.toBe("verified_upstream");
+    expect(row(DIGEST).trust).not.toBe("verified_user_checksum");
+  });
+});
+
+/** A NewModel as the registry hands it back, for the checks that read a row. */
+function installed(row: NewModel): InstalledModel {
+  return {
+    id: "m1",
+    hfRepo: null,
+    hfFile: null,
+    quant: null,
+    minRamMb: null,
+    chatTemplate: null,
+    contextSize: 4096,
+    role: "primary",
+    state: "ready",
+    resumeToken: null,
+    sha256: null,
+    trust: "unverified",
+    backend: "llama_cpp",
+    artifact: "gguf",
+    targetSoc: null,
+    runtimeVersion: null,
+    runtimeModelName: null,
+    tokenizerPath: null,
+    bundleFiles: [],
+    isActive: false,
+    createdAt: 0,
+    ...row,
+    sizeBytes: row.sizeBytes ?? 0,
+  } as InstalledModel;
+}

@@ -31,9 +31,9 @@ import type {
   CatalogModel,
   DownloadProgress,
   InstalledModel,
-  ModelTrust,
   RetryState,
 } from "../lib/models/types";
+import { describeProvenance } from "../lib/models/integrity";
 import { describeRetry } from "../lib/models/download-retry";
 import {
   pullabilityIndex,
@@ -521,7 +521,7 @@ function CatalogRow({
       </View>
 
       {installed && !downloading && (
-        <Text style={styles.rowHint}>{TRUST_LABEL[installed.trust]}</Text>
+        <Provenance model={installed} />
       )}
       {/* Why a downloaded model can't be selected. Without this the row simply
           lost its button and the only visible difference was a trust label —
@@ -566,16 +566,35 @@ function CatalogRow({
   );
 }
 
-// What each trust level means, in one line, for the model card. Deliberately
-// four distinct statements: "verified" against an upstream digest, "verified"
-// against the user's own digest, and "this is the file you imported" are three
-// different claims, and flattening them would overstate the weakest one.
-const TRUST_LABEL: Record<ModelTrust, string> = {
-  verified_upstream: "✓ Verified against the repository's SHA-256",
-  verified_user_checksum: "✓ Verified against your SHA-256",
-  user_supplied_baseline: "• Imported by you — hashed at import, not verified against a source",
-  unverified: "• No checksum on record",
-};
+/**
+ * What is actually known about a model's bytes, in three lines.
+ *
+ * One line could not do it. The single label this replaces put "verified
+ * against a repository digest" and "we have no digest at all" on the same
+ * footing as claims — one sentence each, same styling — and the weakest of
+ * them, "No checksum on record", read as a verdict on the model rather than a
+ * statement about a missing EXTERNAL digest. A locally imported GGUF is the
+ * case where that reading is both most likely and most wrong: there is no
+ * source digest for one and there never can be, so the sentence described a
+ * permanent, unavoidable condition as though it were a fault.
+ *
+ * Splitting source / integrity / authenticity fixes that by making the
+ * authenticity line say "Not independently verified" explicitly, for almost
+ * everything — at which point it stops reading as this particular model's
+ * problem, which is exactly what it is not.
+ *
+ * The wording lives in lib/models/integrity.ts so it is testable; this draws it.
+ */
+function Provenance({ model }: { model: InstalledModel }) {
+  const p = describeProvenance(model);
+  return (
+    <>
+      <Text style={styles.rowHint}>Source: {p.source}</Text>
+      <Text style={styles.rowHint}>Integrity: {p.integrity}</Text>
+      <Text style={styles.rowHint}>Authenticity: {p.authenticity}</Text>
+    </>
+  );
+}
 
 function InstalledRow({
   model,
@@ -601,8 +620,13 @@ function InstalledRow({
         <Text style={styles.rowTitle} numberOfLines={1}>{model.displayName}</Text>
         <Text style={styles.rowMeta}>{formatBytes(model.sizeBytes)}</Text>
       </View>
-      {model.hfRepo && <Text style={styles.rowHint}>{model.hfRepo}</Text>}
-      {!downloading && <Text style={styles.rowHint}>{TRUST_LABEL[model.trust]}</Text>}
+      {/* Mid-download the repo is all that can honestly be said: the bytes are
+          still arriving, so no claim about them is meaningful yet. Once they
+          have landed, Provenance says where they came from and what is known. */}
+      {downloading && model.hfRepo && (
+        <Text style={styles.rowHint}>{model.hfRepo}</Text>
+      )}
+      {!downloading && <Provenance model={model} />}
       {!downloading && !activation.ok && (
         <Text style={styles.rowError}>{activation.message}</Text>
       )}
@@ -756,7 +780,7 @@ function NpuSection({
               <Text style={styles.rowHint}>Vesta&rsquo;s preferred NPU model</Text>
 
               {row && !downloading && (
-                <Text style={styles.rowHint}>{TRUST_LABEL[row.trust]}</Text>
+                <Provenance model={row} />
               )}
               {row && !downloading && activation && !activation.ok && (
                 <Text style={styles.rowError}>{activation.message}</Text>
